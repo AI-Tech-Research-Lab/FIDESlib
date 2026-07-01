@@ -65,6 +65,18 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// @param ct Ciphertext to load.
 	void LoadCiphertext(Ciphertext<DCRTPoly>& ct);
 
+	// ---- Offload to host RAM ----
+
+	/// @brief Evict a loaded ciphertext's GPU limbs to host RAM, freeing VRAM. The ciphertext
+	/// stays registered (its handle remains valid) so it can be transparently restored on next
+	/// use. A no-op if the ciphertext isn't currently loaded on a device, or handle is 0.
+	void OffloadCiphertext(uint32_t handle);
+	/// @brief Restore a ciphertext previously evicted by OffloadCiphertext(). A no-op if the
+	/// ciphertext isn't currently offloaded, or handle is 0.
+	void ReloadCiphertext(uint32_t handle);
+	/// @brief Whether the ciphertext behind `handle` is currently offloaded to host RAM.
+	bool IsCiphertextOffloaded(uint32_t handle) const;
+
 	// ---- Key Generation ----
 
 	/// @brief Generate a public/private key pair.

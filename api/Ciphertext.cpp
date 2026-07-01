@@ -130,6 +130,27 @@ void CiphertextImpl<DCRTPoly>::SetLevel(size_t level) {
 	ct_gpu->dropToLevel(maxDepth - level);
 }
 
+// ---- Offload to host RAM ----
+
+void CiphertextImpl<DCRTPoly>::Offload() {
+	if (this->loaded && this->parent_context) {
+		this->parent_context->OffloadCiphertext(this->gpu);
+	}
+}
+
+void CiphertextImpl<DCRTPoly>::Reload() {
+	if (this->loaded && this->parent_context) {
+		this->parent_context->ReloadCiphertext(this->gpu);
+	}
+}
+
+bool CiphertextImpl<DCRTPoly>::IsOffloaded() const {
+	if (!this->loaded || !this->parent_context) {
+		return false;
+	}
+	return this->parent_context->IsCiphertextOffloaded(this->gpu);
+}
+
 void CiphertextImpl<DCRTPoly>::EnsureLazyCPUCopy() {
 	if (!this->need_lazy_copy) {
 		return;

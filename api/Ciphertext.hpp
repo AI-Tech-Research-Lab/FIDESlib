@@ -44,6 +44,19 @@ template <> class CiphertextImpl<DCRTPoly> {
 	void SetLevel(size_t level);
 	void EnsureLazyCPUCopy();
 
+	// ---- Offload to host RAM ----
+
+	/// @brief Evict the ciphertext's GPU limbs to host RAM, freeing VRAM. A bit-exact
+	/// snapshot is kept so Reload() restores it verbatim; no decrypt/rescale/NTT is
+	/// performed. A no-op if not currently loaded on a device or already offloaded.
+	void Offload();
+	/// @brief Restore a ciphertext previously evicted by Offload(). A no-op if not
+	/// currently offloaded. Not required before reuse: every operation transparently
+	/// reloads an offloaded ciphertext on first use.
+	void Reload();
+	/// @brief Whether the ciphertext's GPU limbs are currently evicted to host RAM.
+	[[nodiscard]] bool IsOffloaded() const;
+
 	// ---- Internal State ----
 
 	bool need_lazy_copy = false;

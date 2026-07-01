@@ -287,6 +287,46 @@ void CryptoContextImpl<DCRTPoly>::LoadCiphertext(Ciphertext<DCRTPoly>& ct) {
 	ct->original_level                                 = this->multiplicative_depth - ct->GetLevel();
 }
 
+void CryptoContextImpl<DCRTPoly>::OffloadCiphertext(uint32_t handle) {
+	FIDESlib::CudaNvtxRange r("API");
+	if (handle == 0) {
+		return;
+	}
+	auto it = device_ciphertexts.find(handle);
+	if (it == device_ciphertexts.end()) {
+		return;
+	}
+	// Bypass GetDeviceCiphertext()'s auto-reload: it exists precisely to undo this state.
+	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(it->second);
+	ct_gpu->offload();
+}
+
+void CryptoContextImpl<DCRTPoly>::ReloadCiphertext(uint32_t handle) {
+	FIDESlib::CudaNvtxRange r("API");
+	if (handle == 0) {
+		return;
+	}
+	auto it = device_ciphertexts.find(handle);
+	if (it == device_ciphertexts.end()) {
+		return;
+	}
+	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(it->second);
+	ct_gpu->reload();
+}
+
+bool CryptoContextImpl<DCRTPoly>::IsCiphertextOffloaded(uint32_t handle) const {
+	FIDESlib::CudaNvtxRange r("API");
+	if (handle == 0) {
+		return false;
+	}
+	auto it = device_ciphertexts.find(handle);
+	if (it == device_ciphertexts.end()) {
+		return false;
+	}
+	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(it->second);
+	return ct_gpu->isOffloaded();
+}
+
 // ---- Key Generation ----
 
 KeyPair<DCRTPoly> CryptoContextImpl<DCRTPoly>::KeyGen() {
@@ -1970,6 +2010,14 @@ std::shared_ptr<void>& CryptoContextImpl<DCRTPoly>::GetDeviceCiphertext(uint32_t
 	// device_ciphertexts_mutex->lock_shared();
 	auto& it = device_ciphertexts.at(handle);
 	// device_ciphertexts_mutex->unlock_shared();
+
+	// Every caller (receiver or read-only operand alike) fetches the GPU ciphertext through
+	// this single choke point, so restoring an offloaded ciphertext here -- rather than at each
+	// of the ~40 call sites below -- transparently covers all of them.
+	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(it);
+	if (ct_gpu->isOffloaded()) {
+		ct_gpu->reload();
+	}
 	return it;
 }
 

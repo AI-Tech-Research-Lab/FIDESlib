@@ -253,7 +253,10 @@ void Ciphertext::addPt(const Plaintext& b) {
 			this->rescale();
 		}
 
-		if (b.c0.getLevel() != this->getLevel()) {
+		// BUGFIX: also adjust when levels match but noise degrees differ
+		// (FLEXIBLEAUTO lazy rescale: ct at NoiseLevel 2, fresh pt at 1).
+		// Previously this fell through to a raw add with mismatched scales.
+		if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel != NoiseLevel) {
 			Plaintext b_(cc_);
 			if (!b_.adjustPlaintextToCiphertext(b, *this)) {
 				assert(false);
@@ -286,12 +289,15 @@ void Ciphertext::subPt(const Plaintext& b) {
 			this->rescale();
 		}
 
-		if (b.c0.getLevel() != this->getLevel()) {
+		// BUGFIX (x2): adjust on noise-degree mismatch as well (see addPt),
+		// and recurse into subPt — this branch previously called addPt,
+		// silently turning subtraction into addition on level mismatch.
+		if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel != NoiseLevel) {
 			Plaintext b_(cc_);
 			if (!b_.adjustPlaintextToCiphertext(b, *this)) {
 				assert(false);
 			} else {
-				addPt(b_);
+				subPt(b_);
 			}
 			return;
 		}

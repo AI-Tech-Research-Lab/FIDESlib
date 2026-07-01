@@ -54,7 +54,10 @@ static void launch(cudaFunction_t kernel, dim3 grid, dim3 block, void** args, ui
 
 	CudaCheckErrorModNoSync;
 	CUlaunchAttribute attr[] = { { .id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN, .value = { .memSyncDomain = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE } },
-		{ .id = CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, .value = { .deviceUpdatableKernelNode = { .deviceUpdatable = 1, .devNode = nullptr } } } };
+#if CUDA_VERSION >= 12040
+		{ .id = CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, .value = { .deviceUpdatableKernelNode = { .deviceUpdatable = 1, .devNode = nullptr } } },
+#endif
+	};
 
 	// void* extra[] = { CU_LAUNCH_PARAM_BUFFER_POINTER, args, CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size, CU_LAUNCH_PARAM_END };
 	/* Cooperative Group Array (CGA)

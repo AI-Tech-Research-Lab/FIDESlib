@@ -189,6 +189,15 @@ void DeregisterCryptoContextGPU(Context cc);
 void DeregisterAllContexts();
 Context GetCurrentContext();
 void SetCurrentContext(Context& cc);
+
+/// @brief Give back to the CUDA driver every buffer sitting idle in the GPU allocator's
+/// caching pool (see GPUtrim()/CudaUtils.cuh), on every device `cc` is loaded on. Freeing
+/// a ciphertext's limbs (e.g. via Ciphertext::offload()) only returns them to that pool,
+/// not to the driver, so a caller that needs the VRAM back for something else (rather
+/// than for reuse by this same context) must call this afterwards. Not needed to just
+/// reuse the freed memory for more FIDESlib ciphertexts/ops - the pool already does that
+/// for free. Synchronizes each device before freeing, so avoid calling in a hot loop.
+void TrimGPUMemoryPool(Context cc);
 void AddSecretSwitchingKey(KeySwitchingKey&& ksk_a, KeySwitchingKey&& ksk_b);
 
 bool HasSecretSwitchingKey(const Context& a, const Context& b, const KeyHash& key_b);

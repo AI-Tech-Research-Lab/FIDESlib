@@ -357,6 +357,21 @@ std::mutex mempool_lock[MAXG];
 
 std::map<int, std::vector<void*>> size_to_memory[MAXG];
 
+// GPUtrim needs to give whole slabs back to the driver, but the free list above is a flat
+// list of interchangeable void* slices with no record of which cudaMallocAsync slab each
+// one came from -- and only a slab's original base pointer is a valid cudaFreeAsync
+// argument, never a mid-slab slice. So, non-invasively, we remember every slab we carve
+// (its base + full size) here at allocation time and leave the malloc/free hot path
+// otherwise untouched. Pointers that end up in a bucket without belonging to any recorded
+// slab (e.g. a foreign cudaMalloc'd buffer freed with bytes<64K, which the coercion below
+// files into the 1024-byte bucket) simply fall inside no slab and are never trimmed --
+// exactly the original behavior.
+struct GPUSlab {
+	void* base;
+	size_t bytes; // full slab size
+};
+std::map<int, std::vector<GPUSlab>> slab_registry[MAXG];
+
 FIDESlib::Stream s[MAXG];
 
 #define MEMPOOL true
@@ -392,6 +407,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 			cudaMallocAsync(&base, MBs * 1024 * 1024, s[id].ptr());
 
 			mempool_lock[id].lock();
+			slab_registry[id][bytes].push_back(GPUSlab{ (void*)base, MBs * 1024 * 1024 });
 			for (uint32_t i = 0; i < MBs * 1024 * 1024; i += bytes) {
 				free_limb.emplace_back(((char*)base) + i);
 			}
@@ -418,45 +434,9 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 
 #endif
 	// std::cout << bytes << std::endl;
-	if (0) {
-		cudaMalloc(&ptr, bytes);
-	} else if (1) {
-		cudaMallocAsync(&ptr, bytes, 0);
-	} else {
-		if (size_to_memory[id][bytes].empty()) {
-			cudaSetDevice(id);
-			cudaMallocAsync(&ptr, bytes, stream);
-		} else {
-			mempool_lock[id].lock();
-			if (size_to_memory[id][bytes].empty()) {
-				mempool_lock[id].unlock();
-				cudaSetDevice(id);
-				cudaMallocAsync(&ptr, bytes, stream);
-			} else {
-				ptr = size_to_memory[id][bytes].back();
-				size_to_memory[id][bytes].pop_back();
-				mempool_lock[id].unlock();
-			}
-		}
-	}
+	cudaMallocAsync(&ptr, bytes, 0);
 
 	return ptr;
-}
-
-struct pointerdata {
-	void* pointer;
-	int id;
-	int bytes;
-};
-
-void CUDART_CB streamCallback(void* userData) {
-
-	auto* p = reinterpret_cast<pointerdata*>(userData);
-
-	mempool_lock[p->id].lock();
-	size_to_memory[p->id][p->bytes].push_back(p->pointer);
-	mempool_lock[p->id].unlock();
-	delete p;
 }
 
 void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
@@ -492,17 +472,93 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
 	}
 #endif
 
-	if (0) {
-		cudaFree(ptr);
-	} else if (1) {
-		cudaFreeAsync(ptr, 0);
-	} else {
-		auto* p    = new pointerdata;
-		p->id      = id;
-		p->bytes   = bytes;
-		p->pointer = ptr;
-		cudaLaunchHostFunc(stream, streamCallback, p);
+	cudaFreeAsync(ptr, stream);
+}
+
+void GPUtrim(int id) {
+	cudaSetDevice(id);
+	if (s[id].ptr() == nullptr) {
+		s[id].init();
 	}
+	// Slices were pushed back onto the free list only after waiting on their owning stream
+	// (see GPUfree), but that wait is stream-ordered, not host-blocking: sync here so the
+	// cudaFreeAsync below cannot race a kernel still using a slab we are about to release.
+	cudaStreamSynchronize(s[id].ptr());
+
+	mempool_lock[id].lock();
+	for (auto& [bytes, slabs] : slab_registry[id]) {
+		std::vector<void*>& free_limb = size_to_memory[id][bytes];
+		if (slabs.empty()) {
+			continue;
+		}
+
+		// A slab is fully idle iff every slice we carved from it is back in the free list.
+		// Count the free slices that fall inside each slab; foreign pointers match no slab.
+		std::vector<size_t> freeCount(slabs.size(), 0);
+		for (void* p : free_limb) {
+			for (size_t i = 0; i < slabs.size(); ++i) {
+				char* base = (char*)slabs[i].base;
+				if ((char*)p >= base && (char*)p < base + slabs[i].bytes) {
+					freeCount[i]++;
+					break;
+				}
+			}
+		}
+
+		std::vector<bool> freed(slabs.size(), false);
+		bool any = false;
+		for (size_t i = 0; i < slabs.size(); ++i) {
+			if (freeCount[i] == slabs[i].bytes / bytes) {
+				cudaFreeAsync(slabs[i].base, s[id].ptr());
+				freed[i] = true;
+				any		 = true;
+			}
+		}
+		if (!any) {
+			continue;
+		}
+
+		// Drop the freed slabs' slices from the free list and the slabs from the registry.
+		std::vector<void*> survivingChunks;
+		survivingChunks.reserve(free_limb.size());
+		for (void* p : free_limb) {
+			bool drop = false;
+			for (size_t i = 0; i < slabs.size(); ++i) {
+				if (!freed[i]) {
+					continue;
+				}
+				char* base = (char*)slabs[i].base;
+				if ((char*)p >= base && (char*)p < base + slabs[i].bytes) {
+					drop = true;
+					break;
+				}
+			}
+			if (!drop) {
+				survivingChunks.push_back(p);
+			}
+		}
+		free_limb = std::move(survivingChunks);
+
+		std::vector<GPUSlab> survivingSlabs;
+		for (size_t i = 0; i < slabs.size(); ++i) {
+			if (!freed[i]) {
+				survivingSlabs.push_back(slabs[i]);
+			}
+		}
+		slabs = std::move(survivingSlabs);
+	}
+	mempool_lock[id].unlock();
+
+	// The cudaFreeAsync calls above only return slabs to the async-malloc pool; because the
+	// pool's release threshold is pinned to UINT64_MAX at context creation (see
+	// ContextData::ContextData), the pool caches that memory instead of handing it back to
+	// the OS -- so cudaMemGetInfo/nvidia-smi would still report it as used. Drain the frees,
+	// then explicitly trim the pool to 0 bytes reserved so the now-idle slabs actually
+	// become free VRAM the rest of the system can use. Live allocations are untouched.
+	cudaStreamSynchronize(s[id].ptr());
+	cudaMemPool_t mp;
+	cudaDeviceGetDefaultMemPool(&mp, id);
+	cudaMemPoolTrimTo(mp, 0);
 }
 
 int GetTargetThreads(int id) {

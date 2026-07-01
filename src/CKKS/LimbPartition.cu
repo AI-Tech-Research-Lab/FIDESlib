@@ -170,7 +170,7 @@ void LimbPartition::freeLimbs() {
 	while (!limb.empty())
 		dropLimb();
 	if (bufferLIMB) {
-		GPUfree(bufferLIMB, id, 0, s.ptr());
+		GPUfree(bufferLIMB, id, cc.N * meta.size() * 2 * sizeof(uint64_t), s.ptr());
 		bufferLIMB = nullptr;
 	}
 }
@@ -1041,7 +1041,7 @@ void LimbPartition::generateLimbConstant() {
 		// bufferLIMB = (uint64_t*)GPUmalloc(device, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
 		// cudaMallocAsync(&bufferLIMB, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
 	} else {
-		GPUfree(bufferLIMB, id, 0, s.ptr());
+		GPUfree(bufferLIMB, id, cc.N * meta.size() * 2 * sizeof(uint64_t), s.ptr());
 		bufferLIMB = nullptr;
 		// cudaFreeAsync(&bufferLIMB, s.ptr());
 		// bufferLIMB = (uint64_t*)GPUmalloc(device, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());

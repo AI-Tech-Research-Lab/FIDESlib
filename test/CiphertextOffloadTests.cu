@@ -255,4 +255,92 @@ TEST_P(CiphertextOffloadTest, IdempotentAndBoundaryLevels) {
 
 INSTANTIATE_TEST_SUITE_P(CiphertextOffloadTests, CiphertextOffloadTest, testing::Values(TTALL64));
 
+// 6. TrimGPUMemoryPool() actually returns offloaded VRAM to the OS -- the whole point of
+// the offload feature for the "cache many ciphertexts, then reclaim VRAM for other work"
+// use case. Two observable facts, measured with cudaMemGetInfo:
+//   * offload() alone frees limbs only into FIDESlib's process-local allocator pool
+//     (VectorGPU::free() -> GPUfree(cache=true)); with the pool's release threshold pinned
+//     to UINT64_MAX it keeps that memory, so free VRAM barely moves.
+//   * TrimGPUMemoryPool() then hands the now-idle pool slabs back, so free VRAM jumps up.
+// The allocator reclaims memory a whole ~1 GiB slab at a time, so we allocate a small batch
+// at a large ring (each ciphertext spans ~90 x 1 MiB limbs) -- enough to fill a couple of
+// slabs exclusively with these ciphertexts' limbs, which trim can then release.
+class CiphertextBulkOffloadTest : public GeneralParametrizedTest {
+  protected:
+	FIDESlib::CKKS::Context& SetupGPUContext() {
+		cc->Enable(lbcrypto::PKE);
+		cc->Enable(lbcrypto::KEYSWITCH);
+		cc->Enable(lbcrypto::LEVELEDSHE);
+
+		FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+		FIDESlib::CKKS::Context& cc_		= GPUcc;
+		cc_									= CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+		return cc_;
+	}
+};
+
+TEST_P(CiphertextBulkOffloadTest, TrimReclaimsOffloadedVRAM) {
+	FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
+
+	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+
+	constexpr int kNumCiphertexts = 16;
+	std::vector<std::unique_ptr<FIDESlib::CKKS::Ciphertext>> cts;
+	cts.reserve(kNumCiphertexts);
+	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> first_cpu; // kept to check correctness later
+
+	size_t total = 0, free_resident = 0;
+	for (int i = 0; i < kNumCiphertexts; ++i) {
+		auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+		if (i == 0)
+			first_cpu = c1;
+		FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
+		cts.push_back(std::make_unique<FIDESlib::CKKS::Ciphertext>(cc_, raw1));
+	}
+	cudaDeviceSynchronize();
+	cudaMemGetInfo(&free_resident, &total); // VRAM free with the batch resident on the GPU
+
+	for (auto& ct : cts)
+		ct->offload();
+	cudaDeviceSynchronize();
+	size_t free_after_offload = 0;
+	cudaMemGetInfo(&free_after_offload, &total);
+
+	FIDESlib::CKKS::TrimGPUMemoryPool(cc_);
+	cudaDeviceSynchronize();
+	size_t free_after_trim = 0;
+	cudaMemGetInfo(&free_after_trim, &total);
+
+	long long reclaimed_by_offload = (long long)free_after_offload - (long long)free_resident;
+	long long reclaimed_by_trim	   = (long long)free_after_trim - (long long)free_resident;
+	std::cout << "reclaimed by offload() alone: " << (reclaimed_by_offload >> 20) << " MiB, "
+			  << "reclaimed after TrimGPUMemoryPool(): " << (reclaimed_by_trim >> 20) << " MiB" << std::endl;
+
+	constexpr long long kHalfGiB = 512ll * 1024 * 1024;
+	// offload() pools the limbs; on its own it must not hand VRAM back to the OS.
+	ASSERT_LT(reclaimed_by_offload, kHalfGiB);
+	// trim must return at least a full slab's worth of VRAM to the OS.
+	ASSERT_GT(reclaimed_by_trim, kHalfGiB);
+
+	// After its VRAM was reclaimed, a ciphertext must still reload and decrypt correctly.
+	cts.front()->reload();
+	FIDESlib::CKKS::RawCipherText raw_res;
+	cts.front()->store(raw_res);
+	auto cResGPU = first_cpu->Clone();
+	GetOpenFHECipherText(cResGPU, raw_res);
+
+	lbcrypto::Plaintext resultGPU;
+	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
+	resultGPU->SetLength(generalTestParams.batchSize);
+
+	lbcrypto::Plaintext expected;
+	cc->Decrypt(keys.secretKey, first_cpu, &expected);
+	expected->SetLength(generalTestParams.batchSize);
+
+	ASSERT_ERROR_OK(expected, resultGPU);
+}
+
+INSTANTIATE_TEST_SUITE_P(CiphertextBulkOffloadTests, CiphertextBulkOffloadTest, testing::Values(tparams64_17_flex));
+
 } // namespace FIDESlib::Testing

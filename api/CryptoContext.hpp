@@ -76,6 +76,14 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void ReloadCiphertext(uint32_t handle);
 	/// @brief Whether the ciphertext behind `handle` is currently offloaded to host RAM.
 	bool IsCiphertextOffloaded(uint32_t handle) const;
+	/// @brief Give idle VRAM back to the CUDA driver after offloading a batch of
+	/// ciphertexts. OffloadCiphertext() only returns freed limbs to FIDESlib's own
+	/// process-local allocator pool (so they stay cheap to reuse for more FIDESlib
+	/// ciphertexts/ops), not to the driver, so `nvidia-smi`/`cudaMemGetInfo` won't show
+	/// a drop from OffloadCiphertext() alone. Call this once after offloading everything
+	/// you want the memory back from, e.g. before allocating unrelated GPU memory for
+	/// other work. A no-op if the context isn't loaded to any device.
+	void TrimGPUMemoryPool();
 
 	// ---- Key Generation ----
 

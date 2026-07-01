@@ -314,6 +314,15 @@ void CryptoContextImpl<DCRTPoly>::ReloadCiphertext(uint32_t handle) {
 	ct_gpu->reload();
 }
 
+void CryptoContextImpl<DCRTPoly>::TrimGPUMemoryPool() {
+	FIDESlib::CudaNvtxRange r("API");
+	if (!this->loaded) {
+		return;
+	}
+	auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	FIDESlib::CKKS::TrimGPUMemoryPool(context_gpu);
+}
+
 bool CryptoContextImpl<DCRTPoly>::IsCiphertextOffloaded(uint32_t handle) const {
 	FIDESlib::CudaNvtxRange r("API");
 	if (handle == 0) {

@@ -21,6 +21,44 @@ A server-side CKKS GPU library fully interoperable with OpenFHE.
 - Multi-GPU support with NCCL.
 - Sparse Secret Encapsulation support.
 - Many performance optimizations.
+- Ciphertext offloading: evict GPU-resident ciphertexts to host RAM and reclaim VRAM on demand.
+
+## Ciphertext offloading
+
+When you are holding more ciphertexts than comfortably fit in GPU memory, or simply want to
+hand some VRAM back to the system before other GPU work, a GPU-resident ciphertext can be
+evicted to host RAM and brought back on demand:
+
+  - `ct->Offload()` — copy the ciphertext's limbs to host RAM and free its VRAM.
+  - `ct->IsOffloaded()` — whether the ciphertext is currently evicted.
+  - `ct->Reload()` — copy it back to the GPU. With `SetCiphertextAutoload(true)` this also
+    happens automatically the first time an offloaded ciphertext is used.
+  - `cc->TrimGPUMemoryPool()` — return the freed VRAM to the driver/OS.
+
+`Offload()`/`Reload()` are a bit-exact round trip: no decrypt, rescale or NTT is performed,
+so the ciphertext is numerically identical afterwards.
+
+`Offload()` on its own frees the limbs into FIDESlib's internal GPU memory pool so they can
+be cheaply reused by later operations; it does **not** return that memory to the OS, so
+`nvidia-smi` will not show a drop until you call `TrimGPUMemoryPool()`. If you only intend to
+reuse the memory for more FIDESlib work, no trim is needed — the pool recycles it for free.
+
+```cpp
+// Cache some ciphertexts we do not need on the GPU right now.
+std::vector<Ciphertext<DCRTPoly>> cached;
+for (int i = 0; i < n; ++i)
+    cached.push_back(cc->Encrypt(keys.publicKey, ptxt));
+
+for (auto& ct : cached)
+    ct->Offload();       // limbs -> host RAM, VRAM freed into the pool
+cc->TrimGPUMemoryPool(); // hand the freed VRAM back to the system
+
+// ... do other GPU work here ...
+
+auto sum = cc->EvalAdd(cached[0], cached[1]); // cached[*] auto-reload on use
+```
+
+See `examples/offload` for a complete, runnable program.
 
 ## Citation
 

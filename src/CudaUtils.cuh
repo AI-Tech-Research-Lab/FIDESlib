@@ -156,5 +156,13 @@ template <bool capture> void run_in_graph(cudaGraphExec_t& exec, Stream& s, std:
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache = false);
 void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache = false);
 
+/// @brief Release every buffer currently sitting in GPUalloc/GPUfree's process-local
+/// caching pool for device `id` back to the CUDA driver. GPUfree never does this on its
+/// own (buffers are kept around for cheap reuse), so a caller that actually wants VRAM
+/// back after freeing a batch of large objects (e.g. offloaded ciphertexts) must call
+/// this explicitly. Synchronous: blocks until the device's internal stream drains before
+/// freeing, so avoid calling it on a hot path.
+void GPUtrim(int id);
+
 } // namespace FIDESlib
 #endif // FIDESLIB_CUDAUTILS_CUH

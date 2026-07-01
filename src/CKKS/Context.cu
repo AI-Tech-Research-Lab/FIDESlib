@@ -1000,6 +1000,12 @@ void DeregisterCryptoContextGPU(Context cc) {
 	DeregisterCryptoContextGPU(cc->param);
 }
 
+void TrimGPUMemoryPool(Context cc) {
+	for (int id : cc->GPUid) {
+		GPUtrim(id);
+	}
+}
+
 Context GetCurrentContext() {
 	return currentContext;
 }

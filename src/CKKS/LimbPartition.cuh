@@ -215,6 +215,12 @@ class LimbPartition {
 	void addScalar(std::vector<uint64_t>& vector);
 	void subScalar(std::vector<uint64_t>& vector);
 	void dropLimb();
+
+	/** Release the device memory backing every regular limb (and the single-malloc
+	 * buffer, if any), leaving the partition valid to regenerate limbs via generate()/
+	 * generateLimbSingleMalloc() again. Does not touch special/decomp/digit/gather
+	 * buffers. Idempotent: safe to call on an already-empty partition. */
+	void freeLimbs();
 	void addMult(const LimbPartition& partition, const LimbPartition& partition1);
 	void broadcastLimb0();
 	void evalLinearWSum(uint32_t n, std::vector<const LimbPartition*> ps, std::vector<uint64_t>& weights);

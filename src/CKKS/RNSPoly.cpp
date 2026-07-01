@@ -849,6 +849,14 @@ void RNSPoly::dropToLevel(int level) {
 		this->level = level;
 }
 
+void RNSPoly::freeGPU() {
+	for (auto& g : GPU) {
+		cudaSetDevice(g.device);
+		g.freeLimbs();
+	}
+	level = -1;
+}
+
 void RNSPoly::addMult(const RNSPoly& poly, const RNSPoly& poly1) {
 	assert(level <= poly1.level && level <= poly.level);
 #pragma omp parallel for num_threads(cc.GPUid.size())

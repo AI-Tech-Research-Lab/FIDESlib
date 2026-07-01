@@ -37,6 +37,20 @@ class Ciphertext {
 	/** @brief NVTX range object for profiling this class' methods. */
 	CudaNvtxRange my_range;
 
+	/** @brief Host-resident snapshot of a ciphertext evicted from VRAM via offload(). */
+	struct OffloadedState {
+		RawCipherText raw;
+		bool present = false;
+	};
+	OffloadedState state;
+
+	/** @brief Reloads from `state` if the ciphertext is currently offloaded; a no-op otherwise.
+	 *  Called at the entry of every method that touches c0/c1, so an offloaded ciphertext is
+	 *  never used with freed GPU pointers *as the receiver*. This does not extend to other
+	 *  ciphertexts passed in as read-only operands (e.g. `b` in add(b)) — the caller is
+	 *  responsible for those being resident, same as any other precondition. */
+	void ensureResident();
+
   public:
 	/** @brief Identifier for the key associated with this ciphertext. */
 	KeyHash keyID{ "" };
@@ -151,6 +165,28 @@ class Ciphertext {
 	 * @param rawct Destination object that will receive the serialized data.
 	 */
 	void store(RawCipherText& rawct);
+
+	/**
+	 * @brief Evicts the ciphertext's GPU limbs to host RAM, freeing VRAM.
+	 *
+	 * A bit-exact snapshot of the RNS limbs is taken (via store()) before the device
+	 * memory is released; reload() restores it verbatim. No decrypt, rescale, level
+	 * switch or NTT/domain change is performed. Requires the ciphertext not be in a
+	 * modUp state. A no-op if already offloaded.
+	 */
+	void offload();
+
+	/**
+	 * @brief Restores a ciphertext previously evicted by offload().
+	 *
+	 * A no-op if the ciphertext is not currently offloaded.
+	 */
+	void reload();
+
+	/**
+	 * @brief Whether the ciphertext's GPU limbs are currently evicted to host RAM.
+	 */
+	[[nodiscard]] bool isOffloaded() const;
 
 	/**
 	 * @brief Adds another ciphertext to *this* (in‑place).

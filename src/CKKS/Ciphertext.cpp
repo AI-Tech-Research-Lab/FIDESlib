@@ -65,8 +65,8 @@ constexpr std::array<const char*, 18> opstr{ "                   Noop: ",
 std::map<OPS, int> op_count;
 
 Ciphertext::Ciphertext(Ciphertext&& ct_moved) noexcept
-	: my_range(std::move(ct_moved.my_range)), keyID(std::move(ct_moved.keyID)), cc_(ct_moved.cc_), cc(*cc_), c0(std::move(ct_moved.c0)),
-	  c1(std::move(ct_moved.c1)),
+	: my_range(std::move(ct_moved.my_range)), state(std::move(ct_moved.state)), keyID(std::move(ct_moved.keyID)), cc_(ct_moved.cc_), cc(*cc_),
+	  c0(std::move(ct_moved.c0)), c1(std::move(ct_moved.c1)),
 	  NoiseFactor(ct_moved.NoiseFactor), NoiseLevel(ct_moved.NoiseLevel), slots(ct_moved.slots) {
 }
 
@@ -163,6 +163,7 @@ int Ciphertext::normalyzeIndex(int index) const {
 
 void Ciphertext::add(const Ciphertext& b) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 
 	assert(keyID == b.keyID);
@@ -205,6 +206,7 @@ void Ciphertext::add(const Ciphertext& b) {
 
 void Ciphertext::sub(const Ciphertext& b) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	assert(keyID == b.keyID);
 	if (cc.rescaleTechnique == FIXEDAUTO || cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT) {
@@ -241,6 +243,7 @@ void Ciphertext::sub(const Ciphertext& b) {
 
 void Ciphertext::addPt(const Plaintext& b) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	if (cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT || cc.rescaleTechnique == FIXEDAUTO) {
 
@@ -276,6 +279,7 @@ void Ciphertext::addPt(const Plaintext& b) {
 
 void Ciphertext::subPt(const Plaintext& b) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	if (cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT || cc.rescaleTechnique == FIXEDAUTO) {
 
@@ -312,6 +316,7 @@ void Ciphertext::subPt(const Plaintext& b) {
 
 void Ciphertext::load(const RawCipherText& rawct) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	keyID = rawct.keyid;
 	c0.load(rawct.sub_0, rawct.moduli);
@@ -324,7 +329,7 @@ void Ciphertext::load(const RawCipherText& rawct) {
 
 void Ciphertext::store(RawCipherText& rawct) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
-
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	cudaDeviceSynchronize();
 	rawct.numRes = c0.getLevel() + 1;
@@ -343,8 +348,54 @@ void Ciphertext::store(RawCipherText& rawct) {
 	cudaDeviceSynchronize();
 }
 
+void Ciphertext::ensureResident() {
+	if (state.present) {
+		reload();
+	}
+}
+
+void Ciphertext::offload() {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	if (state.present) {
+		return;
+	}
+	CKKS::SetCurrentContext(cc_);
+	assert(!c0.isModUp() && !c1.isModUp());
+
+	state.raw = RawCipherText{};
+	store(state.raw);
+
+	// store() does not populate moduli (that is normally filled in from the OpenFHE
+	// side by GetRawCipherText); RNSPoly::load() needs it to validate/regrow limbs.
+	state.raw.moduli.resize(state.raw.numRes);
+	for (int i = 0; i < state.raw.numRes; ++i) {
+		state.raw.moduli[i] = cc.prime.at(i).p;
+	}
+
+	c0.freeGPU();
+	c1.freeGPU();
+
+	state.present = true;
+}
+
+void Ciphertext::reload() {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	if (!state.present) {
+		return;
+	}
+	CKKS::SetCurrentContext(cc_);
+	state.present = false;
+	load(state.raw);
+	state.raw = RawCipherText{};
+}
+
+bool Ciphertext::isOffloaded() const {
+	return state.present;
+}
+
 void Ciphertext::modDown(bool free) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	c0.moddown(true, false, 0);
 	c1.moddown(true, false, 1);
@@ -356,6 +407,7 @@ void Ciphertext::modDown(bool free) {
 
 void Ciphertext::modUp() {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	// c0.modup();
 	c1.modup();
@@ -363,6 +415,7 @@ void Ciphertext::modUp() {
 
 void Ciphertext::multPt(const Plaintext& b, bool rescale, bool ignore_scale) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 
 	constexpr bool PRINT = false;
@@ -431,6 +484,7 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale, bool ignore_scale) {
 
 void Ciphertext::rescale() {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	// assert(this->NoiseLevel == 2);
 	if (cc.rescaleTechnique != FIXEDMANUAL) {
@@ -463,6 +517,7 @@ RNSPoly& MGPUkeySwitchCore(RNSPoly& in, const KeySwitchingKey& kskEval, const bo
 
 void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	assert(keyID == b.keyID);
 	if (cc.rescaleTechnique == FIXEDAUTO || cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT) {
@@ -684,6 +739,7 @@ void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
 
 void Ciphertext::square(bool rescale) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	Out(KEYSWITCH, " start ");
 
@@ -752,6 +808,7 @@ void Ciphertext::square(bool rescale) {
 
 void Ciphertext::multScalarNoPrecheck(const double c, bool rescale) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::MULTSCALAR]++;
 
@@ -769,6 +826,7 @@ void Ciphertext::multScalarNoPrecheck(const double c, bool rescale) {
 
 void Ciphertext::multScalar(const double c, bool rescale) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	if (cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT || cc.rescaleTechnique == FIXEDAUTO) {
 
@@ -785,6 +843,7 @@ void Ciphertext::multScalar(const double c, bool rescale) {
 
 void Ciphertext::addScalar(const double c) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::ADDSCALAR]++;
 
@@ -805,6 +864,7 @@ void Ciphertext::addScalar(const double c) {
 
 void Ciphertext::automorph(const int index, const int br) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	auto& aux0 = cc.getModdownAux(0);
 	auto& aux1 = cc.getModdownAux(1);
@@ -816,6 +876,7 @@ void Ciphertext::automorph(const int index, const int br) {
 
 void Ciphertext::extend(bool init) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	c0.generateSpecialLimbs(init && !c0.isModUp(), false);
 	c1.generateSpecialLimbs(init && !c1.isModUp(), false);
@@ -830,6 +891,7 @@ void Ciphertext::extend(bool init) {
 
 void Ciphertext::rotate(const int index__, const bool moddown) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::ROTATE]++;
 	int index = normalyzeIndex(index__);
@@ -902,6 +964,7 @@ void Ciphertext::rotate(const Ciphertext& c, const int index) {
 
 void Ciphertext::conjugate(const Ciphertext& c) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::CONJUGATE]++;
 
@@ -950,6 +1013,7 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 	}
 
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::HOISTEDROTATE]++;
 	op_count[OPS::HOISTEDROTATEOUTS] += indexes.size();
@@ -1148,6 +1212,7 @@ void Ciphertext::square(const Ciphertext& src, bool rescale) {
 
 void Ciphertext::dropToLevel(const int level, bool skip_adjust) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 
 	if (c0.getLevel() > level) {
@@ -1165,6 +1230,11 @@ void Ciphertext::dropToLevel(const int level, bool skip_adjust) {
 }
 
 int32_t Ciphertext::getLevel() const {
+	if (state.present) {
+		// Answer from the offloaded snapshot without forcing a reload: getLevel() is
+		// const, and the level is already known (state.raw.numRes = level + 1).
+		return state.raw.numRes - 1;
+	}
 	assert(c0.getLevel() == c1.getLevel());
 	return c0.getLevel();
 }
@@ -1176,6 +1246,7 @@ void Ciphertext::multScalar(const Ciphertext& b, const double c, bool rescale) {
 
 void Ciphertext::evalLinearWSumMutable(uint32_t n, const std::vector<Ciphertext*>& ctxs, std::vector<double> weights) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::WSUM]++;
 	op_count[OPS::WSUMINPUTS] += n;
@@ -1238,6 +1309,7 @@ void Ciphertext::evalLinearWSumMutable(uint32_t n, const std::vector<Ciphertext*
 
 void Ciphertext::addMultScalar(const Ciphertext& b, double d) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::MULTSCALAR]++;
 	op_count[OPS::COPY]++;
@@ -1284,7 +1356,7 @@ void Ciphertext::add(const Ciphertext& b, const Ciphertext& c) {
 }
 
 void Ciphertext::growToLevel(int level) {
-
+	ensureResident();
 	c0.grow(level);
 	c1.grow(level);
 	if (c0.isModUp())
@@ -1295,6 +1367,7 @@ void Ciphertext::growToLevel(int level) {
 
 void Ciphertext::copy(const Ciphertext& ciphertext) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	if (this == &ciphertext) {
 		return;
@@ -1313,6 +1386,7 @@ void Ciphertext::multPt(const Ciphertext& c, const Plaintext& b, bool rescale) {
 
 void Ciphertext::addMultPt(const Ciphertext& c, const Plaintext& b, bool rescale) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::ADDMULTPT]++;
 
@@ -1359,6 +1433,7 @@ void Ciphertext::reinterpretContext(const Ciphertext& ciphertext) {
 
 void Ciphertext::keySwitch(const KeySwitchingKey& ksk) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	assert(ksk.keyID == this->keyID);
 
@@ -1550,6 +1625,7 @@ void Ciphertext::dotProductPt(Ciphertext* ciphertexts, Plaintext** plaintexts, c
 
 void Ciphertext::dotProductPt(Ciphertext** ciphertexts, Plaintext** plaintexts, const int n, const bool ext) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 	std::vector<const RNSPoly*> c0s(n, nullptr), c1s(n, nullptr), pts(n, nullptr);
 
@@ -1577,6 +1653,7 @@ void Ciphertext::dotProductPt(Ciphertext** ciphertexts, Plaintext** plaintexts, 
 
 void Ciphertext::dotProduct(const std::vector<Ciphertext*>& a, const std::vector<Ciphertext*>& b, const bool ext) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 
 	assert(a.size() == b.size());
@@ -1634,6 +1711,7 @@ void Ciphertext::dotProduct(const std::vector<Ciphertext*>& a, const std::vector
 
 void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
+	ensureResident();
 	CKKS::SetCurrentContext(cc_);
 
 	if (!cc.precom.monomialCache.contains(power) || cc.precom.monomialCache.find(power)->second.getLevel() != this->getLevel()) {

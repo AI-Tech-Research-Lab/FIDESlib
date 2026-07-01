@@ -141,10 +141,6 @@ LimbPartition::~LimbPartition() {
 	if (bufferSPECIAL)
 		GPUfree(bufferSPECIAL, id, 0, s.ptr());
 	// cudaFreeAsync(bufferSPECIAL, s.ptr());
-	if (bufferLIMB) {
-		GPUfree(bufferLIMB, id, 0, s.ptr());
-		// cudaFreeAsync(bufferLIMB, s.ptr());
-	}
 	if (bufferAUXptrs)
 		GPUfree(bufferAUXptrs, id, MAXP * sizeof(void*) * (4ul + 4 * std::max(cc.dnum, 1)), s.ptr(), false);
 	// cudaFreeAsync(bufferAUXptrs, s.ptr());
@@ -163,10 +159,20 @@ LimbPartition::~LimbPartition() {
 			GPUfree(bufferGATHER, id, 0, s.ptr());
 		// cudaFreeAsync(bufferGATHER, s.ptr());
 	}
-	limb.clear();
+	freeLimbs();
 	SPECIALlimb.clear();
 	DECOMPlimb.clear();
 	DIGITlimb.clear();
+}
+
+void LimbPartition::freeLimbs() {
+	cudaSetDevice(device);
+	while (!limb.empty())
+		dropLimb();
+	if (bufferLIMB) {
+		GPUfree(bufferLIMB, id, 0, s.ptr());
+		bufferLIMB = nullptr;
+	}
 }
 
 Global::Globals* LimbPartition::getGlobals() {

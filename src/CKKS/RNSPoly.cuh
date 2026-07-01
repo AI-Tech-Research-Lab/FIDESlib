@@ -105,6 +105,11 @@ class RNSPoly {
 	void subScalar(std::vector<uint64_t>& vector1);
 	void copy(const RNSPoly& poly);
 	void dropToLevel(int level);
+
+	/** Release all limb device memory on every GPU partition, leaving the polynomial
+	 * in a valid, empty (level == -1) state that load()/grow() can repopulate from
+	 * scratch. Does not touch special/decomp/digit/gather limbs. Idempotent. */
+	void freeGPU();
 	void addMult(const RNSPoly& poly, const RNSPoly& poly1);
 	void broadcastLimb0();
 	void evalLinearWSum(uint32_t i, std::vector<const RNSPoly*>& vector1, std::vector<uint64_t>& vector2);

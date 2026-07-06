@@ -340,9 +340,20 @@ std::vector<std::vector<int>> ContextData::generateGPUdigits(const int dnum, con
 	return res;
 }
 
+// These key-switch/mod-down scratch polynomials are allocated lazily, once per context,
+// from the process-global caching GPU pool (see src/CudaUtils.cu). On that first allocation
+// the pool can hand back chunks whose previous tenant -- e.g. the scratch freed by the
+// mult/rescale ops that immediately precede the process's first key-switch -- still has GPU
+// writes in flight. The key-switch then reads/writes those chunks concurrently, corrupting
+// them and yielding all-NaN results (only on the *first* key-switch at a given level, since
+// afterwards this scratch is reused, never re-allocated from the pool). A subsequent sync
+// cannot repair the already-corrupted buffer, so we drain once, before the first allocation,
+// closing the race for good.
 RNSPoly& ContextData::getKeySwitchAux() {
-	if (key_switch_aux == nullptr)
+	if (key_switch_aux == nullptr) {
+		cudaDeviceSynchronize();
 		key_switch_aux = std::make_unique<RNSPoly>(*this, L, false);
+	}
 
 	key_switch_aux->generateDecompAndDigit(false);
 	key_switch_aux->generateSpecialLimbs(false, false);
@@ -350,16 +361,20 @@ RNSPoly& ContextData::getKeySwitchAux() {
 }
 
 RNSPoly& ContextData::getKeySwitchAux2() {
-	if (key_switch_aux2 == nullptr)
+	if (key_switch_aux2 == nullptr) {
+		cudaDeviceSynchronize();
 		key_switch_aux2 = std::make_unique<RNSPoly>(*this, L, false);
+	}
 	key_switch_aux2->generateDecompAndDigit(false);
 	key_switch_aux2->generateSpecialLimbs(false, false);
 	return *key_switch_aux2;
 }
 
 RNSPoly& ContextData::getModdownAux(const int num) {
-	if (moddown_aux[num % moddown_aux.size()] == nullptr)
+	if (moddown_aux[num % moddown_aux.size()] == nullptr) {
+		cudaDeviceSynchronize();
 		moddown_aux[num % moddown_aux.size()] = std::make_unique<RNSPoly>(*this, L, false);
+	}
 	moddown_aux[num % moddown_aux.size()]->generateSpecialLimbs(false, true);
 	return *moddown_aux[num % moddown_aux.size()];
 }

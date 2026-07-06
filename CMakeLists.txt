@@ -16,24 +16,27 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif ()
 
-# Set installation paths.
+# Set installation paths. Default to repo-relative locations so a plain `cmake -B build -S .`
+# is fully self-contained and never touches /usr/local or any path outside this checkout.
 if (NOT DEFINED FIDESLIB_INSTALL_PREFIX)
-    set(FIDESLIB_INSTALL_PREFIX "/usr/local" CACHE STRING "FIDESlib installation path.")
+    set(FIDESLIB_INSTALL_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/install" CACHE STRING "FIDESlib installation path.")
 else ()
     get_filename_component(TMP_PATH_FIDES "${FIDESLIB_INSTALL_PREFIX}" REALPATH BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
     message(STATUS "FIDESlib install path at: ${TMP_PATH_FIDES}")
     set(FIDESLIB_INSTALL_PREFIX "${TMP_PATH_FIDES}" CACHE STRING "FIDESlib installation path." FORCE)
 endif ()
 if (NOT DEFINED OPENFHE_INSTALL_PREFIX)
-    set(OPENFHE_INSTALL_PREFIX "/usr/local" CACHE STRING "OpenFHE installation path.")
+    set(OPENFHE_INSTALL_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/deps/openfhe-install" CACHE STRING "OpenFHE installation path.")
 else ()
     get_filename_component(TMP_PATH_OPENFHE "${OPENFHE_INSTALL_PREFIX}" REALPATH BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
     message(STATUS "OpenFHE install path at: ${TMP_PATH_OPENFHE}")
     set(OPENFHE_INSTALL_PREFIX ${TMP_PATH_OPENFHE} CACHE STRING "OpenFHE installation path." FORCE)
 endif ()
 
-# Option to auto-install patched OpenFHE.
-option(FIDESLIB_INSTALL_OPENFHE "Set ON to install a patched version of OpenFHE." OFF)
+# Option to force a rebuild/reinstall of the vendored OpenFHE even if one is already present at
+# OPENFHE_INSTALL_PREFIX. It is built automatically (see "OpenFHE Configuration" below) the first
+# time it's missing, so this only needs to be set to pick up a patch change or force a refresh.
+option(FIDESLIB_INSTALL_OPENFHE "Set ON to force-(re)install the vendored patched OpenFHE." OFF)
 
 # Option to compile the benchmark suite.
 option(FIDESLIB_COMPILE_BENCHMARKS "Set ON to compile the FIDESlib benchmark suite." ON)
@@ -50,8 +53,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
-set(CMAKE_C_COMPILER "gcc")
-set(CMAKE_CXX_COMPILER "g++")
+# Only pin the compiler when nothing has fixed one yet: a parent project (e.g. this repo
+# vendored via FetchContent/add_subdirectory) may have already enabled CXX with a resolved
+# absolute path, and re-setting it here would look like an (unsupported) compiler change.
+if (NOT DEFINED CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER "gcc")
+endif ()
+if (NOT DEFINED CMAKE_CXX_COMPILER)
+    set(CMAKE_CXX_COMPILER "g++")
+endif ()
 
 ############### CUDA Configuration ###################
 
@@ -114,10 +124,13 @@ endif ()
 
 ############### OpenFHE Configuration ###################
 
-# Default runs will not update nor install OpenFHE. Specify manually to install.
-if (FIDESLIB_INSTALL_OPENFHE)
+# Build and vendor the patched OpenFHE into this repo (deps/openfhe-src -> OPENFHE_INSTALL_PREFIX)
+# whenever it isn't already installed there, so this project always compiles its own OpenFHE
+# in-tree with no dependency on anything outside this checkout. FIDESLIB_INSTALL_OPENFHE=ON
+# forces a rebuild even if one is already present.
+if (FIDESLIB_INSTALL_OPENFHE OR NOT EXISTS "${OPENFHE_INSTALL_PREFIX}/lib/OpenFHE/OpenFHEConfig.cmake")
     execute_process(COMMAND ./build.sh ${OPENFHE_INSTALL_PREFIX}
-            WORKING_DIRECTORY "../deps"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps"
             COMMAND_ERROR_IS_FATAL ANY)
 endif ()
 

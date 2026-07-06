@@ -2308,7 +2308,15 @@ uint32_t CryptoContextImpl<DCRTPoly>::CopyDeviceCiphertext(const CiphertextImpl<
 	}
 
 	auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
-	auto ct_gpu       = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct.gpu));
+auto ct_gpu       = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct.gpu));
+	// RNSPoly::copy()'s cross-stream wait (s.wait(partition.getS())) does not observe per-limb
+	// streams that a preceding op (e.g. multPt's NTT step) left work on without folding it back
+	// into the partition's main stream in time -- draining ct_gpu's own streams here, the same
+	// way Ciphertext::store() does before a Decrypt/serialize read, closes that race. Without
+	// this, chaining an op straight off a ciphertext that just came out of a plaintext multiply
+	// (no intervening Decrypt/Synchronize) can read/copy it while writes are still in flight.
+	ct_gpu->c0.sync();
+	ct_gpu->c1.sync();
 	auto new_ct       = std::make_shared<FIDESlib::CKKS::Ciphertext>(context_gpu);
 	new_ct->copy(*ct_gpu);
 	uint32_t handle = this->RegisterDeviceCiphertext(std::move(new_ct));

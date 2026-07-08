@@ -332,6 +332,65 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
 	ctxt.slots = old_slots;
 }
 
+void FIDESlib::CKKS::IterativeBootstrap(Ciphertext& ctxt, const int slots, const uint32_t numIterations,
+  const uint32_t precision, const bool prescaled) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() });
+
+	if (numIterations <= 1) {
+		Bootstrap(ctxt, slots, prescaled);
+		return;
+	}
+	if (numIterations != 2)
+		throw std::invalid_argument("CKKS bootstrapping only supported for 1 or 2 iterations.");
+	if (prescaled)
+		throw std::invalid_argument("prescaled is not supported with numIterations > 1.");
+
+	FIDESlib::CKKS::Context& cc_ = ctxt.cc_;
+	ContextData& cc				 = ctxt.cc;
+	const uint64_t pow2			 = uint64_t{ 1 } << precision;
+	const int initLevel			 = ctxt.getLevel(); // before anything mutates ctxt
+
+	// Inner bootstrap on a copy -- ctxt must stay intact for the early-out and for ctScaledUp.
+	Ciphertext ctInit(cc_);
+	ctInit.copy(ctxt);
+	Bootstrap(ctInit, slots, false);
+	if (ctInit.NoiseLevel == 2) // OpenFHE: ModReduceInternalInPlace(_, 1)
+		ctInit.rescale();
+	multIntScalar(ctInit, pow2); // exact: NoiseFactor/NoiseLevel untouched
+
+	// Early-out: input already has at least as many limbs as a bootstrap yields.
+	if (ctInit.getLevel() <= initLevel)
+		return; // leave ctxt unchanged
+
+	Ciphertext ctScaledUp(cc_);
+	ctScaledUp.copy(ctxt);
+	if (cc.rescaleTechnique == CKKS::FIXEDMANUAL)
+		while (ctScaledUp.NoiseLevel > 1) // OpenFHE: ModReduce by (noiseDeg - 1)
+			ctScaledUp.rescale();
+	multIntScalar(ctScaledUp, pow2);
+
+	Ciphertext ctDown(cc_);
+	ctDown.copy(ctInit);
+	if (cc.rescaleTechnique == CKKS::FIXEDAUTO)
+		ctDown.dropToLevel(ctScaledUp.getLevel(), /*skip_adjust=*/true); // raw limb drop, no scale adjust
+
+	// Error = ctDown - ctScaledUp. Ciphertext::sub (Ciphertext.cpp:205) already performs
+	// the technique-correct level/scale alignment (adjustForAddOrSub for the AUTO/FLEX
+	// modes, raw dropToLevel for FIXEDMANUAL -- the "implicit mod down").
+	ctDown.sub(ctScaledUp);
+
+	// Bootstrap the error, then subtract it from the initial bootstrap.
+	Bootstrap(ctDown, slots, false);
+	if (ctDown.NoiseLevel == 2)
+		ctDown.rescale();
+
+	ctInit.sub(ctDown);
+	ctInit.multScalar(1.0 / (double)pow2); // ordinary real-scalar mult; default
+											// rescale=false matches OpenFHE (result
+											// is NoiseScaleDeg 2 under FIXEDMANUAL)
+	ctxt.copy(ctInit);
+}
+
 double FIDESlib::CKKS::GetPreScaleFactor(Context& cc_, int slots) {
 	ContextData& cc = *cc_;
 	SetCurrentContext(cc_);

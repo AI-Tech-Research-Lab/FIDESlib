@@ -3494,6 +3494,128 @@ TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrap) {
 	}
 }
 
+TEST_P(OpenFHEBootstrapTest, IterativeBootstrap) {
+	CKKS::DeregisterAllContexts();
+	for (auto& i : cached_cc) {
+		i.second.first->ClearEvalAutomorphismKeys();
+		i.second.first->ClearEvalMultKeys();
+		if (std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(i.second.first->GetScheme()->m_FHE))
+			std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(i.second.first->GetScheme()->m_FHE)->m_bootPrecomMap.clear();
+	}
+	// Enable the features that you wish to use
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::KEYSWITCH);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+	cc->Enable(lbcrypto::ADVANCEDSHE);
+	cc->Enable(lbcrypto::FHE);
+	std::cout << "CKKS scheme is using ring dimension " << cc->GetRingDimension() << std::endl << std::endl;
+
+	cc->EvalMultKeyGen(keys.secretKey);
+
+	int slots			= 1 << 4;
+	uint32_t precision	= 18;
+	std::cout << "Setup Bootstrap" << std::endl;
+	cc->EvalBootstrapSetup({ 2, 2 }, { 2, 2 }, slots);
+
+	std::cout << "Generate keys" << std::endl;
+	cc->EvalBootstrapKeyGen(keys.secretKey, slots);
+
+	///// PROBAR /////
+	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+	// Encoding as plaintexts
+	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1, 1, raw_param.L - 1, nullptr, slots);
+	lbcrypto::Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x1, 1, 0, nullptr, slots);
+
+	std::cout << "Input x1: " << ptxt1 << std::endl;
+
+	// Encrypt the encoded vectors
+	auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+	auto c2 = cc->Encrypt(keys.publicKey, ptxt2);
+
+	// CPU reference: double (Meta-BTS) iteration.
+	auto cAdd = cc->EvalBootstrap(c1, 2, precision);
+
+	lbcrypto::Plaintext result;
+	std::cout << cAdd->GetLevel() << "\n";
+	cc->Decrypt(keys.secretKey, cAdd, &result);
+
+	std::cout << "Result " << result;
+
+	FIDESlib::CKKS::Context& cc_	   = GPUcc;
+	cc_								   = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+	FIDESlib::CKKS::ContextData& GPUcc = *cc_;
+
+	FIDESlib::CKKS::AddBootstrapPrecomputation(cc, keys, slots, cc_);
+
+	///////////////////////////////////////////////////////////
+
+	FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
+	FIDESlib::CKKS::Ciphertext GPUct_o(cc_, raw1);
+
+	CudaCheckErrorMod;
+
+	for (int batch : FIDESlib::Testing::batch_configs) {
+		fideslibParams.batch = batch;
+		std::cout << "Batch " << batch << std::endl;
+
+		GPUcc.batch = batch;
+		cudaDeviceSynchronize();
+
+		// Single-shot GPU bootstrap: baseline error to beat.
+		FIDESlib::CKKS::Ciphertext GPUctSingle(cc_);
+		GPUctSingle.copy(GPUct_o);
+		cudaDeviceSynchronize();
+		FIDESlib::CKKS::Bootstrap(GPUctSingle, slots, false);
+
+		FIDESlib::CKKS::RawCipherText raw_res_single;
+		GPUctSingle.store(raw_res_single);
+		auto cResSingle(c2);
+		GetOpenFHECipherText(cResSingle, raw_res_single);
+		lbcrypto::Plaintext resultSingle;
+		cc->Decrypt(keys.secretKey, cResSingle, &resultSingle);
+
+		// Iterative (2-iteration) GPU bootstrap.
+		FIDESlib::CKKS::Ciphertext GPUct1(cc_);
+		GPUct1.copy(GPUct_o);
+		cudaDeviceSynchronize();
+		FIDESlib::CKKS::IterativeBootstrap(GPUct1, slots, 2, precision, false);
+
+		FIDESlib::CKKS::RawCipherText raw_res1;
+		GPUct1.store(raw_res1);
+		auto cResGPU(c2);
+		GetOpenFHECipherText(cResGPU, raw_res1);
+		lbcrypto::Plaintext resultGPU;
+		cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
+
+		std::cout << "Result GPU single-shot " << resultSingle;
+		std::cout << "Result GPU iterative " << resultGPU;
+
+		CudaCheckErrorMod;
+
+		// (a) iterative error vs. the true message is strictly lower than single-shot.
+		double errSingle = 0.0, errIter = 0.0;
+		for (size_t i = 0; i < x1.size(); ++i) {
+			errSingle = std::max(errSingle, std::abs(resultSingle->GetRealPackedValue().at(i) - x1.at(i)));
+			errIter	  = std::max(errIter, std::abs(resultGPU->GetRealPackedValue().at(i) - x1.at(i)));
+		}
+		std::cout << "Single-shot max error: " << errSingle << ", iterative max error: " << errIter << std::endl;
+		ASSERT_LT(errIter, errSingle);
+
+		// (b) GPU iterative matches CPU iterative within tolerance. Looser than
+		// ASSERT_ERROR_OK's single-bootstrap tolerance: this test chains two bootstraps
+		// (initial + error), so CPU/GPU rounding differences compound, and observed margins
+		// vary run-to-run with the fresh randomness in key/noise generation.
+		double cpuVsGpu = 0.0;
+		for (size_t i = 0; i < result->GetSlots(); ++i)
+			cpuVsGpu = std::max(cpuVsGpu, std::abs(resultGPU->GetRealPackedValue().at(i) - result->GetRealPackedValue().at(i)));
+		double tolerance = pow(2.0, -result->GetLogPrecision() + 8);
+		std::cout << "CPU vs GPU max error: " << cpuVsGpu << " (tolerance: " << tolerance << ")" << std::endl;
+		ASSERT_LE(cpuVsGpu, tolerance);
+	}
+}
+
 TEST_P(OpenFHEBootstrapTest, OpenFHEBootstrapManualPrescale) {
 	CKKS::DeregisterAllContexts();
 	for (auto& i : cached_cc) {

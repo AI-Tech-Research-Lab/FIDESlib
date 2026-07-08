@@ -1788,7 +1788,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalBootstrap(const Ciphertext
 	Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
 	auto res_gpu                = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 
-	FIDESlib::CKKS::Bootstrap(*res_gpu, res_gpu->slots, prescaled);
+	FIDESlib::CKKS::IterativeBootstrap(*res_gpu, res_gpu->slots, numIterations, precision, prescaled);
 
 	return result;
 }
@@ -1813,7 +1813,7 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapInPlace(Ciphertext<DCRTPoly>& cip
 
 	auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ciphertext->gpu));
 
-	FIDESlib::CKKS::Bootstrap(*res_gpu, res_gpu->slots, prescaled);
+	FIDESlib::CKKS::IterativeBootstrap(*res_gpu, res_gpu->slots, numIterations, precision, prescaled);
 }
 
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::AccumulateSum(const Ciphertext<DCRTPoly>& ct, int slots, int stride) {

@@ -164,5 +164,18 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache = fal
 /// freeing, so avoid calling it on a hot path.
 void GPUtrim(int id);
 
+struct GPUPoolBucketStats {
+	size_t chunkBytes;
+	size_t slabCount;
+	size_t reservedBytes;
+	size_t totalChunks;
+	size_t freeChunks;
+	size_t liveChunks;
+};
+
+/// Synchronous diagnostic snapshot of FIDESlib's process-local caching allocator.
+/// Intended for profiling only; it does not allocate, free, or trim any buffer.
+std::vector<GPUPoolBucketStats> GPUmemoryPoolStats(int id);
+
 } // namespace FIDESlib
 #endif // FIDESLIB_CUDAUTILS_CUH

@@ -913,7 +913,21 @@ RNSPoly ContextData::getAuxilarPoly() {
 }
 
 void ContextData::returnAuxilarPoly(RNSPoly&& c) {
-	precom.auxPoly.emplace_back(std::move(c));
+	// The auxiliary RNSPoly cache sits above GPUmalloc's pool. An unbounded cache can
+	// strand tens of GiB in full-size polynomials that unrelated allocations (notably
+	// Plaintext::grow) cannot reuse. Keep upstream behavior unless an explicit profiling/
+	// deployment limit is requested.
+	static const size_t cacheLimit = [] {
+		const char* value = std::getenv("FIDESLIB_AUX_POLY_CACHE_LIMIT");
+		if (!value || !*value)
+			return std::numeric_limits<size_t>::max();
+		char* end = nullptr;
+		const unsigned long long parsed = std::strtoull(value, &end, 10);
+		return end != value && *end == '\0' ? static_cast<size_t>(parsed)
+		                                     : std::numeric_limits<size_t>::max();
+	}();
+	if (precom.auxPoly.size() < cacheLimit)
+		precom.auxPoly.emplace_back(std::move(c));
 }
 
 void ContextData::trimAuxilarPoly(size_t size) {

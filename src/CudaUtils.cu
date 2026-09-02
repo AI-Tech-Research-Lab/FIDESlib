@@ -561,6 +561,28 @@ void GPUtrim(int id) {
 	cudaMemPoolTrimTo(mp, 0);
 }
 
+std::vector<GPUPoolBucketStats> GPUmemoryPoolStats(int id) {
+	cudaSetDevice(id);
+	if (s[id].ptr() != nullptr)
+		cudaStreamSynchronize(s[id].ptr());
+
+	std::lock_guard<std::mutex> guard(mempool_lock[id]);
+	std::vector<GPUPoolBucketStats> result;
+	for (const auto& [bytes, slabs] : slab_registry[id]) {
+		size_t reserved = 0;
+		size_t total = 0;
+		for (const auto& slab : slabs) {
+			reserved += slab.bytes;
+			total += slab.bytes / static_cast<size_t>(bytes);
+		}
+		const size_t free = size_to_memory[id][bytes].size();
+		result.push_back(GPUPoolBucketStats{
+			static_cast<size_t>(bytes), slabs.size(), reserved, total, free,
+			total >= free ? total - free : 0});
+	}
+	return result;
+}
+
 int GetTargetThreads(int id) {
 	return GPUprop[id].multiProcessorCount * GPUprop[id].maxThreadsPerMultiProcessor;
 }

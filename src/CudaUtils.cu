@@ -296,8 +296,13 @@ void Stream::init(int priority) {
 	// cudaStreamCreateWithFlags(&ptr, cudaStreamNonBlocking);
 #endif
 
+	// One event per stream, and ONE creation: the second call used to overwrite `ev`
+	// with a fresh event and strand the first one. Nothing held its handle any more, so
+	// ~Stream() could not destroy it and every Stream::init() leaked ~500 B of host
+	// driver memory. With the auxiliary-RNSPoly cache disabled (see
+	// FIDESLIB_AUX_POLY_CACHE_LIMIT) each ciphertext builds fresh RNSPolys, so this ran
+	// at hundreds of thousands of events per training step.
 	cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-	cudaEventCreate(&ev, cudaEventDisableTiming);
 #else
 	ptr_ = nullptr;
 	ev   = nullptr;

@@ -4,6 +4,7 @@
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
+#include <algorithm>
 #include <source_location>
 
 #include "../parallel_for.hpp"
@@ -579,13 +580,143 @@ BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
 	return precom.boot[slots];
 }
 
+void Precomputations::KeyPrecomputations::touch(const int index) {
+	auto it = lru_pos.find(index);
+	if (it != lru_pos.end()) {
+		lru_order.splice(lru_order.begin(), lru_order, it->second);
+	} else {
+		lru_order.emplace_front(index);
+		lru_pos[index] = lru_order.begin();
+	}
+}
+
+bool Precomputations::KeyPrecomputations::offloadKey(const int index) {
+	auto it = rot_keys.find(index);
+	if (it == rot_keys.end() || !it->second.isResident() || !it->second.hasSnapshot())
+		return false;
+	it->second.offload();
+	resident_bytes -= it->second.limbBytes();
+	auto lit = lru_pos.find(index);
+	if (lit != lru_pos.end()) {
+		lru_order.erase(lit->second);
+		lru_pos.erase(lit);
+	}
+	return true;
+}
+
+void Precomputations::KeyPrecomputations::evictToFit(const size_t budget, const size_t incoming) {
+	while (resident_bytes + incoming > budget) {
+		bool evicted = false;
+		for (auto it = lru_order.rbegin(); it != lru_order.rend(); ++it) {
+			if (!pinned.contains(*it)) {
+				offloadKey(*it); // erases *it from lru_order; we break right away
+				evicted = true;
+				break;
+			}
+		}
+		if (!evicted) {
+			// Everything resident is pinned (or has no snapshot): the budget is
+			// unsatisfiable; overshoot it rather than break correctness.
+			return;
+		}
+	}
+}
+
+KeySwitchingKey& Precomputations::KeyPrecomputations::ensureResident(const int index, const size_t budget, const bool may_evict) {
+	auto it = rot_keys.find(index);
+	if (it == rot_keys.end())
+		throw std::runtime_error("Rotation key " + std::to_string(index) + " not found");
+	KeySwitchingKey& ksk = it->second;
+	if (!ksk.isResident()) {
+		if (may_evict) {
+			// Evict BEFORE loading so peak VRAM stays at budget (+1 key when the budget
+			// itself is smaller than a single key).
+			evictToFit(budget, ksk.limbBytes());
+		}
+		ksk.ensureResident();
+		resident_bytes += ksk.limbBytes();
+	}
+	touch(index);
+	return ksk;
+}
+
+void Precomputations::KeyPrecomputations::registerKey(const int index, KeySwitchingKey& ksk) {
+	if (ksk.isResident()) {
+		resident_bytes += ksk.limbBytes();
+	}
+	// Offloaded (lazy) keys enter the LRU on their first use.
+}
+
+void Precomputations::KeyPrecomputations::resetCacheBookkeeping() {
+	resident_bytes = 0;
+	lru_order.clear();
+	lru_pos.clear();
+	pinned.clear();
+}
+
+void Precomputations::KeyPrecomputations::enforceBudget(const size_t budget) {
+	evictToFit(budget, 0);
+}
+
+void ContextData::SetRotationKeyCache(const size_t bytes) {
+	rotation_key_cache_bytes = bytes;
+	for (auto& [keyID, kp] : precom.keys) {
+		kp.enforceBudget(bytes);
+	}
+}
+
+void ContextData::OffloadRotationKeys(const std::vector<int>& indexes, const KeyHash& keyID) {
+	for (auto& [kid, kp] : precom.keys) {
+		if (!keyID.empty() && kid != keyID)
+			continue;
+		for (auto& [idx, ksk] : kp.rot_keys) {
+			if (!indexes.empty() && std::find(indexes.begin(), indexes.end(), idx) == indexes.end())
+				continue;
+			kp.offloadKey(idx);
+		}
+	}
+}
+
+void ContextData::PinRotationKey(const int index, const bool pin, const KeyHash& keyID) {
+	for (auto& [kid, kp] : precom.keys) {
+		if (!keyID.empty() && kid != keyID)
+			continue;
+		if (!kp.rot_keys.contains(index))
+			continue;
+		if (pin) {
+			kp.pinned.insert(index);
+		} else {
+			kp.pinned.erase(index);
+		}
+	}
+}
+
+bool ContextData::IsRotationKeyResident(const int index, const KeyHash& keyID) const {
+	for (const auto& [kid, kp] : precom.keys) {
+		if (!keyID.empty() && kid != keyID)
+			continue;
+		auto it = kp.rot_keys.find(index);
+		if (it != kp.rot_keys.end())
+			return it->second.isResident();
+	}
+	return false;
+}
+
+size_t ContextData::RotationKeyCacheResidentBytes() const {
+	size_t bytes = 0;
+	for (const auto& [keyID, kp] : precom.keys) {
+		bytes += kp.resident_bytes;
+	}
+	return bytes;
+}
+
 KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID) {
 
 	if (!precom.keys.at(keyID).rot_keys.contains(index)) {
 		throw std::runtime_error("Rotation index " + std::to_string(index) + " not found");
 	}
 
-	return precom.keys.at(keyID).rot_keys.at(index);
+	return precom.keys.at(keyID).ensureResident(index, rotation_key_cache_bytes, rotation_key_eviction_hold == 0);
 }
 
 KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID, int slots, int& actual_index) {
@@ -604,18 +735,20 @@ KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID, in
 				for (int i = 1; i < N / 2 / slots; ++i) {
 					int index_ = (index + i * slots) % (N / 2);
 					if (precom.keys.at(keyID).rot_keys.contains(index_)) {
-						actual_index = index_;
-						return precom.keys.at(keyID).rot_keys.at(index_);
+						index = index_;
+						break;
 					}
 				}
 			}
-			std::cout << "Rotation index " << index << "/ " << index - slots << "not found." << std::endl;
-			throw std::runtime_error("Rotation index" + std::to_string(index) + " not found");
+			if (!precom.keys.at(keyID).rot_keys.contains(index)) {
+				std::cout << "Rotation index " << index << "/ " << index - slots << "not found." << std::endl;
+				throw std::runtime_error("Rotation index" + std::to_string(index) + " not found");
+			}
 		}
 	}
 
 	actual_index = index;
-	return precom.keys.at(keyID).rot_keys.at(index);
+	return precom.keys.at(keyID).ensureResident(index, rotation_key_cache_bytes, rotation_key_eviction_hold == 0);
 }
 
 void ContextData::AddRotationKey(int index, KeySwitchingKey&& ksk) {
@@ -624,7 +757,9 @@ void ContextData::AddRotationKey(int index, KeySwitchingKey&& ksk) {
 		index += this->N / 2;
 	if (!precom.keys.contains(ksk.keyID))
 		precom.keys[ksk.keyID] = Precomputations::KeyPrecomputations{};
-	precom.keys.at(ksk.keyID).rot_keys.emplace(index, std::move(ksk));
+	const KeyHash keyID = ksk.keyID;
+	precom.keys.at(keyID).rot_keys.emplace(index, std::move(ksk));
+	precom.keys.at(keyID).registerKey(index, precom.keys.at(keyID).rot_keys.at(index));
 }
 
 bool ContextData::HasRotationKey(int index, const KeyHash& keyID) {
@@ -944,6 +1079,7 @@ void ContextData::clearAutomorphismKeys(const KeyHash& KeyID) {
 	for (auto& i : precom.keys) {
 		if (KeyID.empty() || KeyID == i.first) {
 			i.second.rot_keys.clear();
+			i.second.resetCacheBookkeeping();
 		}
 	}
 }

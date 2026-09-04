@@ -132,6 +132,13 @@ class LimbPartition {
 
 	void freeSpecialLimbs();
 
+	/** Free every DECOMP and DIGIT limb of this partition (the bulk of a KeySwitchingKey's
+	 * VRAM footprint). Regular/special/gather limbs are untouched. The partition stays
+	 * regenerable: a later generateAllDecompAndDigit() recreates the limbs and repopulates
+	 * the pointer arrays, which are unmanaged views into bufferAUXptrs and must NOT be
+	 * freed here. Frees are stream-ordered through each limb's own stream. */
+	void freeDecompDigitLimbs();
+
 	using OptReference		= LimbPartition*;
 	using OptConstReference = const LimbPartition*;
 

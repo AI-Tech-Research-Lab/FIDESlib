@@ -12,8 +12,10 @@
 
 #include <array>
 #include <cassert>
+#include <cstdint>
 #include <iostream>
 #include <list>
+#include <set>
 
 #ifdef NCCL
 #include "nccl.h"
@@ -35,6 +37,33 @@ struct Precomputations {
 	struct KeyPrecomputations {
 		std::unique_ptr<KeySwitchingKey> eval_key;
 		std::map<int, KeySwitchingKey> rot_keys;
+
+		/** VRAM cache bookkeeping for the rotation keys in `rot_keys`. lru_order only
+		 * ever holds resident keys (back = least recently used); offloaded keys re-enter
+		 * on their next touch. Budget is per key set (per KeyHash): contexts normally
+		 * hold a single secret-key set, which makes this equal to the global budget. */
+		size_t resident_bytes = 0;
+		std::list<int> lru_order;
+		std::map<int, std::list<int>::iterator> lru_pos;
+		std::set<int> pinned;
+
+		void touch(int index);
+		/** Stream-ordered offload of rot_keys[index]; updates bookkeeping. Returns
+		 * false if the key does not exist, is already offloaded or has no snapshot. */
+		bool offloadKey(int index);
+		/** Evict LRU keys until resident_bytes + incoming <= budget. Skips pinned
+		 * keys and keys without a host snapshot; gives up (transient overshoot)
+		 * when nothing evictable remains. */
+		void evictToFit(size_t budget, size_t incoming);
+		/** Make rot_keys[index] resident, honoring `budget` with evict-before-load
+		 * so peak VRAM never exceeds budget + one key. */
+		KeySwitchingKey& ensureResident(int index, size_t budget, bool may_evict);
+		/** Account a key registered via AddRotationKey. */
+		void registerKey(int index, KeySwitchingKey& ksk);
+		/** Reset the bookkeeping (must be called whenever rot_keys is cleared). */
+		void resetCacheBookkeeping();
+		/** Immediately evict down to `budget` (runtime budget change). */
+		void enforceBudget(size_t budget);
 	};
 
 	std::map<KeyHash, KeyPrecomputations> keys;
@@ -176,6 +205,36 @@ class ContextData {
 	void clearBootPrecomputation(int slots = -1);
 	void clearParamSwitchKeys(const KeyHash& KeyID = {});
 
+	/** @name Rotation-key VRAM cache
+	 * Offload rotation keys to host RAM and reload them on the fly so the VRAM spent on
+	 * rotation keys stays within `rotation_key_cache_bytes` (steady state). Keys registered
+	 * while a finite budget is set are created VRAM-free (host snapshot only) and load
+	 * lazily on first use. The budget is soft: ops that need several keys at once (hoisted
+	 * rotation, bootstrap's linear transforms) transiently overshoot it; eviction resumes
+	 * on the next load. Keys created before a budget was set (no host snapshot) and keys
+	 * explicitly pinned are never offloaded. SIZE_MAX restores legacy behavior (all keys
+	 * permanently resident). The eval/relin key is not part of this cache.
+	 * @{ */
+	void SetRotationKeyCache(size_t bytes);
+	[[nodiscard]] size_t GetRotationKeyCache() const { return rotation_key_cache_bytes; }
+	/** True while a finite cache budget is set; rotation keys created now start offloaded. */
+	[[nodiscard]] bool rotationKeysLazy() const { return rotation_key_cache_bytes != SIZE_MAX; }
+	/** Manually offload rotation keys to host RAM. Empty `indexes` = all, empty `keyID` =
+	 * every key set. Requires the keys to have host snapshots (see rotationKeysLazy()). */
+	void OffloadRotationKeys(const std::vector<int>& indexes = {}, const KeyHash& keyID = {});
+	/** Pin/unpin a rotation key: pinned keys are never evicted by the cache. */
+	void PinRotationKey(int index, bool pin = true, const KeyHash& keyID = {});
+	[[nodiscard]] bool IsRotationKeyResident(int index, const KeyHash& keyID = {}) const;
+	/** Sum of VRAM bytes currently spent on resident rotation keys (all key sets). */
+	[[nodiscard]] size_t RotationKeyCacheResidentBytes() const;
+	/** }@ */
+
+	/** @cond */
+	size_t rotation_key_cache_bytes = SIZE_MAX;
+	/** Depth of active RotationKeyEvictionHold scopes. */
+	int rotation_key_eviction_hold = 0;
+	/** @endcond */
+
 	friend Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& devs);
 	friend void DeregisterCryptoContextGPU(const Parameters& param);
 	friend void DeregisterCryptoContextGPU(Context cc);
@@ -189,6 +248,21 @@ void DeregisterCryptoContextGPU(Context cc);
 void DeregisterAllContexts();
 Context GetCurrentContext();
 void SetCurrentContext(Context& cc);
+
+/** RAII guard that pauses rotation-key cache eviction while in scope. Required around
+ * any op that fetches SEVERAL rotation keys before launching the kernels that consume
+ * them (fused hoisted rotation, bootstrap linear transforms): an eviction between two
+ * fetches could free a key whose consuming kernels have not even been enqueued yet,
+ * where no amount of stream ordering or syncing can help. Within the hold, keys are
+ * still loaded on demand, just never evicted; the cache re-shrinks on the next load
+ * outside the hold. */
+struct RotationKeyEvictionHold {
+	ContextData& cc;
+	explicit RotationKeyEvictionHold(ContextData& cc_) : cc(cc_) { ++cc.rotation_key_eviction_hold; }
+	~RotationKeyEvictionHold() { --cc.rotation_key_eviction_hold; }
+	RotationKeyEvictionHold(const RotationKeyEvictionHold&) = delete;
+	RotationKeyEvictionHold& operator=(const RotationKeyEvictionHold&) = delete;
+};
 
 /// @brief Give back to the CUDA driver every buffer sitting idle in the GPU allocator's
 /// caching pool (see GPUtrim()/CudaUtils.cuh), on every device `cc` is loaded on. Freeing

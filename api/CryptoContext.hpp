@@ -54,6 +54,36 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void SetAutoLoadCiphertexts(bool autoload);
 	void SetDevices(const std::vector<int>& devices);
 
+	// ---- Rotation-key VRAM cache ----
+
+	/// @brief Cap the VRAM spent on rotation keys to `bytes`, offloading the least recently
+	/// used ones to host RAM and reloading them on demand. SIZE_MAX (the default) keeps every
+	/// rotation key permanently resident.
+	///
+	/// Call it BEFORE LoadContext(): rotation keys can only be offloaded if they were created
+	/// while a finite budget was set (they then keep the host-RAM snapshot that offload/reload
+	/// round-trips through, and cost no VRAM until first used). Keys already resident when the
+	/// budget is set have no snapshot and stay pinned; setting the budget after LoadContext()
+	/// therefore only bounds keys added later (e.g. by EvalBootstrapKeyGen).
+	///
+	/// The budget is soft: operations that need several keys at once (hoisted rotation,
+	/// bootstrap's linear transforms) transiently overshoot it and the cache re-shrinks on the
+	/// next load.
+	void SetRotationKeyCache(size_t bytes);
+	/// @brief The current rotation-key VRAM budget in bytes (SIZE_MAX = unlimited).
+	size_t GetRotationKeyCache() const;
+	/// @brief Offload rotation keys to host RAM now, without waiting for eviction. An empty
+	/// `indexes` offloads all of them. Keys without a host snapshot, and pinned keys, are
+	/// skipped. Requires the context to be loaded.
+	void OffloadRotationKeys(const std::vector<int>& indexes = {});
+	/// @brief Pin (or unpin) a rotation key so the cache never evicts it. Requires the context
+	/// to be loaded.
+	void PinRotationKey(int index, bool pin = true);
+	/// @brief Whether the rotation key for `index` currently holds its VRAM limbs.
+	bool IsRotationKeyResident(int index) const;
+	/// @brief VRAM bytes currently spent on resident rotation keys.
+	size_t GetRotationKeyCacheResidentBytes() const;
+
 	// ---- Load to devices ----
 
 	/// @brief Load the context to the devices.
@@ -244,6 +274,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	std::vector<uint32_t> slots_bootstrap;
 	/// @brief Secret key distribution.
 	SecretKeyDist keyDist = UNIFORM_TERNARY;
+	/// @brief Rotation-key VRAM budget in bytes, applied to the GPU context in LoadContext();
+	/// SIZE_MAX means unlimited. See SetRotationKeyCache().
+	size_t rotation_key_cache_bytes = SIZE_MAX;
 
 	// ---- Copy helpers ----
 

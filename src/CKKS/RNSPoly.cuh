@@ -110,6 +110,11 @@ class RNSPoly {
 	 * in a valid, empty (level == -1) state that load()/grow() can repopulate from
 	 * scratch. Does not touch special/decomp/digit/gather limbs. Idempotent. */
 	void freeGPU();
+
+	/** Free the DECOMP/DIGIT limbs of every GPU partition (see
+	 * LimbPartition::freeDecompDigitLimbs). Leaves the polynomial regenerable via
+	 * generateDecompAndDigit(); does not touch regular limbs nor the level. Idempotent. */
+	void freeDecompDigitGPU();
 	void addMult(const RNSPoly& poly, const RNSPoly& poly1);
 	void broadcastLimb0();
 	void evalLinearWSum(uint32_t i, std::vector<const RNSPoly*>& vector1, std::vector<uint64_t>& vector2);

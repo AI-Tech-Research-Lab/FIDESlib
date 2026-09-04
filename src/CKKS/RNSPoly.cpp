@@ -857,6 +857,13 @@ void RNSPoly::freeGPU() {
 	level = -1;
 }
 
+void RNSPoly::freeDecompDigitGPU() {
+	for (auto& g : GPU) {
+		cudaSetDevice(g.device);
+		g.freeDecompDigitLimbs();
+	}
+}
+
 void RNSPoly::addMult(const RNSPoly& poly, const RNSPoly& poly1) {
 	assert(level <= poly1.level && level <= poly.level);
 #pragma omp parallel for num_threads(cc.GPUid.size())

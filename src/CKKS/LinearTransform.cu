@@ -1204,12 +1204,18 @@ void FIDESlib::CKKS::LinearTransformPt(FIDESlib::CKKS::Plaintext& ptxt, FIDESlib
 	std::vector<int> indexes;
 	std::vector<KeySwitchingKey*> keys;
 
-	for (int i = 1; i < bStep; ++i) {
-		fastRotationPtr.push_back(&fastRotation[i - 1]);
-		keys.push_back(&cc.GetRotationKey(i * stride));
-		indexes.push_back(i * stride);
+	{
+		// Several keys are fetched before the kernels consuming them are enqueued (both in
+		// the collection loop here and in rotate_hoisted below); pause cache eviction to
+		// avoid freeing a key that is not used yet.
+		RotationKeyEvictionHold hold(cc);
+		for (int i = 1; i < bStep; ++i) {
+			fastRotationPtr.push_back(&fastRotation[i - 1]);
+			keys.push_back(&cc.GetRotationKey(i * stride));
+			indexes.push_back(i * stride);
+		}
+		ptxt.rotate_hoisted(indexes, fastRotationPtr);
 	}
-	ptxt.rotate_hoisted(indexes, fastRotationPtr);
 
 	Plaintext result(cc);
 	Plaintext inner(cc);

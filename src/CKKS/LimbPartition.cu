@@ -826,6 +826,24 @@ void LimbPartition::freeSpecialLimbs() {
 	}
 }
 
+void LimbPartition::freeDecompDigitLimbs() {
+	cudaSetDevice(device);
+	for (auto& group : DECOMPlimb)
+		for (auto& l : group)
+			STREAM(l).wait(s);
+	for (auto& group : DIGITlimb)
+		for (auto& l : group)
+			STREAM(l).wait(s);
+	// ~Limb releases each limb's device buffers through GPUfree on the limb's (partition)
+	// stream, so the frees are ordered after any kernel enqueued there. DECOMPlimbptr /
+	// DIGITlimbptr are unmanaged views into bufferAUXptrs: keep them alive, they are
+	// repopulated by generateAllDecompAndDigit().
+	for (auto& group : DECOMPlimb)
+		group.clear();
+	for (auto& group : DIGITlimb)
+		group.clear();
+}
+
 void LimbPartition::copyLimb(const LimbPartition& partition) {
 	cudaSetDevice(device);
 	s.wait(partition.getS());

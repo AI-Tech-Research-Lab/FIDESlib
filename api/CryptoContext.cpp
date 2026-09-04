@@ -194,6 +194,53 @@ void CryptoContextImpl<DCRTPoly>::SetDevices(const std::vector<int>& devices) {
 	this->devices = devices;
 }
 
+// ---- Rotation-key VRAM cache ----
+
+void CryptoContextImpl<DCRTPoly>::SetRotationKeyCache(const size_t bytes) {
+	FIDESlib::CudaNvtxRange r("API");
+	this->rotation_key_cache_bytes = bytes;
+	if (this->loaded) {
+		auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+		context_gpu->SetRotationKeyCache(bytes);
+	}
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetRotationKeyCache() const {
+	return this->rotation_key_cache_bytes;
+}
+
+void CryptoContextImpl<DCRTPoly>::OffloadRotationKeys(const std::vector<int>& indexes) {
+	FIDESlib::CudaNvtxRange r("API");
+	if (!this->loaded) {
+		OPENFHE_THROW("CryptoContext not loaded to any device");
+	}
+	auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	context_gpu->OffloadRotationKeys(indexes);
+}
+
+void CryptoContextImpl<DCRTPoly>::PinRotationKey(const int index, const bool pin) {
+	FIDESlib::CudaNvtxRange r("API");
+	if (!this->loaded) {
+		OPENFHE_THROW("CryptoContext not loaded to any device");
+	}
+	auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	context_gpu->PinRotationKey(index, pin);
+}
+
+bool CryptoContextImpl<DCRTPoly>::IsRotationKeyResident(const int index) const {
+	if (!this->loaded)
+		return false;
+	auto& context_gpu = std::any_cast<const FIDESlib::CKKS::Context&>(this->gpu);
+	return context_gpu->IsRotationKeyResident(index);
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetRotationKeyCacheResidentBytes() const {
+	if (!this->loaded)
+		return 0;
+	auto& context_gpu = std::any_cast<const FIDESlib::CKKS::Context&>(this->gpu);
+	return context_gpu->RotationKeyCacheResidentBytes();
+}
+
 // ---- Load to devices ----
 
 void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicKey) {
@@ -222,6 +269,11 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 	params                              = params.adaptTo(rawParams);
 	FIDESlib::CKKS::Context c           = FIDESlib::CKKS::GenCryptoContextGPU(params, this->devices);
 
+	// Must happen before the keys below are built: a finite budget makes every rotation key
+	// (including the bootstrapping ones) start as a host-RAM snapshot that loads lazily and can
+	// be evicted again. Keys built without it are permanently resident.
+	c->SetRotationKeyCache(this->rotation_key_cache_bytes);
+
 	auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
 
 	// Multiplicative key switching key.
@@ -236,7 +288,7 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 	for (const auto& step : this->rotation_indexes) {
 		auto raw_rot_ksk = FIDESlib::CKKS::GetRotationKeySwitchKey(pkImpl, step);
 		FIDESlib::CKKS::KeySwitchingKey rot_ksk(c);
-		rot_ksk.Initialize(raw_rot_ksk);
+		rot_ksk.Initialize(raw_rot_ksk, c->rotationKeysLazy());
 		c->AddRotationKey(step, std::move(rot_ksk));
 	}
 	// Bootstrapping keys.

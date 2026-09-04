@@ -1152,26 +1152,31 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 		std::vector<RNSPoly*> c1_out;
 		std::vector<RNSPoly*> ksk_a;
 		std::vector<RNSPoly*> ksk_b;
-		for (size_t i = 0; i < indexes.size(); ++i) {
-			if (indexes[i] == 0) {
-				results[i]->copy(*this);
-				if (ext) {
-					results[i]->extend();
+		{
+			// Several keys are fetched before hoistedRotationFused enqueues the kernels
+			// consuming them; an eviction in between could free a not-yet-used key.
+			RotationKeyEvictionHold hold(cc);
+			for (size_t i = 0; i < indexes.size(); ++i) {
+				if (indexes[i] == 0) {
+					results[i]->copy(*this);
+					if (ext) {
+						results[i]->extend();
+					}
+				} else {
+					c0_out.push_back(&results[i]->c0);
+					c1_out.push_back(&results[i]->c1);
+					int actual_index;
+					auto& ksk = cc.GetRotationKey(indexes[i], keyID, slots, actual_index);
+					ksk_a.push_back(&ksk.a);
+					ksk_b.push_back(&ksk.b);
+					index.push_back(actual_index);
+
+					results[i]->copyMetadata(*this);
 				}
-			} else {
-				c0_out.push_back(&results[i]->c0);
-				c1_out.push_back(&results[i]->c1);
-				int actual_index;
-				auto& ksk = cc.GetRotationKey(indexes[i], keyID, slots, actual_index);
-				ksk_a.push_back(&ksk.a);
-				ksk_b.push_back(&ksk.b);
-				index.push_back(actual_index);
-
-				results[i]->copyMetadata(*this);
 			}
-		}
 
-		in.hoistedRotationFused(index, c0_out, c1_out, ksk_a, ksk_b, c0, c1);
+			in.hoistedRotationFused(index, c0_out, c1_out, ksk_a, ksk_b, c0, c1);
+		}
 
 		if (!ext) {
 			for (size_t i = 0; i < indexes.size(); ++i) {

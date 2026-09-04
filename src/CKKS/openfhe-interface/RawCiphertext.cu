@@ -808,7 +808,7 @@ void FIDESlib::CKKS::AddRotationKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPol
 		auto clave_rotacion = FIDESlib::CKKS::GetRotationKeySwitchKey(publicKey, i);
 		// std::cout << "Load rotation key " << i << std::endl;
 		FIDESlib::CKKS::KeySwitchingKey clave_rotacion_gpu(GPUcc);
-		clave_rotacion_gpu.Initialize(clave_rotacion);
+		clave_rotacion_gpu.Initialize(clave_rotacion, GPUcc->rotationKeysLazy());
 		GPUcc->AddRotationKey(i, std::move(clave_rotacion_gpu));
 	}
 }
@@ -1104,7 +1104,7 @@ void FIDESlib::CKKS::AddBootstrapKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPo
 	{
 		KeySwitchingKey ksk(GPUcc_);
 		RawKeySwitchKey rksk = GetConjugateKeySwitchKey(publicKey);
-		ksk.Initialize(rksk);
+		ksk.Initialize(rksk, GPUcc_->rotationKeysLazy());
 		GPUcc.AddRotationKey(GPUcc.N * 2 - 1, std::move(ksk));
 	}
 	// std::cout << "Add rotation keys" << std::endl;

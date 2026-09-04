@@ -571,6 +571,56 @@ class GeneralParametrizedTest : public testing::TestWithParam<std::tuple<std::tu
 		ASSERT_LE(Max, pow(2.0, -result->GetLogPrecision() + 4));                                                                          \
 	} while (0);
 
+// Like ASSERT_ERROR_OK but with extra exponent slack. Bootstrap sub-operations
+// (CoeffsToSlots, ApproxModReduction, ...) produce a permuted/rescaled slot layout, so
+// there is no meaningful per-slot message to compare against; the reference's
+// GetLogPrecision() is scale-derived and does not track the algorithmic GPU-vs-CPU
+// rounding differences (different digit decomposition / NTT order / fused kernels).
+#define ASSERT_ERROR_OK_SLACK(result, resultGPU, SLACK)                                                                                \
+	do {                                                                                                                               \
+		double acc = 0.0;                                                                                                              \
+		double Max = 0.0;                                                                                                              \
+		for (size_t i = 0; i < result->GetSlots(); ++i) {                                                                              \
+			double diff = abs(resultGPU->GetRealPackedValue().at(i) - result->GetRealPackedValue().at(i));                             \
+			acc += diff * diff;                                                                                                        \
+			Max = std::max(Max, diff);                                                                                                 \
+		}                                                                                                                              \
+		acc = std::sqrt(acc / result->GetSlots());                                                                                     \
+		double tol = pow(2.0, -result->GetLogPrecision() + 4 + (SLACK));                                                               \
+		std::cout << "Max error: " << Max << " (tolerance: " << tol << "), dev: " << acc << std::endl;                                 \
+		ASSERT_LE(Max, tol);                                                                                                           \
+	} while (0);
+
+// CPU/GPU comparison for an operation whose operands need a depth/level adjustment.
+//
+// Bit-exact equality is unattainable there under FIXEDAUTO: OpenFHE performs the adjustment by
+// multiplying the operand by a *rounded* double and then mod-reducing it
+// (EvalMultCoreInPlace(ct, 1.0) resp. scf1/scf2/scf, see AdjustLevelsAndDepth[ToOne]InPlace in
+// ckksrns-leveledshe.cpp), while FIDESlib aligns exactly -- limb drop plus rescale, no scalar
+// multiply (Plaintext::adjustPlaintextToCiphertext, Plaintext.cu). Under FIXEDAUTO the nominal
+// scaling factor is the constant 2^scaleModSize at every level (m_scalingFactorsReal is only
+// filled for the FLEXIBLE*/COMPOSITE* techniques), so the two results are valid encryptions of
+// the same message that differ by the q_l/Delta drift the technique tolerates by design -- and
+// two residues that differ by one unit share no digits, hence the strict check cannot hold.
+// FIXEDMANUAL (adjustment = plain level drop) and FLEXIBLE* (FIDESlib replicates the same scalar
+// multiply in adjustScaleAndLevel) do stay bit-exact, so they keep the strict comparison; only
+// FIXEDAUTO falls back to comparing the decrypted messages.
+// The 2^13 slack on the message comparison is measured: the CPU/GPU decrypted difference under
+// FIXEDAUTO comes out at 4.2e-11 (Mult/PtMult over all levels) to 1.1e-9 (single PtMult), against
+// an ASSERT_ERROR_OK tolerance of ~9e-13 -- i.e. the q_l/Delta drift stays ~7x inside this bound,
+// while an actual breakage (a dropped diagonal, a wrong rotation) is O(1) and still caught.
+#define ASSERT_EQ_CIPHERTEXT_INTEROP(ctCPU, ctGPU)                              \
+	do {                                                                        \
+		if (std::get<1>(GetParam()) == lbcrypto::ScalingTechnique::FIXEDAUTO) { \
+			lbcrypto::Plaintext pCPU_, pGPU_;                                   \
+			cc->Decrypt(keys.secretKey, ctCPU, &pCPU_);                         \
+			cc->Decrypt(keys.secretKey, ctGPU, &pGPU_);                         \
+			ASSERT_ERROR_OK_SLACK(pCPU_, pGPU_, 13);                            \
+		} else {                                                                \
+			ASSERT_EQ_CIPHERTEXT(ctCPU, ctGPU);                                 \
+		}                                                                       \
+	} while (0);
+
 #define ASSERT_EQ_DCRTPOLY(ct1, ct2)                                                                                         \
 	do {                                                                                                                     \
 		for (int j = 0; j < 1; ++j) {                                                                                        \

@@ -41,6 +41,10 @@ template <typename T> class VectorGPU {
 	VectorGPU(const VectorGPU<T>& v)			   = delete;
 	VectorGPU(T* data, const int size, const int device, const int offset = 0);
 	VectorGPU(Stream& stream, const int size, const int device, const T* src = nullptr);
+	/** Device bytes this vector owns, i.e. that its own free()/destructor releases. Zero for
+	 * an unmanaged vector -- a view into someone else's buffer (see the T* constructor) --
+	 * so that summing over a set of vectors never counts the same allocation twice. */
+	[[nodiscard]] size_t ownedBytes() const { return managed ? static_cast<size_t>(size) * sizeof(T) : 0; }
 	void free(Stream& stream);
 	~VectorGPU();
 };

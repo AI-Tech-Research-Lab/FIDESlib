@@ -114,6 +114,8 @@ class Plaintext {
 	 *       cause deserialization errors in consumers written in other languages (e.g., Python bindings).
 	 */
 	void store(RawPlainText& raw);
+	/** Device bytes this plaintext currently holds. See RNSPoly::limbBytes(). */
+	[[nodiscard]] size_t limbBytes() const { return c0.limbBytes(); }
 	/**
 	 * @brief Deep copy of another plaintext.
 	 *

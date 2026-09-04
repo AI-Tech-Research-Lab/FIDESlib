@@ -5,9 +5,11 @@
 #include <complex>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <memory>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "CCParams.hpp"
@@ -83,6 +85,40 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	bool IsRotationKeyResident(int index) const;
 	/// @brief VRAM bytes currently spent on resident rotation keys.
 	size_t GetRotationKeyCacheResidentBytes() const;
+
+	// ---- Plaintext VRAM cache ----
+
+	/// @brief Cap the VRAM spent on device plaintexts to `bytes`, dropping the least recently
+	/// used ones and re-uploading them on demand. SIZE_MAX (the default) keeps every plaintext
+	/// on the device until its Plaintext is destroyed.
+	///
+	/// Unlike the rotation-key cache this can be called at any time, and needs no snapshot:
+	/// the host-side encoding a plaintext was built from is kept by its Plaintext anyway, so
+	/// eviction is a plain free and a miss costs one host->device upload of an unchanged
+	/// encoding (plaintexts are read-only in every operation that takes one). Every operation
+	/// re-uploads what it needs through LoadPlaintext(), so eviction is transparent.
+	///
+	/// The budget is soft in three ways: a plaintext's size is only known once it is built, so
+	/// a load overshoots by that one plaintext before the cache re-shrinks; an operation
+	/// holding several plaintexts at once (the convolution transforms) keeps all of them
+	/// resident until it returns; and a budget smaller than a single plaintext still keeps the
+	/// one in use resident. Pinned plaintexts are never evicted.
+	///
+	/// Only plaintexts registered through LoadPlaintext() are cached -- not the plaintexts
+	/// inside the bootstrapping precomputation, which belong to the GPU context.
+	void SetPlaintextCache(size_t bytes);
+	/// @brief The current plaintext VRAM budget in bytes (SIZE_MAX = unlimited).
+	size_t GetPlaintextCache() const;
+	/// @brief VRAM bytes currently spent on device plaintexts. Tracked whether or not a
+	/// budget is set, so it also answers "how much VRAM are my plaintexts holding?".
+	size_t GetPlaintextCacheResidentBytes() const;
+	/// @brief Drop every unpinned device plaintext now, without waiting for eviction. The
+	/// plaintexts stay usable: the next operation re-uploads what it needs.
+	void OffloadPlaintexts();
+	/// @brief Pin (or unpin) a plaintext so the cache never evicts it, loading it to the
+	/// device first if needed. The pin is tied to the current device copy: dropping it
+	/// explicitly (Decrypt into it, or destroying it) also drops the pin.
+	void PinPlaintext(Plaintext& pt, bool pin = true);
 
 	// ---- Load to devices ----
 
@@ -291,6 +327,40 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// @brief Next available handle for GPU objects. Zero is reserved as a null handle.
 	uint32_t next_gpu_handle = 1;
 
+	/// @brief Plaintext VRAM budget in bytes; SIZE_MAX means unlimited. See SetPlaintextCache().
+	size_t plaintext_cache_bytes = SIZE_MAX;
+	/// @brief VRAM bytes held by the plaintexts currently in `device_plaintexts`.
+	size_t plaintext_resident_bytes = 0;
+	/// @brief Cache bookkeeping for one device plaintext.
+	struct PlaintextCacheEntry {
+		/// @brief The api-level plaintext owning this handle, so eviction can mark it unloaded.
+		std::weak_ptr<PlaintextImpl> owner;
+		/// @brief VRAM bytes the device plaintext held when it was loaded.
+		size_t bytes = 0;
+		/// @brief This handle's position in `plaintext_lru`.
+		std::list<uint32_t>::iterator lru;
+	};
+	std::unordered_map<uint32_t, PlaintextCacheEntry> plaintext_cache;
+	/// @brief Handles by recency of use, most recent first; eviction takes from the back.
+	std::list<uint32_t> plaintext_lru;
+	/// @brief Handles the cache must never evict. See PinPlaintext().
+	std::unordered_set<uint32_t> plaintext_pinned;
+	/// @brief Depth of active PlaintextCacheHold scopes; eviction is deferred while > 0.
+	int plaintext_cache_hold = 0;
+
+	/// @brief Start tracking a freshly loaded device plaintext as the most recently used one.
+	void TrackPlaintext(uint32_t handle, const Plaintext& pt, size_t bytes);
+	/// @brief Stop tracking a device plaintext that is about to leave `device_plaintexts`.
+	void UntrackPlaintext(uint32_t handle);
+	/// @brief Mark a device plaintext as the most recently used one.
+	void TouchPlaintext(uint32_t handle);
+	/// @brief Drop one device plaintext, marking its Plaintext unloaded so the next operation
+	/// re-uploads it. Returns false if the handle isn't tracked.
+	bool OffloadPlaintextHandle(uint32_t handle);
+	/// @brief Evict least-recently-used plaintexts until the budget is met, never touching
+	/// `protect`, a pinned handle, or anything at all while a PlaintextCacheHold is active.
+	void EnforcePlaintextBudget(uint32_t protect = 0);
+
 	uint32_t RegisterDevicePlaintext(std::shared_ptr<void>&& p);
 	uint32_t RegisterDeviceCiphertext(std::shared_ptr<void>&& c);
 	std::shared_ptr<void>& GetDevicePlaintext(uint32_t handle);
@@ -301,6 +371,29 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void Synchronize() const;
 
 	static std::vector<int> GetConvolutionTransformRotationIndices(int rowSize, int bStep, int stride, uint32_t gStep);
+};
+
+/// @brief RAII guard that defers plaintext cache eviction to the end of the scope, and runs it
+/// there. Every operation that fetches device plaintexts takes one: an operation may hold
+/// several of them (the convolution transforms keep raw pointers to a whole batch), and an
+/// eviction triggered by loading one of them would free a plaintext whose consuming kernels
+/// have not been enqueued yet. Loads still happen inside the scope, they just never evict, so
+/// the budget is met again as soon as the operation returns.
+struct PlaintextCacheHold {
+	CryptoContextImpl<DCRTPoly>& cc;
+	explicit PlaintextCacheHold(CryptoContextImpl<DCRTPoly>& cc_) : cc(cc_) { ++cc.plaintext_cache_hold; }
+	~PlaintextCacheHold() {
+		if (--cc.plaintext_cache_hold == 0) {
+			try {
+				cc.EnforcePlaintextBudget();
+			} catch (...) {
+				// A destructor must not throw; the budget is soft and gets enforced again on
+				// the next load anyway.
+			}
+		}
+	}
+	PlaintextCacheHold(const PlaintextCacheHold&)			 = delete;
+	PlaintextCacheHold& operator=(const PlaintextCacheHold&) = delete;
 };
 
 } // namespace fideslib

@@ -857,6 +857,30 @@ void RNSPoly::freeGPU() {
 	level = -1;
 }
 
+size_t RNSPoly::limbBytes() const {
+	size_t bytes = 0;
+	auto add	 = [&bytes](const LimbImpl& l) { bytes += l.index() == U32 ? std::get<U32>(l).ownedBytes() : std::get<U64>(l).ownedBytes(); };
+	for (const auto& g : GPU) {
+		for (const auto& l : g.limb)
+			add(l);
+		for (const auto& l : g.SPECIALlimb)
+			add(l);
+		for (const auto& grp : g.DECOMPlimb)
+			for (const auto& l : grp)
+				add(l);
+		for (const auto& grp : g.DIGITlimb)
+			for (const auto& l : grp)
+				add(l);
+		for (const auto& l : g.GATHERlimb)
+			add(l);
+		if (g.bufferLIMB != nullptr) {
+			// Mirrors the size LimbPartition::freeLimbs() releases it with.
+			bytes += static_cast<size_t>(cc.N) * g.meta.size() * 2 * sizeof(uint64_t);
+		}
+	}
+	return bytes;
+}
+
 void RNSPoly::freeDecompDigitGPU() {
 	for (auto& g : GPU) {
 		cudaSetDevice(g.device);

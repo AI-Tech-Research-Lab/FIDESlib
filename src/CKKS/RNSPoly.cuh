@@ -111,6 +111,16 @@ class RNSPoly {
 	 * scratch. Does not touch special/decomp/digit/gather limbs. Idempotent. */
 	void freeGPU();
 
+	/** Device bytes this polynomial currently holds: the owned payload+scratch of every
+	 * limb it has generated (regular, special, decomp, digit and gather) on every GPU
+	 * partition, plus the partition-level single limb buffer when one is in use. Limbs that
+	 * are views into a partition buffer report zero on their own, so nothing is counted
+	 * twice; the special/decomp/digit/gather single buffers of the key-switching paths are
+	 * not tracked (their sizes are not recorded at allocation) and are not counted. Changes
+	 * as the polynomial grows, drops levels or frees limbs, so re-read it rather than
+	 * caching the value. */
+	[[nodiscard]] size_t limbBytes() const;
+
 	/** Free the DECOMP/DIGIT limbs of every GPU partition (see
 	 * LimbPartition::freeDecompDigitLimbs). Leaves the polynomial regenerable via
 	 * generateDecompAndDigit(); does not touch regular limbs nor the level. Idempotent. */

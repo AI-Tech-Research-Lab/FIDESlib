@@ -19,6 +19,7 @@
 #include "cryptocontext-fwd.h"
 #include "lattice/hal/lat-backend.h"
 
+#include <algorithm>
 #include <any>
 #include <cmath>
 #include <complex>
@@ -241,6 +242,111 @@ size_t CryptoContextImpl<DCRTPoly>::GetRotationKeyCacheResidentBytes() const {
 	return context_gpu->RotationKeyCacheResidentBytes();
 }
 
+// ---- Plaintext VRAM cache ----
+
+void CryptoContextImpl<DCRTPoly>::SetPlaintextCache(const size_t bytes) {
+	FIDESlib::CudaNvtxRange r("API");
+	this->plaintext_cache_bytes = bytes;
+	this->EnforcePlaintextBudget();
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetPlaintextCache() const {
+	return this->plaintext_cache_bytes;
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetPlaintextCacheResidentBytes() const {
+	return this->plaintext_resident_bytes;
+}
+
+void CryptoContextImpl<DCRTPoly>::OffloadPlaintexts() {
+	FIDESlib::CudaNvtxRange r("API");
+	// Collect first: offloading mutates plaintext_cache.
+	std::vector<uint32_t> handles;
+	handles.reserve(this->plaintext_cache.size());
+	for (const auto& [handle, entry] : this->plaintext_cache) {
+		if (!this->plaintext_pinned.contains(handle)) {
+			handles.push_back(handle);
+		}
+	}
+	for (const uint32_t handle : handles) {
+		this->OffloadPlaintextHandle(handle);
+	}
+}
+
+void CryptoContextImpl<DCRTPoly>::PinPlaintext(Plaintext& pt, const bool pin) {
+	FIDESlib::CudaNvtxRange r("API");
+	if (pin) {
+		this->LoadPlaintext(pt);
+		if (pt->loaded) {
+			this->plaintext_pinned.insert(pt->gpu);
+		}
+	} else if (pt->gpu != 0) {
+		this->plaintext_pinned.erase(pt->gpu);
+		this->EnforcePlaintextBudget();
+	}
+}
+
+void CryptoContextImpl<DCRTPoly>::TrackPlaintext(const uint32_t handle, const Plaintext& pt, const size_t bytes) {
+	this->plaintext_lru.push_front(handle);
+	this->plaintext_cache.emplace(handle, PlaintextCacheEntry{ std::weak_ptr<PlaintextImpl>(pt), bytes, this->plaintext_lru.begin() });
+	this->plaintext_resident_bytes += bytes;
+}
+
+void CryptoContextImpl<DCRTPoly>::UntrackPlaintext(const uint32_t handle) {
+	auto it = this->plaintext_cache.find(handle);
+	if (it == this->plaintext_cache.end()) {
+		return;
+	}
+	this->plaintext_resident_bytes -= std::min(it->second.bytes, this->plaintext_resident_bytes);
+	this->plaintext_lru.erase(it->second.lru);
+	this->plaintext_pinned.erase(handle);
+	this->plaintext_cache.erase(it);
+}
+
+void CryptoContextImpl<DCRTPoly>::TouchPlaintext(const uint32_t handle) {
+	auto it = this->plaintext_cache.find(handle);
+	if (it == this->plaintext_cache.end()) {
+		return;
+	}
+	this->plaintext_lru.splice(this->plaintext_lru.begin(), this->plaintext_lru, it->second.lru);
+}
+
+bool CryptoContextImpl<DCRTPoly>::OffloadPlaintextHandle(const uint32_t handle) {
+	auto it = this->plaintext_cache.find(handle);
+	if (it == this->plaintext_cache.end()) {
+		return false;
+	}
+	if (const auto owner = it->second.owner.lock()) {
+		// The next operation taking this plaintext re-uploads it from the host encoding.
+		owner->loaded = false;
+		owner->gpu	  = 0;
+	}
+	// Drops the registry's reference to the device plaintext (and its bookkeeping, through
+	// UntrackPlaintext). If an operation in flight still holds a reference, the VRAM comes
+	// back when that one dies instead of here.
+	return this->EvictDevicePlaintext(handle);
+}
+
+void CryptoContextImpl<DCRTPoly>::EnforcePlaintextBudget(const uint32_t protect) {
+	if (this->plaintext_cache_bytes == SIZE_MAX || this->plaintext_cache_hold > 0) {
+		return;
+	}
+	while (this->plaintext_resident_bytes > this->plaintext_cache_bytes) {
+		uint32_t victim = 0;
+		for (auto it = this->plaintext_lru.rbegin(); it != this->plaintext_lru.rend(); ++it) {
+			if (*it != protect && !this->plaintext_pinned.contains(*it)) {
+				victim = *it;
+				break;
+			}
+		}
+		// Nothing left to evict: the budget is unsatisfiable (everything is pinned or in use),
+		// so overshoot it rather than break the caller.
+		if (victim == 0 || !this->OffloadPlaintextHandle(victim)) {
+			return;
+		}
+	}
+}
+
 // ---- Load to devices ----
 
 void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicKey) {
@@ -321,9 +427,16 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt) {
 	const auto& ptImpl                                = std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
 	FIDESlib::CKKS::RawPlainText raw_pt               = FIDESlib::CKKS::GetRawPlainText(context, ptImpl);
 	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu, raw_pt);
+	const size_t bytes                                = gpu_pt->limbBytes();
 	uint32_t handle                                   = this->RegisterDevicePlaintext(std::move(gpu_pt));
 	pt->gpu                                           = handle;
 	pt->loaded                                        = true;
+
+	// A plaintext's size is only known once it is built, so the budget is enforced after the
+	// upload (protecting the new plaintext, which the caller is about to use) rather than
+	// before it: it can overshoot by this one plaintext until the next load.
+	this->TrackPlaintext(handle, pt, bytes);
+	this->EnforcePlaintextBudget(handle);
 }
 
 void CryptoContextImpl<DCRTPoly>::LoadCiphertext(Ciphertext<DCRTPoly>& ct) {
@@ -836,6 +949,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalAdd(const Ciphertext<DCRTP
 
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalAdd(const Ciphertext<DCRTPoly>& ct, Plaintext& pt) {
 	FIDESlib::CudaNvtxRange r("API");
+	PlaintextCacheHold plaintext_hold(*this); // no plaintext this op fetches may be evicted mid-op
 
 	// Fall back to CPU.
 	if (this->devices.empty()) {
@@ -918,6 +1032,7 @@ void CryptoContextImpl<DCRTPoly>::EvalAddInPlace(Ciphertext<DCRTPoly>& ct1, cons
 
 void CryptoContextImpl<DCRTPoly>::EvalAddInPlace(Ciphertext<DCRTPoly>& ct1, Plaintext& pt) {
 	FIDESlib::CudaNvtxRange r("API");
+	PlaintextCacheHold plaintext_hold(*this); // no plaintext this op fetches may be evicted mid-op
 
 	// Fall back to CPU.
 	if (this->devices.empty()) {
@@ -1102,6 +1217,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSub(const Ciphertext<DCRTP
 
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSub(const Ciphertext<DCRTPoly>& ct, Plaintext& pt) {
 	FIDESlib::CudaNvtxRange r("API");
+	PlaintextCacheHold plaintext_hold(*this); // no plaintext this op fetches may be evicted mid-op
 
 	// Fall back to CPU.
 	if (this->devices.empty()) {
@@ -1129,6 +1245,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSub(const Ciphertext<DCRTP
 
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSub(Plaintext& pt, const Ciphertext<DCRTPoly>& ct) {
 	FIDESlib::CudaNvtxRange r("API");
+	PlaintextCacheHold plaintext_hold(*this); // no plaintext this op fetches may be evicted mid-op
 
 	// Fall back to CPU.
 	if (this->devices.empty()) {
@@ -1319,6 +1436,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(const Ciphertext<DCRT
 
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(const Ciphertext<DCRTPoly>& ct1, Plaintext& pt) {
 	FIDESlib::CudaNvtxRange r("API");
+	PlaintextCacheHold plaintext_hold(*this); // no plaintext this op fetches may be evicted mid-op
 
 	// Fall back to CPU.
 	if (this->devices.empty()) {
@@ -1380,6 +1498,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(double scalar, const 
 
 void CryptoContextImpl<DCRTPoly>::EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, Plaintext& pt) {
 	FIDESlib::CudaNvtxRange r("API");
+	PlaintextCacheHold plaintext_hold(*this); // no plaintext this op fetches may be evicted mid-op
 
 	if (this->devices.empty()) {
 
@@ -1963,6 +2082,7 @@ void CryptoContextImpl<DCRTPoly>::ConvolutionTransformInPlace(Ciphertext<DCRTPol
                                                               int stride,
                                                               int rowSize) {
 	FIDESlib::CudaNvtxRange r("API");
+	PlaintextCacheHold plaintext_hold(*this); // no plaintext this op fetches may be evicted mid-op
 
 	if (this->devices.empty()) {
 		OPENFHE_THROW("Not implemented for CPU path");
@@ -1996,6 +2116,7 @@ void CryptoContextImpl<DCRTPoly>::SpecialConvolutionTransformInPlace(Ciphertext<
                                                                      int maskRotationStride,
                                                                      int rowSize) {
 	FIDESlib::CudaNvtxRange r("API");
+	PlaintextCacheHold plaintext_hold(*this); // no plaintext this op fetches may be evicted mid-op
 
 	if (this->devices.empty()) {
 		OPENFHE_THROW("Not implemented for CPU path");
@@ -2070,6 +2191,10 @@ std::shared_ptr<void>& CryptoContextImpl<DCRTPoly>::GetDevicePlaintext(uint32_t 
 	// device_plaintexts_mutex->lock_shared();
 	auto& it = device_plaintexts.at(handle);
 	// device_plaintexts_mutex->unlock_shared();
+
+	// Every operation reaches a device plaintext through this one choke point, so the cache's
+	// recency order is maintained here for all of them at once.
+	this->TouchPlaintext(handle);
 	return it;
 }
 
@@ -2091,6 +2216,9 @@ std::shared_ptr<void>& CryptoContextImpl<DCRTPoly>::GetDeviceCiphertext(uint32_t
 
 bool CryptoContextImpl<DCRTPoly>::EvictDevicePlaintext(uint32_t handle) {
 	FIDESlib::CudaNvtxRange r("API");
+	// Every path out of the registry (cache eviction, Decrypt into a plaintext, ~PlaintextImpl,
+	// an explicit unload) goes through here, so the cache bookkeeping is dropped here too.
+	this->UntrackPlaintext(handle);
 	// device_plaintexts_mutex->lock();
 	auto result = device_plaintexts.erase(handle) > 0;
 	// device_plaintexts_mutex->unlock();

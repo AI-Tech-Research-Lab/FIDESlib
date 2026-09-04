@@ -110,6 +110,11 @@ template <typename T> class Limb {
 	void NTT_and_ksk_dot_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& kska_, const LimbImpl& kskb_);
 
 	void automorph(const int index, const int br);
+
+	/** Device bytes this limb owns (payload + auxiliary scratch). Limbs generated as views
+	 * into a partition-level buffer own nothing and report 0; the buffer is accounted for
+	 * where it is allocated. */
+	[[nodiscard]] size_t ownedBytes() const { return v.ownedBytes() + aux.ownedBytes(); }
 };
 
 using LimbImpl = std::variant<Limb<uint32_t>, Limb<uint64_t>>;

@@ -174,6 +174,13 @@ class Ciphertext {
 	 * switch or NTT/domain change is performed. Requires the ciphertext not be in a
 	 * modUp state. A no-op if already offloaded.
 	 */
+	/** Device bytes this ciphertext currently holds, across both components. Zero while it is
+	 * offloaded. Re-read it rather than caching: key-switching grows the special limbs and
+	 * frees them again, so the footprint moves during an operation. Descending levels, on the
+	 * other hand, does NOT shrink it (see RNSPoly::limbBytes()): a ciphertext costs the same
+	 * at the bottom of the circuit as at the top. */
+	[[nodiscard]] size_t limbBytes() const { return c0.limbBytes() + c1.limbBytes(); }
+
 	void offload();
 
 	/**

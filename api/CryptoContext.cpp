@@ -347,6 +347,140 @@ void CryptoContextImpl<DCRTPoly>::EnforcePlaintextBudget(const uint32_t protect)
 	}
 }
 
+// ---- Ciphertext VRAM cache ----
+
+void CryptoContextImpl<DCRTPoly>::SetCiphertextCache(const size_t bytes) {
+	FIDESlib::CudaNvtxRange r("API");
+	this->ciphertext_cache_bytes = bytes;
+	this->EnforceCiphertextBudget();
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetCiphertextCache() const {
+	return this->ciphertext_cache_bytes;
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetCiphertextCacheResidentBytes() const {
+	return this->ciphertext_resident_bytes;
+}
+
+void CryptoContextImpl<DCRTPoly>::OffloadCiphertexts() {
+	FIDESlib::CudaNvtxRange r("API");
+	// Snapshot first: offloading mutates ciphertext_lru.
+	const std::vector<uint32_t> handles(this->ciphertext_lru.begin(), this->ciphertext_lru.end());
+	for (const uint32_t handle : handles) {
+		if (!this->ciphertext_pinned.contains(handle)) {
+			this->OffloadCiphertextForCache(handle);
+		}
+	}
+}
+
+void CryptoContextImpl<DCRTPoly>::PinCiphertext(Ciphertext<DCRTPoly>& ct, const bool pin) {
+	FIDESlib::CudaNvtxRange r("API");
+	if (pin) {
+		this->LoadCiphertext(ct);
+		if (ct->loaded && ct->gpu != 0) {
+			// Pinned means resident, so bring it back if it was parked in host RAM.
+			this->ReloadCiphertext(ct->gpu);
+			this->ciphertext_pinned.insert(ct->gpu);
+		}
+	} else if (ct->gpu != 0) {
+		this->ciphertext_pinned.erase(ct->gpu);
+		this->EnforceCiphertextBudget();
+	}
+}
+
+void CryptoContextImpl<DCRTPoly>::TrackCiphertext(const uint32_t handle, const size_t bytes) {
+	this->ciphertext_lru.push_front(handle);
+	this->ciphertext_cache.emplace(handle, CiphertextCacheEntry{ bytes, true, this->ciphertext_lru.begin() });
+	this->ciphertext_resident_bytes += bytes;
+}
+
+void CryptoContextImpl<DCRTPoly>::UntrackCiphertext(const uint32_t handle) {
+	auto it = this->ciphertext_cache.find(handle);
+	if (it == this->ciphertext_cache.end()) {
+		return;
+	}
+	if (it->second.resident) {
+		this->ciphertext_resident_bytes -= std::min(it->second.bytes, this->ciphertext_resident_bytes);
+		this->ciphertext_lru.erase(it->second.lru);
+	}
+	this->ciphertext_pinned.erase(handle);
+	this->ciphertext_cache.erase(it);
+}
+
+void CryptoContextImpl<DCRTPoly>::TouchCiphertext(const uint32_t handle, const size_t bytes) {
+	auto it = this->ciphertext_cache.find(handle);
+	if (it == this->ciphertext_cache.end()) {
+		return;
+	}
+	CiphertextCacheEntry& entry = it->second;
+	if (entry.resident) {
+		this->ciphertext_resident_bytes -= std::min(entry.bytes, this->ciphertext_resident_bytes);
+		this->ciphertext_lru.splice(this->ciphertext_lru.begin(), this->ciphertext_lru, entry.lru);
+	} else {
+		this->ciphertext_lru.push_front(handle);
+		entry.lru	   = this->ciphertext_lru.begin();
+		entry.resident = true;
+	}
+	this->ciphertext_resident_bytes += bytes;
+	entry.bytes = bytes;
+}
+
+void CryptoContextImpl<DCRTPoly>::MarkCiphertextOffloaded(const uint32_t handle) {
+	auto it = this->ciphertext_cache.find(handle);
+	if (it == this->ciphertext_cache.end() || !it->second.resident) {
+		return;
+	}
+	this->ciphertext_resident_bytes -= std::min(it->second.bytes, this->ciphertext_resident_bytes);
+	this->ciphertext_lru.erase(it->second.lru);
+	it->second.resident = false;
+}
+
+bool CryptoContextImpl<DCRTPoly>::OffloadCiphertextForCache(const uint32_t handle) {
+	auto it = this->ciphertext_cache.find(handle);
+	if (it == this->ciphertext_cache.end() || !it->second.resident) {
+		return false;
+	}
+	auto reg = this->device_ciphertexts.find(handle);
+	if (reg == this->device_ciphertexts.end()) {
+		return false;
+	}
+	// Bypass GetDeviceCiphertext()'s auto-reload: it exists precisely to undo this state.
+	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(reg->second);
+	if (ct_gpu->isOffloaded()) {
+		// Offloaded behind the cache's back (nothing to free, just stale accounting).
+		this->MarkCiphertextOffloaded(handle);
+		return true;
+	}
+	// A ciphertext raised to the extended basis mid-key-switch cannot be snapshotted --
+	// Ciphertext::offload() asserts against it -- so skip it and let the caller try another.
+	if (ct_gpu->c0.isModUp() || ct_gpu->c1.isModUp()) {
+		return false;
+	}
+	ct_gpu->offload();
+	this->MarkCiphertextOffloaded(handle);
+	return true;
+}
+
+void CryptoContextImpl<DCRTPoly>::EnforceCiphertextBudget(const uint32_t protect) {
+	if (this->ciphertext_cache_bytes == SIZE_MAX || this->ciphertext_resident_bytes <= this->ciphertext_cache_bytes) {
+		return;
+	}
+	// One pass, least recently used first, over a snapshot (offloading mutates the list). If
+	// it ends still over budget -- everything left is pinned, in the extended basis, or the
+	// budget is smaller than the ciphertext in use -- overshoot rather than break the caller.
+	const std::vector<uint32_t> candidates(this->ciphertext_lru.rbegin(), this->ciphertext_lru.rend());
+	for (const uint32_t handle : candidates) {
+		if (this->ciphertext_resident_bytes <= this->ciphertext_cache_bytes) {
+			break;
+		}
+		if (handle == protect || this->ciphertext_pinned.contains(handle)) {
+			continue;
+		}
+		this->OffloadCiphertextForCache(handle);
+	}
+}
+
 // ---- Load to devices ----
 
 void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicKey) {
@@ -441,8 +575,22 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt) {
 
 void CryptoContextImpl<DCRTPoly>::LoadCiphertext(Ciphertext<DCRTPoly>& ct) {
 	FIDESlib::CudaNvtxRange r("API");
-	if (ct->loaded || this->devices.empty())
+	if (this->devices.empty())
 		return;
+
+	// This is the ciphertext cache's only automatic eviction point, and the reason it is safe:
+	// every operation calls LoadCiphertext for its operands before it takes a single device
+	// pointer, so whatever gets evicted here is something the operation has not fetched yet
+	// (and would transparently reload). Already-loaded operands come through here too -- the
+	// early return below -- which is what keeps the budget binding in a loop of operations
+	// over ciphertexts that are all resident already.
+	if (ct->loaded) {
+		if (ct->gpu != 0) {
+			this->ReloadCiphertext(ct->gpu); // no-op unless it was parked in host RAM
+			this->EnforceCiphertextBudget(ct->gpu);
+		}
+		return;
+	}
 
 	if (!this->loaded) {
 		OPENFHE_THROW("CryptoContext not loaded to any device");
@@ -457,6 +605,8 @@ void CryptoContextImpl<DCRTPoly>::LoadCiphertext(Ciphertext<DCRTPoly>& ct) {
 	ct->gpu                                            = handle;
 	ct->loaded                                         = true;
 	ct->original_level                                 = this->multiplicative_depth - ct->GetLevel();
+
+	this->EnforceCiphertextBudget(handle);
 }
 
 void CryptoContextImpl<DCRTPoly>::OffloadCiphertext(uint32_t handle) {
@@ -471,6 +621,7 @@ void CryptoContextImpl<DCRTPoly>::OffloadCiphertext(uint32_t handle) {
 	// Bypass GetDeviceCiphertext()'s auto-reload: it exists precisely to undo this state.
 	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(it->second);
 	ct_gpu->offload();
+	this->MarkCiphertextOffloaded(handle);
 }
 
 void CryptoContextImpl<DCRTPoly>::ReloadCiphertext(uint32_t handle) {
@@ -483,7 +634,11 @@ void CryptoContextImpl<DCRTPoly>::ReloadCiphertext(uint32_t handle) {
 		return;
 	}
 	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(it->second);
+	if (!ct_gpu->isOffloaded()) {
+		return;
+	}
 	ct_gpu->reload();
+	this->TouchCiphertext(handle, ct_gpu->limbBytes());
 }
 
 void CryptoContextImpl<DCRTPoly>::TrimGPUMemoryPool() {
@@ -2181,8 +2336,15 @@ uint32_t CryptoContextImpl<DCRTPoly>::RegisterDeviceCiphertext(std::shared_ptr<v
 	}
 	// device_ciphertexts_mutex->lock();
 	uint32_t handle = next_gpu_handle++;
+	// Measure before the move; every ciphertext registered here is a FIDESlib::CKKS::Ciphertext.
+	const size_t bytes = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(c)->limbBytes();
 	device_ciphertexts.emplace(handle, std::move(c));
 	// device_ciphertexts_mutex->unlock();
+	// Tracked, but deliberately NOT an eviction point: an operation registers its result (or
+	// a whole batch, in the hoisted rotations) while holding raw pointers to device
+	// ciphertexts it has already fetched. The budget is enforced in LoadCiphertext() instead,
+	// so it overshoots by one operation's working set.
+	this->TrackCiphertext(handle, bytes);
 	return handle;
 }
 
@@ -2211,6 +2373,10 @@ std::shared_ptr<void>& CryptoContextImpl<DCRTPoly>::GetDeviceCiphertext(uint32_t
 	if (ct_gpu->isOffloaded()) {
 		ct_gpu->reload();
 	}
+	// Recency and size bookkeeping for the cache (the size is re-read here rather than
+	// remembered from the load: key-switching grows and frees the special limbs). Not an
+	// eviction point either, for the same reason as RegisterDeviceCiphertext().
+	this->TouchCiphertext(handle, ct_gpu->limbBytes());
 	return it;
 }
 
@@ -2227,6 +2393,7 @@ bool CryptoContextImpl<DCRTPoly>::EvictDevicePlaintext(uint32_t handle) {
 
 bool CryptoContextImpl<DCRTPoly>::EvictDeviceCiphertext(uint32_t handle) {
 	FIDESlib::CudaNvtxRange r("API");
+	this->UntrackCiphertext(handle);
 	// device_ciphertexts_mutex->lock();
 	auto result = device_ciphertexts.erase(handle) > 0;
 	// device_ciphertexts_mutex->unlock();

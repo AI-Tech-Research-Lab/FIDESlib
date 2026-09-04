@@ -117,8 +117,10 @@ class RNSPoly {
 	 * are views into a partition buffer report zero on their own, so nothing is counted
 	 * twice; the special/decomp/digit/gather single buffers of the key-switching paths are
 	 * not tracked (their sizes are not recorded at allocation) and are not counted. Changes
-	 * as the polynomial grows, drops levels or frees limbs, so re-read it rather than
-	 * caching the value. */
+	 * as the polynomial grows limbs or frees them, so re-read it rather than caching the
+	 * value -- but note that dropping the *level* frees nothing: the limb release in
+	 * dropToLevel() is disabled (`if (0 && ...)`), so a polynomial keeps its footprint all
+	 * the way down. */
 	[[nodiscard]] size_t limbBytes() const;
 
 	/** Free the DECOMP/DIGIT limbs of every GPU partition (see

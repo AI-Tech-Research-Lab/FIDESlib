@@ -120,6 +120,40 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// explicitly (Decrypt into it, or destroying it) also drops the pin.
 	void PinPlaintext(Plaintext& pt, bool pin = true);
 
+	// ---- Ciphertext VRAM cache ----
+
+	/// @brief Cap the VRAM spent on device ciphertexts to `bytes`, parking the least recently
+	/// used ones in host RAM (see OffloadCiphertext()) and reloading them on demand.
+	/// SIZE_MAX (the default) keeps every ciphertext on the device until it is destroyed.
+	///
+	/// This is the expensive one of the three caches, and it is a way to survive a working set
+	/// that does not fit in VRAM, not a way to go faster: evicting a ciphertext synchronizes
+	/// the device and copies its limbs to the host, reloading copies them back, and the host
+	/// snapshot costs as much RAM as the ciphertext did VRAM. Prefer offloading explicitly
+	/// (Ciphertext::Offload()) where the dataflow is known; use a budget when it is not.
+	///
+	/// The round trip is bit-exact -- no decrypt, rescale or NTT -- and every operation
+	/// reloads what it needs, so eviction is transparent.
+	///
+	/// The budget is enforced at operation boundaries only: LoadCiphertext(), which every
+	/// operation calls for its operands before it takes any device pointer. Ciphertexts
+	/// created *during* an operation (its result, the batch a hoisted rotation builds) are
+	/// therefore accounted for but not evicted until the next operation starts, so the budget
+	/// overshoots by one operation's working set. A ciphertext caught in the extended basis
+	/// mid-key-switch cannot be snapshotted and is skipped, as are pinned ones.
+	void SetCiphertextCache(size_t bytes);
+	/// @brief The current ciphertext VRAM budget in bytes (SIZE_MAX = unlimited).
+	size_t GetCiphertextCache() const;
+	/// @brief VRAM bytes currently spent on resident (non-offloaded) device ciphertexts.
+	/// Tracked whether or not a budget is set.
+	size_t GetCiphertextCacheResidentBytes() const;
+	/// @brief Offload every unpinned device ciphertext to host RAM now, without waiting for
+	/// eviction. The ciphertexts stay usable: the next operation reloads what it needs.
+	void OffloadCiphertexts();
+	/// @brief Pin (or unpin) a ciphertext so the cache never evicts it, loading and reloading
+	/// it first if needed. The pin is tied to the current device copy.
+	void PinCiphertext(Ciphertext<DCRTPoly>& ct, bool pin = true);
+
 	// ---- Load to devices ----
 
 	/// @brief Load the context to the devices.
@@ -360,6 +394,48 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// @brief Evict least-recently-used plaintexts until the budget is met, never touching
 	/// `protect`, a pinned handle, or anything at all while a PlaintextCacheHold is active.
 	void EnforcePlaintextBudget(uint32_t protect = 0);
+
+	/// @brief Ciphertext VRAM budget in bytes; SIZE_MAX means unlimited. See SetCiphertextCache().
+	size_t ciphertext_cache_bytes = SIZE_MAX;
+	/// @brief VRAM bytes held by the resident (non-offloaded) device ciphertexts.
+	size_t ciphertext_resident_bytes = 0;
+	/// @brief Cache bookkeeping for one device ciphertext. Unlike a plaintext, an evicted
+	/// ciphertext stays registered -- it keeps a host snapshot and its handle stays valid --
+	/// so entries outlive eviction and only leave the LRU while offloaded.
+	struct CiphertextCacheEntry {
+		/// @brief VRAM bytes as of the last use; re-read on every use, since key-switching
+		/// grows and frees a ciphertext's special limbs. (Descending levels does not shrink
+		/// it: FIDESlib keeps the limbs -- see RNSPoly::limbBytes.)
+		size_t bytes = 0;
+		/// @brief False while the ciphertext is offloaded to host RAM.
+		bool resident = true;
+		/// @brief Position in `ciphertext_lru`; only valid while `resident`.
+		std::list<uint32_t>::iterator lru;
+	};
+	std::unordered_map<uint32_t, CiphertextCacheEntry> ciphertext_cache;
+	/// @brief Resident handles by recency of use, most recent first; eviction takes from the back.
+	std::list<uint32_t> ciphertext_lru;
+	/// @brief Handles the cache must never evict. See PinCiphertext().
+	std::unordered_set<uint32_t> ciphertext_pinned;
+
+	/// @brief Start tracking a freshly registered device ciphertext as the most recently used.
+	void TrackCiphertext(uint32_t handle, size_t bytes);
+	/// @brief Stop tracking a device ciphertext that is about to leave `device_ciphertexts`.
+	void UntrackCiphertext(uint32_t handle);
+	/// @brief Mark a device ciphertext as the most recently used one and refresh its size,
+	/// re-entering it into the LRU if it was offloaded.
+	void TouchCiphertext(uint32_t handle, size_t bytes);
+	/// @brief Drop a device ciphertext's accounting after it was offloaded to host RAM.
+	void MarkCiphertextOffloaded(uint32_t handle);
+	/// @brief Offload one device ciphertext on the cache's behalf. Returns false if it is
+	/// untracked, already offloaded, or in the extended basis mid-key-switch (which cannot be
+	/// snapshotted) -- eviction then moves on to the next candidate.
+	bool OffloadCiphertextForCache(uint32_t handle);
+	/// @brief Evict least-recently-used ciphertexts until the budget is met, never touching
+	/// `protect` or a pinned handle. Called from LoadCiphertext() and nowhere else in the
+	/// operation path: operations hold raw pointers to device ciphertexts across fetches, so
+	/// eviction is only safe before an operation has taken any of them.
+	void EnforceCiphertextBudget(uint32_t protect = 0);
 
 	uint32_t RegisterDevicePlaintext(std::shared_ptr<void>&& p);
 	uint32_t RegisterDeviceCiphertext(std::shared_ptr<void>&& c);

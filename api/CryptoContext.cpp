@@ -267,7 +267,15 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 
 	FIDESlib::CKKS::RawParams rawParams = FIDESlib::CKKS::GetRawParams(context, bootConfig);
 	params                              = params.adaptTo(rawParams);
-	FIDESlib::CKKS::Context c           = FIDESlib::CKKS::GenCryptoContextGPU(params, this->devices);
+
+	// The Context has to be moved into this->gpu *before* the keys are built, and the keys must
+	// then be built against that stored instance: KeySwitchingKey (and Ciphertext) keep a
+	// `Context&`, so binding them to a local that is later moved out of leaves every stored key
+	// holding a dangling reference. A permanently resident key never dereferences it again, which
+	// is why building against a local used to appear to work -- but a rotation key under a VRAM
+	// budget reloads itself on first use and goes through that reference to do it.
+	this->gpu                 = std::make_any<FIDESlib::CKKS::Context>(FIDESlib::CKKS::GenCryptoContextGPU(params, this->devices));
+	FIDESlib::CKKS::Context& c = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
 
 	// Must happen before the keys below are built: a finite budget makes every rotation key
 	// (including the bootstrapping ones) start as a host-RAM snapshot that loads lazily and can
@@ -296,7 +304,6 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 		FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, slot, c);
 	}
 
-	this->gpu    = std::make_any<FIDESlib::CKKS::Context>(std::move(c));
 	this->loaded = true;
 }
 

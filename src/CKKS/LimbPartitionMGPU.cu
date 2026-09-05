@@ -44,7 +44,19 @@ static bool envGraphCapture(bool def = false) {
 	return out;
 }
 
-bool MEMCPY_PEER   = envMemcopyPeer(true);
+// Default off: the cudaMemcpyPeerAsync path races under GPU contention and returns NaN from
+// the special-limb exchange (moddownMGPU/modupMGPU), while the NCCL path it replaces is
+// clean. Measured with one resident block per SM loading two otherwise idle H100s, over
+// AccumulateSum -- the extended hoisted rotation, the only operation that reaches this
+// exchange: 10 failures in 10 runs with the peer copies, 0 in 10 with NCCL, and correct
+// under CUDA_LAUNCH_BLOCKING=1 either way, which is what makes it a race rather than an
+// indexing error. It is not exclusive to loaded GPUs -- contention only makes the window
+// easy to hit -- so the peer path cannot be the default while it is unfixed.
+//
+// It costs about 20% on that operation (9.4 vs 7.8 ms at logN=16, L=24, two NVLinked
+// H100s), which still beats the 10.7 ms of a single GPU. FIDESLIB_USE_MEMCPY_PEER=1 puts
+// the faster path back for anyone who measures it as worthwhile and runs on exclusive GPUs.
+bool MEMCPY_PEER   = envMemcopyPeer(false);
 bool GRAPH_CAPTURE = envGraphCapture(false);
 bool PEER_ACCESS   = envPeerAccess(false);
 

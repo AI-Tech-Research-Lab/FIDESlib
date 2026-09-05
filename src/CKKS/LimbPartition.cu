@@ -180,6 +180,14 @@ void LimbPartition::freeLimbs() {
 	}
 }
 
+int LimbPartition::numSpecialLimbs() const {
+	return (int)cc.splitSpecialMeta.at(id).size();
+}
+
+int LimbPartition::firstSpecialLimbId() const {
+	return cc.splitSpecialMeta.at(id).at(0).id;
+}
+
 Global::Globals* LimbPartition::getGlobals() {
 	return cc.precom.globals->globals[id];
 }
@@ -480,8 +488,8 @@ void LimbPartition::add(const LimbPartition& p, const bool exta, const bool extb
 		if (exta && !extb) {
 			// DO NOTHING !!!
 		} else if (extb && !exta) {
-			int start	  = cc.splitSpecialMeta.at(id).at(0).id - (cc.L + 1);
-			int num_limbs = cc.splitSpecialMeta.at(id).size();
+			int num_limbs = numSpecialLimbs();
+			int start	  = num_limbs > 0 ? firstSpecialLimbId() - (cc.L + 1) : 0;
 			for (size_t i = start; i < static_cast<size_t>(start + num_limbs); i += cc.batch) {
 				STREAM(SPECIALlimb[i]).wait(s);
 				uint32_t size = std::min((int)start + num_limbs - (int)i, cc.batch);
@@ -493,8 +501,8 @@ void LimbPartition::add(const LimbPartition& p, const bool exta, const bool extb
 				s.wait(STREAM(SPECIALlimb[i]));
 			}
 		} else if (exta && extb) {
-			int start	  = cc.splitSpecialMeta.at(id).at(0).id - (cc.L + 1);
-			int num_limbs = cc.splitSpecialMeta.at(id).size();
+			int num_limbs = numSpecialLimbs();
+			int start	  = num_limbs > 0 ? firstSpecialLimbId() - (cc.L + 1) : 0;
 			for (size_t i = start; i < static_cast<size_t>(start + num_limbs); i += cc.batch) {
 				STREAM(SPECIALlimb[i]).wait(s);
 				uint32_t size = std::min((int)start + num_limbs - (int)i, cc.batch);
@@ -880,8 +888,8 @@ void LimbPartition::copySpecialLimb(const LimbPartition& p) {
 	this->generateSpecialLimb(false, false);
 	s.wait(p.getS());
 	assert(*level == *p.level);
-	int start	  = cc.splitSpecialMeta.at(id).at(0).id - (cc.L + 1);
-	int num_limbs = cc.splitSpecialMeta.at(id).size();
+	int num_limbs = numSpecialLimbs();
+	int start	  = num_limbs > 0 ? firstSpecialLimbId() - (cc.L + 1) : 0;
 	for (int32_t i = start; i < start + num_limbs; i += cc.batch) {
 		STREAM(SPECIALlimb[i - (SPECIALmeta.size() > SPECIALlimb.size()) * start]).wait(s);
 		uint32_t size = std::min((int)start + num_limbs - (int)i, cc.batch);
@@ -2037,8 +2045,8 @@ void LimbPartition::automorph(const int index, const int br, LimbPartition* src,
 		  src ? src->limbptr.data + i : limbptr.data + i, src ? limbptr.data + i : auxptr.data + i, index, br, PARTITION(id, i));
 	}
 	if (ext) {
-		int start	  = cc.splitSpecialMeta.at(id).at(0).id - (cc.L + 1);
-		int num_limbs = cc.splitSpecialMeta.at(id).size();
+		int num_limbs = numSpecialLimbs();
+		int start	  = num_limbs > 0 ? firstSpecialLimbId() - (cc.L + 1) : 0;
 
 		for (int32_t i = start; i < start + num_limbs; i += 1 /*cc.batch*/) {
 			STREAM(SPECIALlimb[i - (SPECIALlimb.size() < cc.specialMeta.at(id).size()) * start]).wait(s);
@@ -2265,8 +2273,8 @@ void LimbPartition::add(const LimbPartition& a, const LimbPartition& b, const bo
 	}
 
 	if (ext_a || ext_b) {
-		int start	  = cc.splitSpecialMeta.at(id).at(0).id - (cc.L + 1);
-		int num_limbs = cc.splitSpecialMeta.at(id).size();
+		int num_limbs = numSpecialLimbs();
+		int start	  = num_limbs > 0 ? firstSpecialLimbId() - (cc.L + 1) : 0;
 		for (int32_t i = start; i < start + num_limbs; i += cc.batch) {
 			STREAM(SPECIALlimb[i]).wait(s);
 			uint32_t size = std::min((int)start + num_limbs - (int)i, cc.batch);
@@ -2449,8 +2457,8 @@ void LimbPartition::dotProductPt(LimbPartition& c1,
 		assert(c1s[i]->limb.size() >= limbsize);
 		assert(pts[i]->limb.size() >= limbsize);
 		if (ext) {
-			int start	  = cc.splitSpecialMeta.at(id).at(0).id - cc.precom.constants[id].L;
-			int num_limbs = cc.splitSpecialMeta.at(id).size();
+			int num_limbs = numSpecialLimbs();
+			int start	  = num_limbs > 0 ? firstSpecialLimbId() - cc.precom.constants[id].L : 0;
 			assert(c0s[i]->SPECIALlimb.size() >= this->SPECIALlimb.size());
 			assert(c1s[i]->SPECIALlimb.size() >= this->SPECIALlimb.size());
 			// assert(pts[i]->SPECIALlimb.size() >= 0);
@@ -2471,8 +2479,8 @@ void LimbPartition::dotProductPt(LimbPartition& c1,
 	}
 
 	if (ext) {
-		uint32_t start	   = cc.splitSpecialMeta.at(id).at(0).id - (cc.L + 1);
-		uint32_t num_limbs = cc.splitSpecialMeta.at(id).size();
+		uint32_t num_limbs = numSpecialLimbs();
+		uint32_t start	   = num_limbs > 0 ? firstSpecialLimbId() - (cc.L + 1) : 0;
 		for (uint32_t i = start; i < start + num_limbs; i += cc.batch) {
 			STREAM(SPECIALlimb[i]).wait(s);
 			uint32_t size = std::min(start + num_limbs - i, static_cast<uint32_t>(cc.batch));
@@ -2522,8 +2530,8 @@ void LimbPartition::binomialDotProduct(LimbPartition& c1,
 		assert(d0s[i]->limb.size() >= limbsize);
 		assert(d1s[i]->limb.size() >= limbsize);
 		if (ext) {
-			int start	  = cc.splitSpecialMeta.at(id).at(0).id - cc.precom.constants[id].L;
-			int num_limbs = cc.splitSpecialMeta.at(id).size();
+			int num_limbs = numSpecialLimbs();
+			int start	  = num_limbs > 0 ? firstSpecialLimbId() - cc.precom.constants[id].L : 0;
 			assert(c0s[i]->SPECIALlimb.size() >= this->SPECIALlimb.size());
 			assert(c1s[i]->SPECIALlimb.size() >= this->SPECIALlimb.size());
 			assert(d0s[i]->SPECIALlimb.size() >= this->SPECIALlimb.size());
@@ -2575,8 +2583,8 @@ void LimbPartition::binomialDotProduct(LimbPartition& c1,
 	}
 
 	if (ext) {
-		int start	  = cc.splitSpecialMeta.at(id).at(0).id - (cc.L + 1);
-		int num_limbs = cc.splitSpecialMeta.at(id).size();
+		int num_limbs = numSpecialLimbs();
+		int start	  = num_limbs > 0 ? firstSpecialLimbId() - (cc.L + 1) : 0;
 		for (int32_t i = start; i < start + num_limbs; i += cc.batch) {
 			STREAM(SPECIALlimb[i]).wait(s);
 			int size = std::min((int)start + num_limbs - (int)i, cc.batch);

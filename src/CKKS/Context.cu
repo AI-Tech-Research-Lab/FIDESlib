@@ -56,6 +56,29 @@ ContextData::ContextData(const Parameters& param_, const std::vector<int>& devs,
 		OK = false;
 		return;
 	}
+	// generateSplitSpecialMeta shares the K special primes out over the devices, so asking for
+	// more devices than there are special primes leaves some with none. That is supported -- the
+	// special-limb work simply skips those devices -- but it is almost never what the caller
+	// intended: those devices carry the regular limbs and the replicated key digits while
+	// contributing nothing to the key switch, and K is set indirectly, by dnum and the depth
+	// (K = ceil((L + 1) / dnum)). Say so once, at context creation, rather than let it show up as
+	// a puzzling load imbalance. Raising dnum lowers K; lowering it raises K.
+	{
+		std::vector<int> idle;
+		for (uint32_t i = 0; i < GPUid.size(); ++i)
+			if (splitSpecialMeta.at(i).empty())
+				idle.push_back(GPUid[i]);
+		if (!idle.empty()) {
+			std::cerr << "FIDESlib: " << GPUid.size() << " devices requested but only " << K
+					  << " special prime(s) available (L+1 = " << (L + 1) << ", dnum = " << dnum
+					  << "), so device(s)";
+			for (int d : idle)
+				std::cerr << ' ' << d;
+			std::cerr << " own none and take no part in key switching. Use at most " << K
+					  << " devices, or lower dnum to raise K." << std::endl;
+		}
+	}
+
 
 	// auto& constants = precom.constants;
 	// auto& globals = precom.globals;

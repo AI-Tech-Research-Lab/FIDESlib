@@ -212,6 +212,18 @@ class LimbPartition {
 
 	void multModupDotKSK(LimbPartition& c1, const LimbPartition& c1tilde, LimbPartition& c0, const LimbPartition& c0tilde, const LimbPartition& ksk_a, const LimbPartition& ksk_b);
 
+	/// Number of special primes this device owns. Zero is a legal configuration: the K special
+	/// primes are shared out across the devices by ContextData::generateSplitSpecialMeta, so with
+	/// more devices than special primes some devices get an empty share. Every special-limb loop
+	/// in this class is bounded by this count and becomes a no-op then.
+	int numSpecialLimbs() const;
+
+	/// Global id of the first special prime this device owns. Only meaningful when
+	/// numSpecialLimbs() > 0 -- callers must test that first, which is exactly what the sites
+	/// that used to read splitSpecialMeta.at(id).at(0).id directly failed to do: the resulting
+	/// std::out_of_range is thrown inside an OpenMP region and terminates the process.
+	int firstSpecialLimbId() const;
+
 	size_t getLimbSize(int level);
 	void automorph(const int index, const int br, LimbPartition* src, bool ext);
 

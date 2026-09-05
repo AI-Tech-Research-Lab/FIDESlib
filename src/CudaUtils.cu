@@ -381,7 +381,7 @@ FIDESlib::Stream s[MAXG];
 
 #define MEMPOOL true
 // void* GPUmalloc(int id, int bytes, cudaStream_t stream, FIDESlib::CKKS::Context& cc) {
-void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
+void* GPUmalloc(int device, int bytes, cudaStream_t stream, bool cache) {
 	void* ptr = nullptr;
 
 	uint64_t MBs = 1024;
@@ -397,40 +397,40 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 	}
 #if MEMPOOL
 	if (cache && (bytes & (bytes - 1)) == 0) {
-		std::vector<void*>& free_limb = size_to_memory[id][bytes];
+		std::vector<void*>& free_limb = size_to_memory[device][bytes];
 
-		if (s[id].ptr() == nullptr) {
-			mempool_lock[id].lock();
-			if (s[id].ptr() == nullptr) {
-				s[id].init();
+		if (s[device].ptr() == nullptr) {
+			mempool_lock[device].lock();
+			if (s[device].ptr() == nullptr) {
+				s[device].init();
 			}
-			mempool_lock[id].unlock();
+			mempool_lock[device].unlock();
 		}
 		CudaCheckErrorModNoSync;
 		if (free_limb.empty()) {
 			uint64_t* base;
-			cudaMallocAsync(&base, MBs * 1024 * 1024, s[id].ptr());
+			cudaMallocAsync(&base, MBs * 1024 * 1024, s[device].ptr());
 
-			mempool_lock[id].lock();
-			slab_registry[id][bytes].push_back(GPUSlab{ (void*)base, MBs * 1024 * 1024 });
+			mempool_lock[device].lock();
+			slab_registry[device][bytes].push_back(GPUSlab{ (void*)base, MBs * 1024 * 1024 });
 			for (uint32_t i = 0; i < MBs * 1024 * 1024; i += bytes) {
 				free_limb.emplace_back(((char*)base) + i);
 			}
-			mempool_lock[id].unlock();
+			mempool_lock[device].unlock();
 		}
 		CudaCheckErrorModNoSync;
 
 		//if (stream != nullptr) {
-		s[id].record();
+		s[device].record();
 		CudaCheckErrorModNoSync;
-		cudaStreamWaitEvent(stream, s[id].ev);
+		cudaStreamWaitEvent(stream, s[device].ev);
 		//}
 
 		CudaCheckErrorModNoSync;
-		mempool_lock[id].lock();
+		mempool_lock[device].lock();
 		ptr = free_limb.back();
 		free_limb.pop_back();
-		mempool_lock[id].unlock();
+		mempool_lock[device].unlock();
 		// ptr = free_limb.front();
 		// free_limb.pop_front();
 		// std::cout << "get " << ptr << std::endl;
@@ -444,7 +444,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
 	return ptr;
 }
 
-void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
+void GPUfree(void* ptr, int device, int bytes, cudaStream_t stream, bool cache) {
 
 	if (bytes < 64 * 1024) {
 		int next_pow2 = 1024;
@@ -457,21 +457,21 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
 
 #if MEMPOOL
 	if (cache && (bytes & (bytes - 1)) == 0) {
-		std::vector<void*>& free_limb = size_to_memory[id][bytes];
-		if (s[id].ptr() == nullptr) {
-			mempool_lock[id].lock();
-			s[id].init();
-			mempool_lock[id].unlock();
+		std::vector<void*>& free_limb = size_to_memory[device][bytes];
+		if (s[device].ptr() == nullptr) {
+			mempool_lock[device].lock();
+			s[device].init();
+			mempool_lock[device].unlock();
 		}
 		CudaCheckErrorModNoSync;
 		// cudaDeviceSynchronize();
 		//if (stream != nullptr) {
-		s[id].wait(stream);
+		s[device].wait(stream);
 		//}
 		CudaCheckErrorModNoSync;
-		mempool_lock[id].lock();
+		mempool_lock[device].lock();
 		free_limb.emplace_back(ptr);
-		mempool_lock[id].unlock();
+		mempool_lock[device].unlock();
 		// std::cout << "free " << ptr << std::endl;
 		return;
 	}
@@ -480,19 +480,19 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
 	cudaFreeAsync(ptr, stream);
 }
 
-void GPUtrim(int id) {
-	cudaSetDevice(id);
-	if (s[id].ptr() == nullptr) {
-		s[id].init();
+void GPUtrim(int device) {
+	cudaSetDevice(device);
+	if (s[device].ptr() == nullptr) {
+		s[device].init();
 	}
 	// Slices were pushed back onto the free list only after waiting on their owning stream
 	// (see GPUfree), but that wait is stream-ordered, not host-blocking: sync here so the
 	// cudaFreeAsync below cannot race a kernel still using a slab we are about to release.
-	cudaStreamSynchronize(s[id].ptr());
+	cudaStreamSynchronize(s[device].ptr());
 
-	mempool_lock[id].lock();
-	for (auto& [bytes, slabs] : slab_registry[id]) {
-		std::vector<void*>& free_limb = size_to_memory[id][bytes];
+	mempool_lock[device].lock();
+	for (auto& [bytes, slabs] : slab_registry[device]) {
+		std::vector<void*>& free_limb = size_to_memory[device][bytes];
 		if (slabs.empty()) {
 			continue;
 		}
@@ -514,7 +514,7 @@ void GPUtrim(int id) {
 		bool any = false;
 		for (size_t i = 0; i < slabs.size(); ++i) {
 			if (freeCount[i] == slabs[i].bytes / bytes) {
-				cudaFreeAsync(slabs[i].base, s[id].ptr());
+				cudaFreeAsync(slabs[i].base, s[device].ptr());
 				freed[i] = true;
 				any		 = true;
 			}
@@ -552,7 +552,7 @@ void GPUtrim(int id) {
 		}
 		slabs = std::move(survivingSlabs);
 	}
-	mempool_lock[id].unlock();
+	mempool_lock[device].unlock();
 
 	// The cudaFreeAsync calls above only return slabs to the async-malloc pool; because the
 	// pool's release threshold is pinned to UINT64_MAX at context creation (see
@@ -560,27 +560,27 @@ void GPUtrim(int id) {
 	// the OS -- so cudaMemGetInfo/nvidia-smi would still report it as used. Drain the frees,
 	// then explicitly trim the pool to 0 bytes reserved so the now-idle slabs actually
 	// become free VRAM the rest of the system can use. Live allocations are untouched.
-	cudaStreamSynchronize(s[id].ptr());
+	cudaStreamSynchronize(s[device].ptr());
 	cudaMemPool_t mp;
-	cudaDeviceGetDefaultMemPool(&mp, id);
+	cudaDeviceGetDefaultMemPool(&mp, device);
 	cudaMemPoolTrimTo(mp, 0);
 }
 
-std::vector<GPUPoolBucketStats> GPUmemoryPoolStats(int id) {
-	cudaSetDevice(id);
-	if (s[id].ptr() != nullptr)
-		cudaStreamSynchronize(s[id].ptr());
+std::vector<GPUPoolBucketStats> GPUmemoryPoolStats(int device) {
+	cudaSetDevice(device);
+	if (s[device].ptr() != nullptr)
+		cudaStreamSynchronize(s[device].ptr());
 
-	std::lock_guard<std::mutex> guard(mempool_lock[id]);
+	std::lock_guard<std::mutex> guard(mempool_lock[device]);
 	std::vector<GPUPoolBucketStats> result;
-	for (const auto& [bytes, slabs] : slab_registry[id]) {
+	for (const auto& [bytes, slabs] : slab_registry[device]) {
 		size_t reserved = 0;
 		size_t total = 0;
 		for (const auto& slab : slabs) {
 			reserved += slab.bytes;
 			total += slab.bytes / static_cast<size_t>(bytes);
 		}
-		const size_t free = size_to_memory[id][bytes].size();
+		const size_t free = size_to_memory[device][bytes].size();
 		result.push_back(GPUPoolBucketStats{
 			static_cast<size_t>(bytes), slabs.size(), reserved, total, free,
 			total >= free ? total - free : 0});

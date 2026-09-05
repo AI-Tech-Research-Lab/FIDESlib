@@ -153,8 +153,13 @@ class Stream {
 
 template <bool capture> void run_in_graph(cudaGraphExec_t& exec, Stream& s, std::function<void()> run);
 
-void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache = false);
-void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache = false);
+/// Allocate from / return to the process-local caching pool. `device` is the CUDA device
+/// ordinal, and it selects the pool: the free lists, their slabs and the pool's own stream and
+/// event are all per physical device. Passing anything else -- a logical index into a context's
+/// GPUid list, say -- both strands the chunk in the wrong pool and lets a later allocation on
+/// that ordinal be served memory that lives on another device.
+void* GPUmalloc(int device, int bytes, cudaStream_t stream, bool cache = false);
+void GPUfree(void* ptr, int device, int bytes, cudaStream_t stream, bool cache = false);
 
 /// @brief Release every buffer currently sitting in GPUalloc/GPUfree's process-local
 /// caching pool for device `id` back to the CUDA driver. GPUfree never does this on its
@@ -162,7 +167,7 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache = fal
 /// back after freeing a batch of large objects (e.g. offloaded ciphertexts) must call
 /// this explicitly. Synchronous: blocks until the device's internal stream drains before
 /// freeing, so avoid calling it on a hot path.
-void GPUtrim(int id);
+void GPUtrim(int device);
 
 struct GPUPoolBucketStats {
 	size_t chunkBytes;
@@ -175,7 +180,7 @@ struct GPUPoolBucketStats {
 
 /// Synchronous diagnostic snapshot of FIDESlib's process-local caching allocator.
 /// Intended for profiling only; it does not allocate, free, or trim any buffer.
-std::vector<GPUPoolBucketStats> GPUmemoryPoolStats(int id);
+std::vector<GPUPoolBucketStats> GPUmemoryPoolStats(int device);
 
 } // namespace FIDESlib
 #endif // FIDESLIB_CUDAUTILS_CUH

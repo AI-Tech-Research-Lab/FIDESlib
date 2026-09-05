@@ -167,6 +167,11 @@ LimbPartition::~LimbPartition() {
 
 void LimbPartition::freeLimbs() {
 	cudaSetDevice(device);
+	// Same direction argument as freeSpecialLimbs: the limbs are views into bufferLIMB written on
+	// their own streams, and the free below is ordered on s alone. dropLimb()'s wait goes the
+	// other way (limb stream after s) and does not cover it.
+	for (auto& l : limb)
+		s.wait(STREAM(l));
 	while (!limb.empty())
 		dropLimb();
 	if (bufferLIMB) {
@@ -815,8 +820,14 @@ void LimbPartition::modup(LimbPartition& aux_partition) {
 
 void LimbPartition::freeSpecialLimbs() {
 	cudaSetDevice(device);
+	// The wait has to run this way round: s owns the GPUfree below, so s must wait for the
+	// per-limb streams that write into bufferSPECIAL. Making each limb stream wait on s instead
+	// (the previous direction) orders nothing that matters here and lets the chunk re-enter the
+	// caching pool with those writes still in flight, so the next tenant reads and writes it
+	// concurrently. This is the special-limb machinery the extended hoisted rotation
+	// (Ciphertext::rotate_hoisted with ext=true -- AccumulateSum/Broadcast) exercises.
 	for (size_t i = 0; i < SPECIALlimb.size(); ++i) {
-		STREAM(SPECIALlimb.at(i)).wait(s);
+		s.wait(STREAM(SPECIALlimb.at(i)));
 	}
 	SPECIALlimb.clear();
 	if (bufferSPECIAL != nullptr) {

@@ -54,8 +54,11 @@ static bool envGraphCapture(bool def = false) {
 // easy to hit -- so the peer path cannot be the default while it is unfixed.
 //
 // It costs about 20% on that operation (9.4 vs 7.8 ms at logN=16, L=24, two NVLinked
-// H100s), which still beats the 10.7 ms of a single GPU. FIDESLIB_USE_MEMCPY_PEER=1 puts
-// the faster path back for anyone who measures it as worthwhile and runs on exclusive GPUs.
+// H100s), which still beats the 10.7 ms of a single GPU. FIDESLIB_USE_MEMCPY_PEER=1 selects
+// the faster path again, but ContextData's constructor refuses a multi-GPU context that asks
+// for it unless FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT=1 says the caller means it -- the failure
+// is silent, so it must not be reachable by inheriting an exported variable. PEER_ACCESS, the
+// third transport, is gated the same way and for the same reason (2 failures in 4 under load).
 bool MEMCPY_PEER   = envMemcopyPeer(false);
 bool GRAPH_CAPTURE = envGraphCapture(false);
 bool PEER_ACCESS   = envPeerAccess(false);

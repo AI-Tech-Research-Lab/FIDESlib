@@ -5,7 +5,9 @@
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include <algorithm>
+#include <cstdlib>
 #include <source_location>
+#include <stdexcept>
 
 #include "../parallel_for.hpp"
 #include "CKKS/KeySwitchingKey.cuh"
@@ -56,6 +58,36 @@ ContextData::ContextData(const Parameters& param_, const std::vector<int>& devs,
 		OK = false;
 		return;
 	}
+	// Both hand-rolled peer transports for the multi-GPU special-limb exchange race under GPU
+	// contention and return NaN: measured over AccumulateSum on loaded H100s, 12 failures in 30
+	// for cudaMemcpyPeerAsync and 2 in 4 for peer access, against 0 in 10 for the NCCL path that
+	// is now the default. It reaches everything that accumulates, and bootstrap whenever the
+	// slots are sparse (Bootstrap.cu calls Accumulate directly), and it reaches it silently --
+	// wrong values, no error. Selecting one of them is therefore refused rather than obeyed;
+	// nobody should end up on that path by inheriting an exported variable.
+	//
+	// Only multi-GPU is affected. With one device the exchange never runs and both flags are
+	// inert, so this does not fire on a single-GPU process that happens to have one set.
+	//
+	// FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT=1 lifts the refusal, for measuring what the peer path
+	// is worth on exclusive GPUs (~20% on AccumulateSum) and for working on the race itself.
+	if (GPUid.size() > 1 && (MEMCPY_PEER || PEER_ACCESS)) {
+		const char* ack		= std::getenv("FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT");
+		const char* selected = MEMCPY_PEER ? "FIDESLIB_USE_MEMCPY_PEER" : "FIDESLIB_USE_PEER_ACCESS";
+		if (!(ack && std::atoi(ack))) {
+			throw std::runtime_error(std::string(selected) +
+									 "=1 selects a multi-GPU transport for the special-limb exchange that races under "
+									 "GPU contention and silently returns NaN from AccumulateSum and from bootstrap "
+									 "with sparse slots. Unset it to use the NCCL path (the default), or set "
+									 "FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT=1 to proceed anyway. See "
+									 "docs/multigpu-plan.md.");
+		}
+		std::cerr << "FIDESlib: FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT is set, so " << selected
+				  << "=1 is being honoured. The multi-GPU special-limb exchange races under contention: results "
+					 "from AccumulateSum, and from bootstrap with sparse slots, are not trustworthy."
+				  << std::endl;
+	}
+
 	// generateSplitSpecialMeta shares the K special primes out over the devices, so asking for
 	// more devices than there are special primes leaves some with none. That is supported -- the
 	// special-limb work simply skips those devices -- but it is almost never what the caller

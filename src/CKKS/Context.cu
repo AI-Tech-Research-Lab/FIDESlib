@@ -1046,6 +1046,12 @@ ContextData::~ContextData() {
 		cudaSetDevice(GPUid[i]);
 		CudaCheckErrorMod;
 	}
+	// map_param_switch is global and outlives us, but the keys in it hold a reference to
+	// the context they were built for. Leaving ours behind makes every later touch of that
+	// store -- clearParamSwitchKeys(), DeregisterAllContexts(), or the map's own destructor
+	// at exit -- destroy a KeySwitchingKey whose context is gone, and ~LimbPartition reads
+	// that reference. Take them with us while `this` is still whole.
+	std::erase_if(map_param_switch, [this](const auto& entry) { return entry.first.first == param || entry.first.second == param; });
 	key_switch_aux.reset(nullptr);
 	//   CudaCheckErrorMod;
 	key_switch_aux2.reset(nullptr);

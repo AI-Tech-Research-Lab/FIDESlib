@@ -1883,7 +1883,14 @@ void LimbPartition::modup_ksk_moddown_mgpu(LimbPartition& c0,
 	auxLimbs2.s.wait(s);
 	ksk_a.getS().wait(s);
 	ksk_b.getS().wait(s);
-	// digits.free(s);
+	// The digit streams have joined s above. Without graph capture this table is
+	// local to the call; leaving it allocated leaks on every key switch (including
+	// the ones inside single-GPU bootstrapping). Captured graphs retain their table
+	// for replay, so it must stay alive on that path.
+	if (!GRAPH_CAPTURE) {
+		cudaFreeAsync(digits, s.ptr());
+		CudaCheckErrorModNoSync;
+	}
 	cudaEventDestroy(ev);
 }
 

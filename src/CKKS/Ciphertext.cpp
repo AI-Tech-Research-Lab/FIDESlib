@@ -7,6 +7,8 @@
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/Plaintext.cuh"
 #include <omp.h>
+#include <stdexcept>
+#include <string>
 #if defined(__clang__)
 #include <experimental/source_location>
 using sc                  = std::experimental::source_location;
@@ -18,6 +20,19 @@ constexpr int PREFIX_SIZE = 23;
 #endif
 
 namespace FIDESlib::CKKS {
+
+namespace {
+// Operand adjustment (level / scaling-degree matching) can legitimately fail, e.g. a plaintext with fewer RNS limbs
+// than the ciphertext or a NoiseLevel-2 plaintext at the ciphertext's level. Report it instead of returning the
+// unmodified ciphertext (the previous assert(false) is compiled out in Release builds).
+[[noreturn]] void throwAdjustFailure(const char* op, const Ciphertext& c, int operandLevel, int operandNoiseLevel, const char* operandKind) {
+	throw std::runtime_error(std::string("FIDESlib::CKKS::Ciphertext::") + op + ": cannot adjust the " + operandKind +
+							 " operand to the ciphertext (ciphertext level " + std::to_string(c.getLevel()) + ", NoiseLevel " +
+							 std::to_string(c.NoiseLevel) + "; operand level " + std::to_string(operandLevel) + ", NoiseLevel " +
+							 std::to_string(operandNoiseLevel) + "). The operand needs at least as many RNS limbs as the ciphertext and a " +
+							 "NoiseLevel not above the ciphertext's; encode plaintexts at the ciphertext's level.");
+}
+} // namespace
 
 bool hoistRotateFused         = true;
 constexpr bool RESCALE_DOUBLE = true;
@@ -180,7 +195,7 @@ void Ciphertext::add(const Ciphertext& b) {
 			if (b_.adjustForAddOrSub(*this))
 				add(b_);
 			else
-				assert(false);
+				throwAdjustFailure("add", *this, b.getLevel(), b.NoiseLevel, "ciphertext");
 			return;
 		}
 	}
@@ -222,7 +237,7 @@ void Ciphertext::sub(const Ciphertext& b) {
 			if (b_.adjustForAddOrSub(*this))
 				sub(b_);
 			else
-				assert(false);
+				throwAdjustFailure("sub", *this, b.getLevel(), b.NoiseLevel, "ciphertext");
 			return;
 		}
 	}
@@ -262,7 +277,7 @@ void Ciphertext::addPt(const Plaintext& b) {
 		if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel != NoiseLevel) {
 			Plaintext b_(cc_);
 			if (!b_.adjustPlaintextToCiphertext(b, *this)) {
-				assert(false);
+				throwAdjustFailure("addPt", *this, b.c0.getLevel(), b.NoiseLevel, "plaintext");
 			} else {
 				addPt(b_);
 			}
@@ -270,6 +285,8 @@ void Ciphertext::addPt(const Plaintext& b) {
 		}
 	}
 	assert(NoiseLevel == b.NoiseLevel);
+	if (b.c0.getLevel() < this->getLevel())   // no adjust step ran (FIXEDMANUAL): the kernels would read past the plaintext
+		throwAdjustFailure("addPt", *this, b.c0.getLevel(), b.NoiseLevel, "plaintext");
 	op_count[OPS::ADDPT]++;
 
 	c0.add(b.c0);
@@ -299,7 +316,7 @@ void Ciphertext::subPt(const Plaintext& b) {
 		if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel != NoiseLevel) {
 			Plaintext b_(cc_);
 			if (!b_.adjustPlaintextToCiphertext(b, *this)) {
-				assert(false);
+				throwAdjustFailure("subPt", *this, b.c0.getLevel(), b.NoiseLevel, "plaintext");
 			} else {
 				subPt(b_);
 			}
@@ -307,6 +324,8 @@ void Ciphertext::subPt(const Plaintext& b) {
 		}
 	}
 	assert(NoiseLevel == b.NoiseLevel);
+	if (b.c0.getLevel() < this->getLevel())   // no adjust step ran (FIXEDMANUAL): the kernels would read past the plaintext
+		throwAdjustFailure("subPt", *this, b.c0.getLevel(), b.NoiseLevel, "plaintext");
 	op_count[OPS::ADDPT]++;
 
 	c0.sub(b.c0);
@@ -452,7 +471,7 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale, bool ignore_scale) {
 				if (!b_.adjustPlaintextToCiphertext(b, *this)) {
 					if constexpr (PRINT)
 						std::cout << "multPt: FAILED!" << std::endl;
-					assert(false);
+					throwAdjustFailure("multPt", *this, b.c0.getLevel(), b.NoiseLevel, "plaintext");
 				} else {
 					if (NoiseLevel == 2)
 						this->rescale();
@@ -470,6 +489,8 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale, bool ignore_scale) {
 		assert(NoiseLevel < 2);
 		assert(b.NoiseLevel < 2);
 	}
+	if (b.c0.getLevel() < this->getLevel())   // no adjust step ran (FIXEDMANUAL / ignore_scale): the kernels would read past the plaintext
+		throwAdjustFailure("multPt", *this, b.c0.getLevel(), b.NoiseLevel, "plaintext");
 	op_count[OPS::MULTPT]++;
 
 	c0.multPt(b.c0, rescale && cc.rescaleTechnique == CKKS::FIXEDMANUAL);
@@ -533,7 +554,7 @@ void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
 			if (b_.adjustForMult(*this))
 				mult(b_, rescale, moddown);
 			else
-				assert(false);
+				throwAdjustFailure("mult", *this, b.getLevel(), b.NoiseLevel, "ciphertext");
 			return;
 		}
 	}
@@ -1077,9 +1098,7 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 					// if (!ext)
 					//     results[i]->c0.moddown(true, false);
 
-					results[i]->keyID       = keyID;
-					results[i]->NoiseLevel  = NoiseLevel;
-					results[i]->NoiseFactor = NoiseFactor;
+					results[i]->copyMetadata(*this); // also copies `slots` (was keyID/NoiseLevel/NoiseFactor only -> slots stayed 0)
 				}
 			}
 		} else {

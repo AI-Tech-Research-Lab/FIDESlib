@@ -1156,7 +1156,14 @@ void ContextData::clearAuxilarPoly() {
 	// the freeing stream and makes the pool stream wait on it, so a clear costs thousands of event operations (nsys, H200,
 	// N = 2^16, 104 polys: 4816 cudaEventRecord + 4816 cudaStreamWaitEvent, 12.6 ms of host time). After one device-wide
 	// synchronize no buffer is in use any more, so those waits are redundant: skip them while the pool is being cleared.
-	cudaDeviceSynchronize();
+	// The polys span every GPU of the context, so every one of them has to be synchronized, not just the current one.
+	int current;
+	cudaGetDevice(&current);
+	for (int dev : std::set<int>(GPUid.begin(), GPUid.end())) {
+		cudaSetDevice(dev);
+		cudaDeviceSynchronize();
+	}
+	cudaSetDevice(current);
 	FIDESlib::gpufree_presynced = true;
 	precom.auxPoly.clear();
 	FIDESlib::gpufree_presynced = false;

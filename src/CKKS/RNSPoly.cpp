@@ -198,6 +198,14 @@ void RNSPoly::loadDecompDigit(const std::vector<std::vector<std::vector<uint64_t
 	}
 }
 
+void RNSPoly::loadDecompDigit(const std::vector<std::vector<const uint64_t*>>& data, const size_t n, const std::vector<std::vector<uint64_t>>& moduli) {
+#pragma omp parallel for num_threads(cc.GPUid.size())
+	for (size_t i = 0; i < cc.GPUid.size(); ++i) {
+		assert(omp_get_num_threads() == (int)cc.GPUid.size());
+		GPU.at(i).loadDecompDigit(data, n, moduli);
+	}
+}
+
 void RNSPoly::store(std::vector<std::vector<uint64_t>>& data) {
 	data.resize(level + 1);
 	for (size_t i = 0; i < data.size(); ++i) {
@@ -936,6 +944,16 @@ void RNSPoly::load(const std::vector<std::vector<uint64_t>>& data, const std::ve
 }
 
 void RNSPoly::loadConstant(const std::vector<std::vector<uint64_t>>& data, const std::vector<uint64_t>& moduli) {
+	std::vector<const uint64_t*> rows(data.size());
+	for (size_t i = 0; i < data.size(); ++i) {
+		if (data[i].size() != data[0].size())
+			throw std::invalid_argument("loadConstant: rows of different lengths");
+		rows[i] = data[i].data();
+	}
+	loadConstant(rows, data.empty() ? 0 : data[0].size(), moduli);
+}
+
+void RNSPoly::loadConstant(const std::vector<const uint64_t*>& data, const size_t n, const std::vector<uint64_t>& moduli) {
 	int limbsize  = 0;
 	int Slimbsize = 0;
 	for (int i = 0; i < (int)data.size(); ++i) {
@@ -956,7 +974,7 @@ void RNSPoly::loadConstant(const std::vector<std::vector<uint64_t>>& data, const
 	for (int i = 0; i < limbsize; ++i) {
 		assert(moduli[i] == cc.prime.at(i).p);
 		cudaSetDevice(GPU[cc.limbGPUid[i].x].device);
-		SWITCH(GPU[cc.limbGPUid[i].x].limb[cc.limbGPUid[i].y], load_convert(data[i]));
+		SWITCH(GPU[cc.limbGPUid[i].x].limb[cc.limbGPUid[i].y], load_convert(data[i], n));
 	}
 
 	if ((int)data.size() > limbsize) {
@@ -968,7 +986,7 @@ void RNSPoly::loadConstant(const std::vector<std::vector<uint64_t>>& data, const
 			for (size_t k = 0; k < cc.splitSpecialMeta.at(j).size(); ++k) {
 				if (cc.specialPrime.at(cc.splitSpecialMeta.at(j).at(k).id - cc.L - 1).p == moduli[i]) {
 					cudaSetDevice(GPU[j].device);
-					SWITCH(GPU[j].SPECIALlimb[k], load_convert(data[i]));
+					SWITCH(GPU[j].SPECIALlimb[k], load_convert(data[i], n));
 				}
 			}
 		}

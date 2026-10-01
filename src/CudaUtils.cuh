@@ -182,5 +182,34 @@ struct GPUPoolBucketStats {
 /// Intended for profiling only; it does not allocate, free, or trim any buffer.
 std::vector<GPUPoolBucketStats> GPUmemoryPoolStats(int device);
 
+/// @brief A host-side table of `rows` x `n` 64-bit words in one buffer, page-locked when the
+/// driver allows it (falling back to ordinary memory otherwise). Host->device copies from a
+/// pinned buffer are plain DMA at full PCIe bandwidth -- several times what the staged copy
+/// from pageable memory reaches -- which is what the VRAM caches reload their snapshots from.
+/// A copy from it is asynchronous, so the buffer must outlive it.
+class HostRows {
+  public:
+	HostRows() = default;
+	HostRows(size_t rows, size_t n);
+	~HostRows();
+	HostRows(HostRows&& o) noexcept;
+	HostRows& operator=(HostRows&& o) noexcept;
+	HostRows(const HostRows&)			 = delete;
+	HostRows& operator=(const HostRows&) = delete;
+
+	[[nodiscard]] uint64_t* row(size_t r) { return words + r * n; }
+	[[nodiscard]] const uint64_t* row(size_t r) const { return words + r * n; }
+	[[nodiscard]] size_t rowWords() const { return n; }
+	[[nodiscard]] size_t rows() const { return nrows; }
+	[[nodiscard]] bool pinned() const { return is_pinned; }
+
+  private:
+	void release();
+	uint64_t* words = nullptr;
+	size_t nrows	= 0;
+	size_t n		= 0;
+	bool is_pinned	= false;
+};
+
 } // namespace FIDESlib
 #endif // FIDESLIB_CUDAUTILS_CUH

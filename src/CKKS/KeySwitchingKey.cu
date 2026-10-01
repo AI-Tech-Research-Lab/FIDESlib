@@ -5,7 +5,10 @@
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/RNSPoly.cuh"
+#include <cstring>
+#include <set>
 #include <source_location>
+#include <stdexcept>
 #if defined(__clang__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
@@ -27,9 +30,29 @@ void KeySwitchingKey::Initialize(RawKeySwitchKey& rkk, const bool lazy) {
 		// Rotation-key VRAM cache active: keep only the host snapshot. The limbs are
 		// generated on first use (ensureResident), so creating a full set of rotation
 		// keys never spikes VRAM by sum(key sizes).
-		snapshot		 = rkk;
+		size_t rows = 0, n = 0;
+		for (const auto& poly : rkk.r_key)
+			for (const auto& digit : poly)
+				for (const auto& limb : digit) {
+					n = limb.size();
+					++rows;
+				}
+		snapshot.rows	= HostRows(rows, n);
+		snapshot.moduli = rkk.r_key_moduli;
+		snapshot.first_row.assign(rkk.r_key.size(), {});
+		size_t row = 0;
+		for (size_t p = 0; p < rkk.r_key.size(); ++p) {
+			for (const auto& digit : rkk.r_key[p]) {
+				snapshot.first_row[p].push_back(row);
+				for (const auto& limb : digit) {
+					if (limb.size() != n)
+						throw std::invalid_argument("KeySwitchingKey: limbs of different lengths");
+					std::memcpy(snapshot.rows.row(row++), limb.data(), n * sizeof(uint64_t));
+				}
+			}
+		}
 		has_snapshot = true;
-		resident		 = false;
+		resident	 = false;
 	} else {
 		loadLimbs(rkk);
 		resident = true;
@@ -37,17 +60,45 @@ void KeySwitchingKey::Initialize(RawKeySwitchKey& rkk, const bool lazy) {
 	limb_bytes = computeLimbBytes();
 }
 
-void KeySwitchingKey::loadLimbs(RawKeySwitchKey& rkk) {
+void KeySwitchingKey::allocateLimbs() {
 	a.generateDecompAndDigit(true);
 	b.generateDecompAndDigit(true);
 	if (cc->GPUid.size() > 1) {
 		a.grow(cc->L, false, true);
 		b.grow(cc->L, false, true);
 	}
+}
+
+void KeySwitchingKey::synchronizeDevices() {
+	int current;
+	cudaGetDevice(&current);
+	for (int dev : std::set<int>(cc->GPUid.begin(), cc->GPUid.end())) {
+		cudaSetDevice(dev);
+		cudaDeviceSynchronize();
+	}
+	cudaSetDevice(current);
+}
+
+void KeySwitchingKey::loadLimbs(RawKeySwitchKey& rkk) {
+	allocateLimbs();
 	a.loadDecompDigit(rkk.r_key[0], rkk.r_key_moduli[0]);
 	b.loadDecompDigit(rkk.r_key[1], rkk.r_key_moduli[1]);
 
-	cudaDeviceSynchronize();
+	synchronizeDevices();
+}
+
+void KeySwitchingKey::loadLimbsFromSnapshot() {
+	allocateLimbs();
+	RNSPoly* polys[2] = { &a, &b };
+	for (size_t p = 0; p < 2; ++p) {
+		std::vector<std::vector<const uint64_t*>> rows(snapshot.moduli.at(p).size());
+		for (size_t d = 0; d < rows.size(); ++d)
+			for (size_t l = 0; l < snapshot.moduli[p][d].size(); ++l)
+				rows[d].push_back(snapshot.rows.row(snapshot.first_row[p][d] + l));
+		polys[p]->loadDecompDigit(rows, snapshot.rows.rowWords(), snapshot.moduli[p]);
+	}
+	// The copies read straight from the pinned snapshot: wait for them before returning.
+	synchronizeDevices();
 }
 
 size_t KeySwitchingKey::computeLimbBytes() const {
@@ -102,7 +153,7 @@ void KeySwitchingKey::ensureResident() {
 	assert(has_snapshot && "Key without a host snapshot cannot be reloaded");
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc);
-	loadLimbs(snapshot);
+	loadLimbsFromSnapshot();
 	resident = true;
 }
 

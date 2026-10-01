@@ -1091,6 +1091,21 @@ void LimbPartition::generateLimbConstant() {
 }
 
 void LimbPartition::loadDecompDigit(const std::vector<std::vector<std::vector<uint64_t>>>& data, const std::vector<std::vector<uint64_t>>& moduli) {
+	std::vector<std::vector<const uint64_t*>> rows(data.size());
+	size_t n = 0;
+	for (size_t i = 0; i < data.size(); ++i) {
+		for (const auto& row : data[i]) {
+			if (n == 0)
+				n = row.size();
+			if (row.size() != n)
+				throw std::invalid_argument("loadDecompDigit: rows of different lengths");
+			rows[i].push_back(row.data());
+		}
+	}
+	loadDecompDigit(rows, n, moduli);
+}
+
+void LimbPartition::loadDecompDigit(const std::vector<std::vector<const uint64_t*>>& data, const size_t n, const std::vector<std::vector<uint64_t>>& moduli) {
 	cudaSetDevice(device);
 	int limb_size = getLimbSize(*level);
 
@@ -1101,7 +1116,7 @@ void LimbPartition::loadDecompDigit(const std::vector<std::vector<std::vector<ui
 				for (size_t k = 0; k < data.at(i).size(); ++k) {
 					if (cc.precom.constants[id].primes[PRIMEID(j)] == moduli.at(i).at(k)) {
 						STREAM(j).wait(s);
-						SWITCH(j, load(data.at(i).at(k)));
+						SWITCH(j, load_convert(data.at(i).at(k), n));
 						k = data.at(i).size();
 					}
 				}
@@ -1129,7 +1144,7 @@ void LimbPartition::loadDecompDigit(const std::vector<std::vector<std::vector<ui
 					for (size_t k = 0; k < data.at(i).size(); ++k) {
 						if (cc.precom.constants[id].primes[PRIMEID(limb[j])] == moduli.at(i).at(k)) {
 							STREAM(limb[j]).wait(s);
-							SWITCH(limb[j], load(data.at(i).at(k)));
+							SWITCH(limb[j], load_convert(data.at(i).at(k), n));
 							k = data.at(i).size();
 						}
 					}
@@ -1143,7 +1158,7 @@ void LimbPartition::loadDecompDigit(const std::vector<std::vector<std::vector<ui
 			for (size_t k = 0; k < data.at(i).size(); ++k) {
 				if (cc.precom.constants[id].primes[PRIMEID(j)] == moduli.at(i).at(k)) {
 					STREAM(j).wait(s);
-					SWITCH(j, load(data.at(i).at(k)));
+					SWITCH(j, load_convert(data.at(i).at(k), n));
 					k = data.at(i).size();
 				}
 			}

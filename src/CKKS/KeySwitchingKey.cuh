@@ -27,8 +27,13 @@ class KeySwitchingKey {
 	/** Host-side (RAM) snapshot of the raw key material. Retained when the key is created
 	 * with Initialize(..., lazy = true) (i.e. the rotation-key VRAM cache is active); it is
 	 * what offload()/ensureResident() round-trip through. Empty (has_snapshot == false)
-	 * otherwise: such keys cannot be offloaded and are treated as pinned by the cache. */
-	RawKeySwitchKey snapshot;
+	 * otherwise: such keys cannot be offloaded and are treated as pinned by the cache.
+	 * The limbs sit in one pinned buffer (see HostRows), so a reload is a straight DMA. */
+	struct Snapshot {
+		HostRows rows;										 ///< every limb of a, then of b, digit by digit
+		std::vector<std::vector<std::vector<uint64_t>>> moduli; ///< [poly][digit][limb], as RawKeySwitchKey::r_key_moduli
+		std::vector<std::vector<size_t>> first_row;			 ///< [poly][digit]: index of the digit's first limb
+	} snapshot;
 	bool resident	 = false;
 	bool has_snapshot = false;
 
@@ -60,6 +65,12 @@ class KeySwitchingKey {
 
   private:
 	void loadLimbs(RawKeySwitchKey& rkk);
+	void loadLimbsFromSnapshot();
+	/** Allocate the DECOMP/DIGIT limbs (and, multi-GPU, the regular ones) before an upload. */
+	void allocateLimbs();
+	/** Wait for every device of the context: uploads from pinned memory are asynchronous and
+	 * land on several devices' streams, while callers launch kernels right after. */
+	void synchronizeDevices();
 	[[nodiscard]] size_t computeLimbBytes() const;
 	size_t limb_bytes = 0;
 };

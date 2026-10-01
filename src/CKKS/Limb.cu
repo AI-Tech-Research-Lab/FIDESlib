@@ -80,14 +80,16 @@ template <typename T> template <typename Q> void Limb<T>::load(const std::vector
 	int device = -1;
 	cudaGetDevice(&device);
 	// std::cout << v.device << " " << device << ",";
+	if constexpr (std::is_same_v<T, Q>) {
+		// No staging copy: from pageable memory cudaMemcpyAsync returns only once the source has
+		// been consumed, so the caller's vector may go away right after.
+		cudaMemcpyAsync(v.data, dat_.data(), dat_.size() * sizeof(T), cudaMemcpyHostToDevice, stream.ptr());
+		return;
+	}
 	std::vector<T> dat;
-	if constexpr (!std::is_same<T, Q>().value) {
-		dat.assign(v.size, 0);
-		for (size_t i = 0; i < dat.size(); ++i) {
-			dat[i] = dat_[i];
-		}
-	} else {
-		dat = dat_;
+	dat.assign(v.size, 0);
+	for (size_t i = 0; i < dat.size(); ++i) {
+		dat[i] = dat_[i];
 	}
 
 	// cudaHostRegister((void *) dat.data(), dat.size() * sizeof(T), cudaHostRegisterDefault);
@@ -110,18 +112,28 @@ template <typename T> void Limb<T>::load(const VectorGPU<T>& dat) {
 }
 
 template <typename T> template <typename Q> void Limb<T>::load_convert(const std::vector<Q>& dat_raw) {
-	assert(dat_raw.size() <= v.size);
-	std::vector<T> dat(dat_raw.size());
-
-	for (size_t i = 0; i < dat.size(); ++i)
-		dat[i] = static_cast<T>(dat_raw[i]);
-
-	load(dat);
+	load_convert(dat_raw.data(), dat_raw.size());
 }
 
 template void Limb<uint32_t>::load_convert<uint64_t>(const std::vector<uint64_t>& dat_raw);
 
 template void Limb<uint64_t>::load_convert<uint64_t>(const std::vector<uint64_t>& dat_raw);
+
+template <typename T> template <typename Q> void Limb<T>::load_convert(const Q* src, const size_t n) {
+	assert(n <= v.size);
+	if constexpr (std::is_same_v<T, Q>) {
+		cudaMemcpyAsync(v.data, src, n * sizeof(T), cudaMemcpyHostToDevice, stream.ptr());
+	} else {
+		std::vector<T> dat(n);
+		for (size_t i = 0; i < n; ++i)
+			dat[i] = static_cast<T>(src[i]);
+		cudaMemcpyAsync(v.data, dat.data(), n * sizeof(T), cudaMemcpyHostToDevice, stream.ptr());
+	}
+}
+
+template void Limb<uint32_t>::load_convert<uint64_t>(const uint64_t* src, size_t n);
+
+template void Limb<uint64_t>::load_convert<uint64_t>(const uint64_t* src, size_t n);
 
 template <typename T> template <typename Q> void Limb<T>::store_convert(std::vector<Q>& dat_raw) {
 	dat_raw.resize(v.size);

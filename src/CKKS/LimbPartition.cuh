@@ -205,6 +205,8 @@ class LimbPartition {
 	void generateLimbConstant();
 
 	void loadDecompDigit(const std::vector<std::vector<std::vector<uint64_t>>>& data, const std::vector<std::vector<uint64_t>>& moduli);
+	/** Same, from host pointers of `n` words per limb ([digit][limb]). */
+	void loadDecompDigit(const std::vector<std::vector<const uint64_t*>>& data, size_t n, const std::vector<std::vector<uint64_t>>& moduli);
 
 	void dotKSK(const LimbPartition& src, const LimbPartition& ksk, const bool inplace = false, const LimbPartition* limbsrc = nullptr);
 

@@ -73,6 +73,9 @@ class RNSPoly {
 	void mult1Add2(const RNSPoly& poly1, const RNSPoly& poly2);
 
 	void loadDecompDigit(const std::vector<std::vector<std::vector<uint64_t>>>& data, const std::vector<std::vector<uint64_t>>& moduli);
+	/** Same, from host pointers of `n` words per limb ([digit][limb]); pinned rows upload
+	 * asynchronously and must outlive the copy. */
+	void loadDecompDigit(const std::vector<std::vector<const uint64_t*>>& data, size_t n, const std::vector<std::vector<uint64_t>>& moduli);
 
 	void dotKSKinto(RNSPoly& acc, const RNSPoly& ksk, const RNSPoly* limbsrc = nullptr);
 
@@ -131,6 +134,9 @@ class RNSPoly {
 	void broadcastLimb0();
 	void evalLinearWSum(uint32_t i, std::vector<const RNSPoly*>& vector1, std::vector<uint64_t>& vector2);
 	void loadConstant(const std::vector<std::vector<uint64_t>>& vector1, const std::vector<uint64_t>& vector2);
+	/** Same, from one host pointer of `n` words per row. Rows in pinned memory upload
+	 * asynchronously: they must outlive the copy (synchronize before freeing them). */
+	void loadConstant(const std::vector<const uint64_t*>& rows, size_t n, const std::vector<uint64_t>& moduli);
 	void rotateModupDotKSK(RNSPoly& poly, RNSPoly& poly1, const KeySwitchingKey& key);
 	void squareModupDotKSK(RNSPoly& c0, RNSPoly& c1, const KeySwitchingKey& key);
 	void generatePartialSpecialLimbs();

@@ -72,6 +72,10 @@ template <typename T> class Limb {
 	void store(std::vector<T>& dat) const;
 
 	template <typename Q> void load_convert(const std::vector<Q>& dat_raw);
+	/** Upload `n` words from host memory. When Q == T the copy is issued straight from `src`:
+	 * from pinned memory it is then asynchronous, so `src` must stay alive until the limb's
+	 * stream has caught up. */
+	template <typename Q> void load_convert(const Q* src, size_t n);
 
 	template <typename Q> void store_convert(std::vector<Q>& dat_raw);
 

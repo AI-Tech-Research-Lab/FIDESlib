@@ -4,6 +4,9 @@
 
 #include "CudaUtils.cuh"
 #include <cassert>
+#include <cstdlib>
+#include <new>
+#include <utility>
 #include <list>
 #include <string>
 
@@ -603,6 +606,52 @@ std::vector<GPUPoolBucketStats> GPUmemoryPoolStats(int device) {
 
 int GetTargetThreads(int id) {
 	return GPUprop[id].multiProcessorCount * GPUprop[id].maxThreadsPerMultiProcessor;
+}
+
+HostRows::HostRows(const size_t rows_, const size_t n_) : nrows(rows_), n(n_) {
+	const size_t bytes = nrows * n * sizeof(uint64_t);
+	if (bytes == 0)
+		return;
+	// Portable: a multi-GPU context copies from here onto every one of its devices.
+	if (cudaHostAlloc(reinterpret_cast<void**>(&words), bytes, cudaHostAllocPortable) == cudaSuccess) {
+		is_pinned = true;
+	} else {
+		cudaGetLastError(); // clear the failed allocation: ordinary memory still works, slower
+		words = static_cast<uint64_t*>(std::malloc(bytes));
+		if (words == nullptr)
+			throw std::bad_alloc();
+	}
+}
+
+HostRows::~HostRows() {
+	release();
+}
+
+HostRows::HostRows(HostRows&& o) noexcept
+: words(std::exchange(o.words, nullptr)), nrows(std::exchange(o.nrows, 0)), n(std::exchange(o.n, 0)), is_pinned(o.is_pinned) {}
+
+HostRows& HostRows::operator=(HostRows&& o) noexcept {
+	if (this != &o) {
+		release();
+		words	  = std::exchange(o.words, nullptr);
+		nrows	  = std::exchange(o.nrows, 0);
+		n		  = std::exchange(o.n, 0);
+		is_pinned = o.is_pinned;
+	}
+	return *this;
+}
+
+void HostRows::release() {
+	if (words != nullptr) {
+		if (is_pinned) {
+			// Fails harmlessly when the CUDA runtime is already gone at process exit.
+			if (cudaFreeHost(words) != cudaSuccess)
+				cudaGetLastError();
+		} else {
+			std::free(words);
+		}
+		words = nullptr;
+	}
 }
 
 } // namespace FIDESlib

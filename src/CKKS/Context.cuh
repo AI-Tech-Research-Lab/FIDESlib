@@ -23,6 +23,9 @@
 
 namespace FIDESlib::CKKS {
 
+struct BootCacheBlock;
+struct RawPlainText;
+
 struct Precomputations {
 	std::vector<Constants> constants;
 	std::unique_ptr<Global> globals;
@@ -229,7 +232,47 @@ class ContextData {
 	[[nodiscard]] size_t RotationKeyCacheResidentBytes() const;
 	/** }@ */
 
+	/** @name Bootstrap-precomputation VRAM cache
+	 * Bound the VRAM spent on the linear-transform plaintexts of the bootstrap precomputation
+	 * (the CoeffsToSlots/SlotsToCoeffs matrices) to `bootstrap_cache_bytes`. The unit of the
+	 * cache is a group of plaintexts consumed together (one transform stage), which is loaded
+	 * from a host RAM snapshot right before the stage runs. Same rules as the rotation-key
+	 * cache: only groups built while a finite budget is set have a snapshot, and they cost no
+	 * VRAM until first used; groups built without one stay resident for good. SIZE_MAX keeps
+	 * the legacy behavior (everything resident, no snapshot).
+	 *
+	 * Eviction takes the most recently used group first, not the least recently used one: a
+	 * bootstrap visits its stages in the same order every time, and under that cyclic pattern
+	 * LRU always evicts the group needed soonest -- with a budget below the total it would
+	 * reload every stage of every bootstrap. Evicting the most recent one keeps a fixed subset
+	 * resident and streams only the rest. The budget is soft by one group: the group being
+	 * loaded is never evicted, so a budget smaller than a stage still runs that stage.
+	 * @{ */
+	void SetBootstrapCache(size_t bytes);
+	[[nodiscard]] size_t GetBootstrapCache() const { return bootstrap_cache_bytes; }
+	/** True while a finite budget is set; groups built now keep a snapshot and start offloaded. */
+	[[nodiscard]] bool bootstrapPrecomputationLazy() const { return bootstrap_cache_bytes != SIZE_MAX; }
+	/** Offload every group that has a snapshot, now. */
+	void OffloadBootstrapPrecomputation();
+	/** Sum of VRAM bytes currently held by resident groups (every slot count). */
+	[[nodiscard]] size_t BootstrapCacheResidentBytes() const;
+	/** Total bytes ever reloaded from host snapshots: its growth over one bootstrap is what the
+	 * budget costs per bootstrap. */
+	[[nodiscard]] uint64_t BootstrapCacheLoadedBytes() const { return bootstrap_cache_loaded_bytes; }
+	/** Account a group that has just been built, resident, in `pts`. Under a finite budget
+	 * `raws` (the host data it was built from) becomes its snapshot and the group is
+	 * offloaded right away, so building a precomputation never needs more than one group of
+	 * VRAM; otherwise `raws` is dropped. */
+	void AdmitBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts, std::vector<RawPlainText>&& raws);
+	/** Make a group resident (evicting others to fit the budget) right before a linear
+	 * transform consumes it. Returns `pts`. */
+	std::vector<Plaintext>& AcquireBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts);
+	/** }@ */
+
 	/** @cond */
+	size_t bootstrap_cache_bytes  = SIZE_MAX;
+	uint64_t bootstrap_cache_clock = 0;
+	uint64_t bootstrap_cache_loaded_bytes = 0;
 	size_t rotation_key_cache_bytes = SIZE_MAX;
 	/** Depth of active RotationKeyEvictionHold scopes. */
 	int rotation_key_eviction_hold = 0;

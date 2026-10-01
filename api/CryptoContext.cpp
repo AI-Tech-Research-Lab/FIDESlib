@@ -481,6 +481,44 @@ void CryptoContextImpl<DCRTPoly>::EnforceCiphertextBudget(const uint32_t protect
 	}
 }
 
+// ---- Bootstrap-precomputation VRAM cache ----
+
+void CryptoContextImpl<DCRTPoly>::SetBootstrapCache(const size_t bytes) {
+	FIDESlib::CudaNvtxRange r("API");
+	this->bootstrap_cache_bytes = bytes;
+	if (this->loaded) {
+		auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+		context_gpu->SetBootstrapCache(bytes);
+	}
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetBootstrapCache() const {
+	return this->bootstrap_cache_bytes;
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetBootstrapCacheResidentBytes() const {
+	if (!this->loaded)
+		return 0;
+	auto& context_gpu = std::any_cast<const FIDESlib::CKKS::Context&>(this->gpu);
+	return context_gpu->BootstrapCacheResidentBytes();
+}
+
+size_t CryptoContextImpl<DCRTPoly>::GetBootstrapCacheLoadedBytes() const {
+	if (!this->loaded)
+		return 0;
+	auto& context_gpu = std::any_cast<const FIDESlib::CKKS::Context&>(this->gpu);
+	return context_gpu->BootstrapCacheLoadedBytes();
+}
+
+void CryptoContextImpl<DCRTPoly>::OffloadBootstrapPrecomputation() {
+	FIDESlib::CudaNvtxRange r("API");
+	if (!this->loaded) {
+		OPENFHE_THROW("CryptoContext not loaded to any device");
+	}
+	auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	context_gpu->OffloadBootstrapPrecomputation();
+}
+
 // ---- Load to devices ----
 
 void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicKey) {
@@ -521,6 +559,9 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 	// (including the bootstrapping ones) start as a host-RAM snapshot that loads lazily and can
 	// be evicted again. Keys built without it are permanently resident.
 	c->SetRotationKeyCache(this->rotation_key_cache_bytes);
+	// Same for the bootstrap precomputation: under a finite budget its matrices are built with a
+	// host snapshot and offloaded right away (AddBootstrapPrecomputation below).
+	c->SetBootstrapCache(this->bootstrap_cache_bytes);
 
 	auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
 

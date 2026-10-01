@@ -58,9 +58,10 @@ void FIDESlib::CKKS::EvalLinearTransform(Ciphertext& ctxt, int slots, bool decod
 		*/
 	} else {
 
-		int bStep				  = cc.GetBootPrecomputation(slots).LT.bStep;
+		auto& LT				  = cc.GetBootPrecomputation(slots).LT;
+		int bStep				  = LT.bStep;
 		int gStep				  = slots / bStep;
-		std::vector<Plaintext>& A = decode ? cc.GetBootPrecomputation(slots).LT.invA : cc.GetBootPrecomputation(slots).LT.A;
+		std::vector<Plaintext>& A = decode ? cc.AcquireBootBlock(LT.cacheInvA, LT.invA) : cc.AcquireBootBlock(LT.cacheA, LT.A);
 		std::vector<Plaintext*> Aptr(slots, nullptr);
 		for (uint32_t j = 0; j < static_cast<uint32_t>(gStep); ++j) {
 			for (uint32_t i = 0; i < static_cast<uint32_t>(bStep); ++i) {
@@ -130,7 +131,9 @@ void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode)
 		} else {
 
 			{
-
+				// Under a bootstrap-cache budget the stage may live in host RAM: bring it back
+				// before taking pointers into it.
+				cc.AcquireBootBlock(step.cache, step.A);
 				assert(step.slots == step.A.size());
 				std::vector<Plaintext*> Aptr(step.slots, nullptr);
 				for (int j = 0; j < step.gStep; ++j) {

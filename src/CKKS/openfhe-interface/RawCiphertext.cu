@@ -1153,6 +1153,9 @@ void FIDESlib::CKKS::AddBootstrapKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPo
 void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int slots, FIDESlib::CKKS::Context& GPUcc_, FIDESlib::CKKS::BootstrapPrecomputation& result) {
 	ContextData& GPUcc = *GPUcc_;
 	auto precom		   = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_bootPrecomMap.find(slots)->second;
+	// Under a bootstrap-cache budget every group keeps the host data it was built from as its
+	// snapshot (see ContextData::AdmitBootBlock); otherwise each one is dropped right after upload.
+	const bool keep_raw = GPUcc.bootstrapPrecomputationLazy();
 
 	if (precom->m_paramsEnc.lvlb /*[CKKS_BOOT_PARAMS::LEVEL_BUDGET]*/ == 1 && precom->m_paramsDec.lvlb /*[CKKS_BOOT_PARAMS::LEVEL_BUDGET]*/ == 1) {
 
@@ -1162,20 +1165,28 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
 				auto auxInvA = precom->m_U0Pre;
 
 				result.LT.A.clear();
+				std::vector<RawPlainText> raws;
 				for (uint32_t i = 0; i < auxA.size(); ++i) {
 					RawPlainText raw = GetRawPlainText(cc, auxA.at(i));
 					result.LT.A.emplace_back(GPUcc_, raw);
 					if constexpr (remove_extension)
 						result.LT.A.back().c0.freeSpecialLimbs();
+					if (keep_raw)
+						raws.push_back(std::move(raw));
 				}
+				GPUcc.AdmitBootBlock(result.LT.cacheA, result.LT.A, std::move(raws));
 
 				result.LT.invA.clear();
+				raws.clear();
 				for (uint32_t i = 0; i < auxInvA.size(); ++i) {
 					RawPlainText raw = GetRawPlainText(cc, auxInvA.at(i));
 					result.LT.invA.emplace_back(GPUcc_, raw);
 					if constexpr (remove_extension)
 						result.LT.invA.back().c0.freeSpecialLimbs();
+					if (keep_raw)
+						raws.push_back(std::move(raw));
 				}
+				GPUcc.AdmitBootBlock(result.LT.cacheInvA, result.LT.invA, std::move(raws));
 			}
 		}
 
@@ -1187,21 +1198,29 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
 			auto& invA = precom->m_U0PreFFT;
 
 			for (uint32_t i = 0; i < A.size(); ++i) {
+				std::vector<RawPlainText> raws;
 				for (uint32_t j = 0; j < A.at(A.size() - 1 - i).size(); ++j) {
 					RawPlainText raw = GetRawPlainText(cc, A.at(A.size() - 1 - i).at(j));
 					result.CtS.at(i).A.emplace_back(GPUcc_, raw);
 					if constexpr (remove_extension)
 						result.CtS.at(i).A.back().c0.freeSpecialLimbs();
+					if (keep_raw)
+						raws.push_back(std::move(raw));
 				}
+				GPUcc.AdmitBootBlock(result.CtS.at(i).cache, result.CtS.at(i).A, std::move(raws));
 			}
 
 			for (uint32_t i = 0; i < invA.size(); ++i) {
+				std::vector<RawPlainText> raws;
 				for (uint32_t j = 0; j < invA.at(i).size(); ++j) {
 					RawPlainText raw = GetRawPlainText(cc, invA.at(i).at(j));
 					result.StC.at(i).A.emplace_back(GPUcc_, raw);
 					if constexpr (remove_extension)
 						result.StC.at(i).A.back().c0.freeSpecialLimbs();
+					if (keep_raw)
+						raws.push_back(std::move(raw));
 				}
+				GPUcc.AdmitBootBlock(result.StC.at(i).cache, result.StC.at(i).A, std::move(raws));
 			}
 		}
 	}

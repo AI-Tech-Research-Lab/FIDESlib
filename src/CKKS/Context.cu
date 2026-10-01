@@ -6,6 +6,8 @@
 #include "CKKS/Context.cuh"
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <utility>
 #include <source_location>
 #include <stdexcept>
 
@@ -784,6 +786,158 @@ size_t ContextData::RotationKeyCacheResidentBytes() const {
 	return bytes;
 }
 
+namespace {
+
+/** Drain every device of the context. Linear-transform plaintexts are read by kernels enqueued
+ * on the ciphertext's streams rather than on their own, so -- as for KeySwitchingKey::offload --
+ * only a full drain proves that freeing them (or using freshly uploaded ones) is safe. */
+void synchronizeContextDevices(const ContextData& cc) {
+	int current;
+	cudaGetDevice(&current);
+	for (int dev : std::set<int>(cc.GPUid.begin(), cc.GPUid.end())) {
+		cudaSetDevice(dev);
+		cudaDeviceSynchronize();
+	}
+	cudaSetDevice(current);
+}
+
+/** Free the device limbs of every plaintext in the groups. Synchronizes first. */
+void freeBootBlocks(const ContextData& cc, const std::vector<std::pair<BootCacheBlock*, std::vector<Plaintext>*>>& blocks) {
+	if (blocks.empty())
+		return;
+	synchronizeContextDevices(cc);
+	FIDESlib::gpufree_presynced = true;
+	for (auto& [block, pts] : blocks) {
+		for (auto& pt : *pts) {
+			pt.c0.freeSpecialLimbs();
+			pt.c0.freeGPU();
+		}
+		block->resident = false;
+	}
+	FIDESlib::gpufree_presynced = false;
+}
+
+/** Evict groups, most recently used first, until resident + incoming <= budget. Skips `keep` and
+ * groups without a snapshot; overshoots when nothing evictable is left. */
+void evictBootstrapCache(ContextData& cc, const size_t budget, const size_t incoming, const BootCacheBlock* keep) {
+	size_t resident = cc.BootstrapCacheResidentBytes();
+	if (resident + incoming <= budget)
+		return;
+	std::vector<std::pair<BootCacheBlock*, std::vector<Plaintext>*>> candidates;
+	for (auto& [slots, precomp] : cc.precom.boot) {
+		precomp.forEachBlock([&](BootCacheBlock& block, std::vector<Plaintext>& pts) {
+			if (block.resident && block.hasSnapshot() && &block != keep)
+				candidates.emplace_back(&block, &pts);
+		});
+	}
+	std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first->last_use > b.first->last_use; });
+	size_t n = 0;
+	while (n < candidates.size() && resident + incoming > budget) {
+		resident -= candidates[n].first->bytes;
+		++n;
+	}
+	candidates.resize(n);
+	freeBootBlocks(cc, candidates);
+}
+
+} // namespace
+
+BootSnapshot::BootSnapshot(const std::vector<RawPlainText>& raws, const size_t n) {
+	size_t total_rows = 0;
+	for (const auto& raw : raws) {
+		Entry e;
+		e.first_row	  = total_rows;
+		e.moduli	  = raw.moduli;
+		e.noise		  = raw.Noise;
+		e.noise_level = raw.NoiseLevel;
+		e.slots		  = raw.slots;
+		if (raw.moduli.size() != raw.sub_0.size())
+			throw std::invalid_argument("BootSnapshot: plaintext with " + std::to_string(raw.sub_0.size()) + " limbs but " +
+										std::to_string(raw.moduli.size()) + " moduli");
+		total_rows += raw.sub_0.size();
+		entries.push_back(std::move(e));
+	}
+	buffer = HostRows(total_rows, n);
+	std::vector<std::pair<const uint64_t*, uint64_t*>> copies;
+	for (size_t i = 0; i < raws.size(); ++i) {
+		for (size_t r = 0; r < raws[i].sub_0.size(); ++r) {
+			if (raws[i].sub_0[r].size() != n)
+				throw std::invalid_argument("BootSnapshot: limb of " + std::to_string(raws[i].sub_0[r].size()) + " words, expected " +
+											std::to_string(n));
+			copies.emplace_back(raws[i].sub_0[r].data(), buffer.row(entries[i].first_row + r));
+		}
+	}
+#pragma omp parallel for
+	for (size_t i = 0; i < copies.size(); ++i)
+		std::memcpy(copies[i].second, copies[i].first, n * sizeof(uint64_t));
+}
+
+std::vector<const uint64_t*> BootSnapshot::rows(const size_t i) const {
+	const Entry& e = entries.at(i);
+	std::vector<const uint64_t*> out(e.moduli.size());
+	for (size_t r = 0; r < out.size(); ++r)
+		out[r] = buffer.row(e.first_row + r);
+	return out;
+}
+
+void ContextData::SetBootstrapCache(const size_t bytes) {
+	bootstrap_cache_bytes = bytes;
+	evictBootstrapCache(*this, bytes, 0, nullptr);
+}
+
+void ContextData::OffloadBootstrapPrecomputation() {
+	evictBootstrapCache(*this, 0, 0, nullptr);
+}
+
+size_t ContextData::BootstrapCacheResidentBytes() const {
+	size_t bytes = 0;
+	for (const auto& [slots, precomp] : precom.boot) {
+		precomp.forEachBlock([&](const BootCacheBlock& block, const std::vector<Plaintext>&) {
+			if (block.resident)
+				bytes += block.bytes;
+		});
+	}
+	return bytes;
+}
+
+void ContextData::AdmitBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts, std::vector<RawPlainText>&& raws) {
+	block.bytes = 0;
+	for (const auto& pt : pts)
+		block.bytes += pt.limbBytes();
+	block.resident = true;
+	if (!bootstrapPrecomputationLazy() || pts.empty())
+		return;
+	assert(raws.size() == pts.size());
+	block.snapshot = BootSnapshot(raws, static_cast<size_t>(N));
+	raws.clear();
+	// The group is not in precom.boot yet (the precomputation is still being built), so free it
+	// directly rather than through the eviction loop.
+	freeBootBlocks(*this, { { &block, &pts } });
+}
+
+std::vector<Plaintext>& ContextData::AcquireBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts) {
+	block.last_use = ++bootstrap_cache_clock;
+	if (block.resident)
+		return pts;
+	assert(block.hasSnapshot() && block.snapshot.size() == pts.size());
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	// Evict BEFORE loading, so VRAM peaks at the budget (+ this group if it does not fit alone).
+	evictBootstrapCache(*this, bootstrap_cache_bytes, block.bytes, &block);
+	for (size_t i = 0; i < pts.size(); ++i) {
+		// What Plaintext::load(RawPlainText) does, reading the limbs from the snapshot buffer.
+		const BootSnapshot::Entry& e = block.snapshot.entry(i);
+		CKKS::SetCurrentContext(pts[i].cc_);
+		pts[i].c0.loadConstant(block.snapshot.rows(i), block.snapshot.rowWords(), e.moduli);
+		pts[i].NoiseFactor = e.noise;
+		pts[i].NoiseLevel  = e.noise_level;
+		pts[i].slots	   = e.slots;
+	}
+	block.resident = true;
+	bootstrap_cache_loaded_bytes += block.bytes;
+	synchronizeContextDevices(*this);
+	return pts;
+}
+
 KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID) {
 
 	if (!precom.keys.at(keyID).rot_keys.contains(index)) {
@@ -861,21 +1015,16 @@ KeySwitchingKey& ContextData::GetEvalKey(const KeyHash& keyID) {
 
 void ContextData::AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp) {
 	{
+		// Sized from the bytes each group recorded when it was built: under a bootstrap-cache
+		// budget the groups are already offloaded here, so their limbs cannot be inspected.
+		size_t count = 0, bytes = 0;
+		precomp.forEachBlock([&](const BootCacheBlock& block, const std::vector<Plaintext>& pts) {
+			count += pts.size();
+			bytes += block.bytes;
+		});
 		std::cout << "Adding bootstrap precomputation to GPU for " << slots << " slots.\n"
-
-				  << "Plaintexts loaded: "
-				  << (precomp.CtS.size() == 0 ? (precomp.LT.A.size() + precomp.LT.invA.size()) :
-												(precomp.StC.size() * precomp.StC.at(0).A.size() + precomp.CtS.size() * precomp.CtS.at(0).A.size()))
-				  << " ~ "
-				  << (precomp.CtS.size() == 0 ?
-						 (precomp.LT.A.size() * (precomp.LT.A.at(0).c0.getLevel() + precomp.LT.A.at(0).c0.isModUp() * specialMeta[0].size()) +
-						   precomp.LT.invA.size() * (precomp.LT.invA.at(0).c0.getLevel() + precomp.LT.invA.at(0).c0.isModUp() * specialMeta[0].size())) :
-						 (precomp.StC.size() * precomp.StC.at(0).A.size() *
-							 (1 + precomp.StC.at(0).A.at(0).c0.getLevel() + precomp.StC.at(0).A.at(0).c0.isModUp() * specialMeta[0].size()) +
-						   precomp.CtS.size() * precomp.CtS.at(0).A.size() *
-							 (1 + precomp.CtS.at(0).A.at(0).c0.getLevel() + precomp.CtS.at(0).A.at(0).c0.isModUp() * specialMeta[0].size()))) *
-			N * 8 / (1 << 20)
-			<< "MB\n";
+				  << "Plaintexts loaded: " << count << " ~ " << bytes / (1 << 20) << "MB"
+				  << (bootstrapPrecomputationLazy() ? " (offloaded to host RAM until first use)" : "") << "\n";
 	}
 
 	precom.boot.emplace(slots, std::move(precomp));

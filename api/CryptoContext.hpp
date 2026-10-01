@@ -105,7 +105,8 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// one in use resident. Pinned plaintexts are never evicted.
 	///
 	/// Only plaintexts registered through LoadPlaintext() are cached -- not the plaintexts
-	/// inside the bootstrapping precomputation, which belong to the GPU context.
+	/// inside the bootstrapping precomputation, which belong to the GPU context (see
+	/// SetBootstrapCache()).
 	void SetPlaintextCache(size_t bytes);
 	/// @brief The current plaintext VRAM budget in bytes (SIZE_MAX = unlimited).
 	size_t GetPlaintextCache() const;
@@ -153,6 +154,38 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// @brief Pin (or unpin) a ciphertext so the cache never evicts it, loading and reloading
 	/// it first if needed. The pin is tied to the current device copy.
 	void PinCiphertext(Ciphertext<DCRTPoly>& ct, bool pin = true);
+
+	// ---- Bootstrap-precomputation VRAM cache ----
+
+	/// @brief Cap the VRAM spent on the bootstrap precomputation -- the CoeffsToSlots and
+	/// SlotsToCoeffs matrices, kept as plaintexts in the extended basis -- to `bytes`. The
+	/// matrices of one transform stage are loaded from host RAM right before the stage runs and
+	/// evicted again to make room for others. SIZE_MAX (the default) keeps all of them
+	/// permanently resident. The bootstrapping rotation keys are not part of this cache: they
+	/// are rotation keys like any other, bounded by SetRotationKeyCache().
+	///
+	/// Call it BEFORE LoadContext(), like SetRotationKeyCache(): only matrices built while a
+	/// finite budget is set keep the host-RAM snapshot they reload from (as much host RAM as
+	/// the VRAM they would otherwise hold), and they cost no VRAM until the first bootstrap.
+	/// Calling it after LoadContext() re-tunes the budget, evicting immediately, for matrices
+	/// that already have a snapshot; it cannot make the others evictable.
+	///
+	/// A bootstrap visits its stages in a fixed order, so the most recently used stage is
+	/// evicted first: a fixed subset stays resident and only the stages beyond the budget are
+	/// reloaded on every bootstrap. The budget is soft by one stage -- the stage being loaded is
+	/// never evicted -- so it should exceed the largest stage. The budget belongs to the GPU
+	/// context, which contexts built from identical parameters share.
+	void SetBootstrapCache(size_t bytes);
+	/// @brief The current bootstrap-precomputation VRAM budget in bytes (SIZE_MAX = unlimited).
+	size_t GetBootstrapCache() const;
+	/// @brief VRAM bytes currently held by resident bootstrap-precomputation matrices.
+	size_t GetBootstrapCacheResidentBytes() const;
+	/// @brief Total bytes the cache has reloaded from host RAM since LoadContext(). Its growth
+	/// over one bootstrap is the host->device traffic the budget costs per bootstrap.
+	size_t GetBootstrapCacheLoadedBytes() const;
+	/// @brief Evict every bootstrap matrix that has a host snapshot now. The next bootstrap
+	/// reloads what it needs. Requires the context to be loaded.
+	void OffloadBootstrapPrecomputation();
 
 	// ---- Load to devices ----
 
@@ -347,6 +380,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// @brief Rotation-key VRAM budget in bytes, applied to the GPU context in LoadContext();
 	/// SIZE_MAX means unlimited. See SetRotationKeyCache().
 	size_t rotation_key_cache_bytes = SIZE_MAX;
+	/// @brief Bootstrap-precomputation VRAM budget in bytes, applied to the GPU context in
+	/// LoadContext(); SIZE_MAX means unlimited. See SetBootstrapCache().
+	size_t bootstrap_cache_bytes = SIZE_MAX;
 
 	// ---- Copy helpers ----
 

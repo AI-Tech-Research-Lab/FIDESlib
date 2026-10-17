@@ -4,6 +4,8 @@
 #undef duration
 #include "ParametrizedTest.cuh"
 #include "fideslib.hpp"
+#include "CKKS/Ciphertext.cuh"
+#include "CKKS/Plaintext.cuh"
 
 using namespace fideslib;
 
@@ -143,5 +145,86 @@ TEST(ForkCacheIntegration, RepeatedCompressedPlaintextMultiplication) {
         for (int i = 0; i < 3; ++i)
             actual = cc->EvalMult(actual, one);
         ASSERT_EQ_CIPHERTEXT(expected, actual);
+    }
+}
+
+TEST(ForkCacheIntegration, CpuAddManyInPlaceDetachesClones) {
+    CCParams<CryptoContextCKKSRNS> params;
+    params.SetSecurityLevel(HEStd_NotSet);
+    params.SetRingDim(128);
+    params.SetBatchSize(8);
+    params.SetMultiplicativeDepth(4);
+    params.SetScalingModSize(50);
+    auto cc = GenCryptoContext(params);
+    cc->Enable(PKE);
+    cc->Enable(LEVELEDSHE);
+    cc->Enable(ADVANCEDSHE);
+    auto keys = cc->KeyGen();
+    std::vector<double> values{ 0.25, -0.5, 0.75, 1.0 };
+    auto pt = cc->MakeCKKSPackedPlaintext(values);
+    auto input = cc->Encrypt(keys.publicKey, pt);
+    std::vector<Ciphertext<DCRTPoly>> clones{ input->Clone(), input->Clone(), input->Clone() };
+    auto alias = clones.front();
+    cc->EvalAddManyInPlace(clones);
+    for (auto result : { input, alias }) {
+        Plaintext decoded;
+        cc->Decrypt(keys.secretKey, result, &decoded);
+        decoded->SetLength(values.size());
+        const auto actual = decoded->GetRealPackedValue();
+        for (size_t i = 0; i < values.size(); ++i)
+            EXPECT_NEAR(actual[i], values[i] * (result == input ? 1 : 3), 1e-5);
+    }
+}
+
+TEST(ForkCacheIntegration, DotProductWithCompressedPlaintextsAndAliasedOutput) {
+    for (uint32_t slots : { 8u, 64u }) {
+        SCOPED_TRACE(slots);
+        CCParams<CryptoContextCKKSRNS> params;
+        params.SetSecurityLevel(HEStd_NotSet);
+        params.SetRingDim(128);
+        params.SetBatchSize(slots);
+        params.SetMultiplicativeDepth(4);
+        params.SetScalingModSize(50);
+        params.SetScalingTechnique(FLEXIBLEAUTO);
+        auto cc = GenCryptoContext(params);
+        for (auto feature : { PKE, KEYSWITCH, LEVELEDSHE })
+            cc->Enable(feature);
+        auto keys = cc->KeyGen();
+        std::vector<Plaintext> weights;
+        std::vector<std::vector<double>> masks;
+        std::vector<Ciphertext<DCRTPoly>> inputs;
+        for (int k = 0; k < 3; ++k) {
+            std::vector<double> values(slots), mask(slots);
+            for (uint32_t i = 0; i < slots; ++i) {
+                values[i] = (static_cast<double>(i) - slots / 2) / slots + 0.1 * k;
+                mask[i] = (i + 1.0) / slots * (k + 1);
+            }
+            auto pt = cc->MakeCKKSPackedPlaintext(values, 1, 0, nullptr, slots);
+            inputs.push_back(cc->Encrypt(keys.publicKey, pt));
+            masks.push_back(mask);
+            weights.push_back(cc->MakeCKKSPackedPlaintext(mask, 1, 0, nullptr, slots));
+        }
+        auto expected = cc->EvalMult(inputs[0], weights[0]);
+        for (int k = 1; k < 3; ++k)
+            cc->EvalAddInPlace(expected, cc->EvalMult(inputs[k], weights[k]));
+        // Keep the plaintext operands independent between the CPU and GPU phases.
+        for (int k = 0; k < 3; ++k)
+            weights[k] = cc->MakeCKKSPackedPlaintext(masks[k], 1, 0, nullptr, slots);
+        cc->SetDevices(devices);
+        cc->LoadContext(keys.publicKey);
+        std::vector<FIDESlib::CKKS::Ciphertext*> cts;
+        std::vector<FIDESlib::CKKS::Plaintext*> pts;
+        for (int k = 0; k < 3; ++k) {
+            cc->LoadCiphertext(inputs[k]);
+            cc->LoadPlaintext(weights[k]);
+            cts.push_back(std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(cc->GetDeviceCiphertext(inputs[k]->gpu)).get());
+            pts.push_back(std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(cc->GetDevicePlaintext(weights[k]->gpu)).get());
+        }
+        for (int k = 0; k < 3; ++k) {
+            ASSERT_EQ(cts[k]->NoiseLevel, 1);
+            ASSERT_EQ(pts[k]->NoiseLevel, 1);
+        }
+        cts[0]->dotProductPt(cts.data(), pts.data(), 3, false);
+        ASSERT_EQ_CIPHERTEXT(expected, inputs[0]);
     }
 }

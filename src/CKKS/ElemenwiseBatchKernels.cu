@@ -787,6 +787,7 @@ __global__ void hoistedRotateDotKSKBatched___(void*** c1, void*** din1, void*** 
 __global__ void dotProductPt_(void** c0, void** c1, void*** data, const size_t ptroffset, const int primeidInit, const int n, const __grid_constant__ int elem_data) {
     const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     const int logstride = __ffs(blockDim.x * gridDim.x / elem_data) - 1;
+    // Plaintexts are stride-compressed; ciphertext limbs retain all N coefficients.
     const int dataidx = idx >> logstride;
     const int primeid = C_.primeid_flattened[primeidInit + blockIdx.y];
     constexpr ALGO algo = ALGO_BARRETT;
@@ -795,15 +796,15 @@ __global__ void dotProductPt_(void** c0, void** c1, void*** data, const size_t p
     uint64_t in = ((uint64_t*)data[n * 2][ptroffset + blockIdx.y])[dataidx];
     if (PRINT && idx == 0 && blockIdx.y == 0)
         printf("LT:, b: %d, g:, in pt: %lu \n", 0, in);
-    out0 = modmult<algo>(in, ((uint64_t*)data[0][ptroffset + blockIdx.y])[dataidx], primeid);
+    out0 = modmult<algo>(in, ((uint64_t*)data[0][ptroffset + blockIdx.y])[idx], primeid);
 
     if (PRINT && idx == 0 && blockIdx.y == 0)
-        printf("LT: %d, b: %d, in c0: %lu \n", -1, 0, ((uint64_t*)data[0][ptroffset + blockIdx.y])[dataidx]);
+        printf("LT: %d, b: %d, in c0: %lu \n", -1, 0, ((uint64_t*)data[0][ptroffset + blockIdx.y])[idx]);
 
-    out1 = modmult<algo>(in, ((uint64_t*)data[n][ptroffset + blockIdx.y])[dataidx], primeid);
+    out1 = modmult<algo>(in, ((uint64_t*)data[n][ptroffset + blockIdx.y])[idx], primeid);
 
     if (PRINT && idx == 0 && blockIdx.y == 0)
-        printf("LT: %d, b: %d, in c1: %lu \n", -1, 0, ((uint64_t*)data[n][ptroffset + blockIdx.y])[dataidx]);
+        printf("LT: %d, b: %d, in c1: %lu \n", -1, 0, ((uint64_t*)data[n][ptroffset + blockIdx.y])[idx]);
 
     for (int i = 1; i < n; ++i) {
         in = ((uint64_t*)data[n * 2 + i][ptroffset + blockIdx.y])[dataidx];
@@ -811,15 +812,15 @@ __global__ void dotProductPt_(void** c0, void** c1, void*** data, const size_t p
         if (PRINT && idx == 0 && blockIdx.y == 0)
             printf("LT:, b: %d, g:, in pt: %lu \n", i, in);
 
-        uint64_t aux0 = modmult<algo>(in, ((uint64_t*)data[i][ptroffset + blockIdx.y])[dataidx], primeid);
+        uint64_t aux0 = modmult<algo>(in, ((uint64_t*)data[i][ptroffset + blockIdx.y])[idx], primeid);
 
         if (PRINT && idx == 0 && blockIdx.y == 0)
-            printf("LT: %d, b: %d, in c0: %lu \n", -1, i, ((uint64_t*)data[i][ptroffset + blockIdx.y])[dataidx]);
+            printf("LT: %d, b: %d, in c0: %lu \n", -1, i, ((uint64_t*)data[i][ptroffset + blockIdx.y])[idx]);
 
-        uint64_t aux1 = modmult<algo>(in, ((uint64_t*)data[n + i][ptroffset + blockIdx.y])[dataidx], primeid);
+        uint64_t aux1 = modmult<algo>(in, ((uint64_t*)data[n + i][ptroffset + blockIdx.y])[idx], primeid);
 
         if (PRINT && idx == 0 && blockIdx.y == 0)
-            printf("LT: %d, b: %d, in c1: %lu \n", -1, i, ((uint64_t*)data[n + i][ptroffset + blockIdx.y])[dataidx]);
+            printf("LT: %d, b: %d, in c1: %lu \n", -1, i, ((uint64_t*)data[n + i][ptroffset + blockIdx.y])[idx]);
         out0 = modadd(out0, aux0, primeid);
         out1 = modadd(out1, aux1, primeid);
     }

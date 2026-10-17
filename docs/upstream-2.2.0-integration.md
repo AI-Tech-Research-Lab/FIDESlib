@@ -111,3 +111,21 @@ riesecuzione mirata da 132 casi. Il riepilogo consolidato usa l’ultima
 esecuzione disponibile di ciascun caso e comprende anche i 9 nuovi test.
 Non rappresenta una singola esecuzione monolitica dopo tutte le correzioni.
 I 40 test `LLMTests` di timing non sono inclusi nella verifica funzionale.
+
+## Verifica aggiuntiva durante l'aggiornamento di PyFIDESlib
+
+Le regressioni Python hanno esposto altri due casi nel backend, corretti con test nativi:
+
+- `dotProductPt_`: solo il plaintext usa l'indice compresso; i ciphertext conservano tutti
+  gli `N` coefficienti. Usare l'indice compresso anche per i ciphertext produceva risultati
+  errati con packing sparso e introduceva accessi concorrenti quando l'output era un input.
+- `EvalAddManyInPlace` CPU: i cloni devono materializzare la propria copia prima della
+  riduzione OpenFHE, altrimenti gli operandi condividono il payload e vengono sommati più volte.
+
+I due nuovi test passano su una e due GPU (packing sparso e pieno, output alias di un input;
+controllo bit-exact CPU/GPU per il prodotto). La suite nativa aggiuntiva ha verificato anche
+75/75 test `OpenFHECompatTests` e i nove precedenti test d'integrazione delle cache.
+I log/XML sono in `build/upstream-2.2.0/python-integration-*.{log,xml}`;
+`python-integration-fixes-single.xml` contiene il primo giro con 84 pass e i due nuovi test
+ancora da correggere nel setup, mentre `python-integration-final-{single,multi}.xml`
+contiene il risultato definitivo 2/2 di entrambe le regressioni.

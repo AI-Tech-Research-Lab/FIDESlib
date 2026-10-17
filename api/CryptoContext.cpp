@@ -1507,6 +1507,9 @@ void CryptoContextImpl<DCRTPoly>::EvalAddManyInPlace(std::vector<Ciphertext<DCRT
         ctImpls.reserve(ciphertexts.size());
         for (const auto& ct : ciphertexts) {
             // Null entries pass through as null impls; the CPU EvalAddManyInPlace skips them.
+            // Reduction mutates operands; detach lazy CPU clones before passing them to OpenFHE.
+            if (ct)
+                ct->EnsureLazyCPUCopy();
             ctImpls.push_back(ct ? std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu) : lbcrypto::Ciphertext<lbcrypto::DCRTPoly>());
         }
         context->EvalAddManyInPlace(ctImpls);

@@ -28,85 +28,85 @@ using namespace fideslib;
 namespace {
 
 bool run_trial(int sink_levels, std::vector<double>& head, double& max_abs_err) {
-	CCParams<CryptoContextCKKSRNS> params;
-	params.SetSecurityLevel(HEStd_NotSet);
-	params.SetRingDim(1 << 16);
-	params.SetMultiplicativeDepth(30);
-	params.SetScalingModSize(59);
-	params.SetFirstModSize(60);
-	params.SetNumLargeDigits(3);
-	params.SetBatchSize(1024);
-	params.SetScalingTechnique(FLEXIBLEAUTO);
-	params.SetKeySwitchTechnique(HYBRID);
-	params.SetSecretKeyDist(UNIFORM_TERNARY);
-	params.SetDevices({ 0 });
+    CCParams<CryptoContextCKKSRNS> params;
+    params.SetSecurityLevel(HEStd_NotSet);
+    params.SetRingDim(1 << 16);
+    params.SetMultiplicativeDepth(30);
+    params.SetScalingModSize(59);
+    params.SetFirstModSize(60);
+    params.SetNumLargeDigits(3);
+    params.SetBatchSize(1024);
+    params.SetScalingTechnique(FLEXIBLEAUTO);
+    params.SetKeySwitchTechnique(HYBRID);
+    params.SetSecretKeyDist(UNIFORM_TERNARY);
+    params.SetDevices({ 0 });
 
-	CryptoContext<DCRTPoly> cc = GenCryptoContext(params);
-	cc->Enable(PKE);
-	cc->Enable(KEYSWITCH);
-	cc->Enable(LEVELEDSHE);
-	cc->Enable(ADVANCEDSHE);
-	cc->Enable(FHE);
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(params);
+    cc->Enable(PKE);
+    cc->Enable(KEYSWITCH);
+    cc->Enable(LEVELEDSHE);
+    cc->Enable(ADVANCEDSHE);
+    cc->Enable(FHE);
 
-	auto keys = cc->KeyGen();
-	cc->EvalMultKeyGen(keys.secretKey);
-	cc->EvalRotateKeyGen(keys.secretKey, { 1 });
-	cc->LoadContext(keys.publicKey);
+    auto keys = cc->KeyGen();
+    cc->EvalMultKeyGen(keys.secretKey);
+    cc->EvalRotateKeyGen(keys.secretKey, { 1 });
+    cc->LoadContext(keys.publicKey);
 
-	std::vector<double> x(1024);
-	for (int i = 0; i < 1024; ++i)
-		x[i] = (i < 8) ? (i + 1) : 0.0;
-	Plaintext pt					= cc->MakeCKKSPackedPlaintext(x);
-	Ciphertext<DCRTPoly> ct			= cc->Encrypt(keys.publicKey, pt);
-	Plaintext one_pt				= cc->MakeCKKSPackedPlaintext(std::vector<double>(1024, 1.0));
+    std::vector<double> x(1024);
+    for (int i = 0; i < 1024; ++i)
+        x[i] = (i < 8) ? (i + 1) : 0.0;
+    Plaintext pt = cc->MakeCKKSPackedPlaintext(x);
+    Ciphertext<DCRTPoly> ct = cc->Encrypt(keys.publicKey, pt);
+    Plaintext one_pt = cc->MakeCKKSPackedPlaintext(std::vector<double>(1024, 1.0));
 
-	for (int i = 0; i < sink_levels; ++i)
-		ct = cc->EvalMult(ct, one_pt);
+    for (int i = 0; i < sink_levels; ++i)
+        ct = cc->EvalMult(ct, one_pt);
 
-	Ciphertext<DCRTPoly> r1  = cc->EvalRotate(ct, 1);
-	Ciphertext<DCRTPoly> mid = cc->EvalMult(r1, one_pt);
-	Ciphertext<DCRTPoly> r2  = cc->EvalRotate(mid, 1);
+    Ciphertext<DCRTPoly> r1 = cc->EvalRotate(ct, 1);
+    Ciphertext<DCRTPoly> mid = cc->EvalMult(r1, one_pt);
+    Ciphertext<DCRTPoly> r2 = cc->EvalRotate(mid, 1);
 
-	Plaintext result;
-	cc->Decrypt(keys.secretKey, r2, &result);
-	result->SetLength(1024);
+    Plaintext result;
+    cc->Decrypt(keys.secretKey, r2, &result);
+    result->SetLength(1024);
 
-	bool has_nan = false;
-	head.clear();
-	max_abs_err = 0.0;
-	for (int i = 0; i < 1024; ++i) {
-		double v = result->GetRealPackedValue().at(i);
-		if (i < 8)
-			head.push_back(v);
-		if (std::isnan(v))
-			has_nan = true;
-		else {
-			// rotate-left-by-2 of x: slot i should hold x[(i + 2) % 1024]
-			int src	   = (i + 2) % 1024;
-			double exp = (src < 8) ? (src + 1) : 0.0;
-			max_abs_err = std::max(max_abs_err, std::abs(v - exp));
-		}
-	}
-	return has_nan;
+    bool has_nan = false;
+    head.clear();
+    max_abs_err = 0.0;
+    for (int i = 0; i < 1024; ++i) {
+        double v = result->GetRealPackedValue().at(i);
+        if (i < 8)
+            head.push_back(v);
+        if (std::isnan(v))
+            has_nan = true;
+        else {
+            // rotate-left-by-2 of x: slot i should hold x[(i + 2) % 1024]
+            int src = (i + 2) % 1024;
+            double exp = (src < 8) ? (src + 1) : 0.0;
+            max_abs_err = std::max(max_abs_err, std::abs(v - exp));
+        }
+    }
+    return has_nan;
 }
 
 } // namespace
 
 TEST(SecondRotateApiRepro, SinkZeroClean) {
-	std::vector<double> head;
-	double err;
-	bool nan = run_trial(0, head, err);
-	std::cout << "sink_levels=0 nan=" << nan << " max_abs_err=" << err << std::endl;
-	EXPECT_FALSE(nan);
+    std::vector<double> head;
+    double err;
+    bool nan = run_trial(0, head, err);
+    std::cout << "sink_levels=0 nan=" << nan << " max_abs_err=" << err << std::endl;
+    EXPECT_FALSE(nan);
 }
 
 TEST(SecondRotateApiRepro, SinkThreeReproducesNaN) {
-	std::vector<double> head;
-	double err;
-	bool nan = run_trial(3, head, err);
-	std::cout << "sink_levels=3 nan=" << nan << " max_abs_err=" << err << " head=[";
-	for (double v : head)
-		std::cout << v << " ";
-	std::cout << "]" << std::endl;
-	EXPECT_FALSE(nan) << "second rotate (via api:: layer) returned NaN at sink_levels=3";
+    std::vector<double> head;
+    double err;
+    bool nan = run_trial(3, head, err);
+    std::cout << "sink_levels=3 nan=" << nan << " max_abs_err=" << err << " head=[";
+    for (double v : head)
+        std::cout << v << " ";
+    std::cout << "]" << std::endl;
+    EXPECT_FALSE(nan) << "second rotate (via api:: layer) returned NaN at sink_levels=3";
 }

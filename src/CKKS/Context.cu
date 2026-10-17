@@ -4,12 +4,14 @@
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/OpenFheCompat.cuh"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include <utility>
 #include <source_location>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 #include "../parallel_for.hpp"
 #include "CKKS/KeySwitchingKey.cuh"
@@ -24,13 +26,13 @@ using sc = std::source_location;
 #endif
 
 namespace FIDESlib {
-extern thread_local bool gpufree_presynced;   // defined in CudaUtils.cu next to GPUfree
+extern thread_local bool gpufree_presynced; // defined in CudaUtils.cu next to GPUfree
 }
 
 namespace FIDESlib::CKKS {
 
 std::atomic_uint64_t next_uid = 0;
-constexpr bool SPLIT_SPECIAL  = true;
+constexpr bool SPLIT_SPECIAL = true;
 
 std::map<Parameters, std::shared_ptr<ContextData>> map_param_context;
 Context currentContext;
@@ -53,352 +55,410 @@ ContextData::ContextData(const Parameters& param_, const std::vector<int>& devs,
   limbGPUid(generateLimbGPUid(meta, L, splitSpecialMeta, K)), digitGPUid(generateDigitGPUid(meta, L, dnum)), GPUrank(GPUid.size())
 // top_limb(devs.size())
 {
+    // Startup probe: refuse to run when the linked OpenFHE was built with FMA (the GPU
+    // pipeline would silently stop reproducing the CPU reference bit-for-bit).
+    CheckOpenFheFpCompat();
+
 #ifndef NCCL
-	if (GPUid.size() > 1) {
-		std::cerr << "MGPU requested but no NCCL linked, aborting" << std::endl;
-		exit(-1);
-	}
+    if (GPUid.size() > 1) {
+        std::cerr << "MGPU requested but no NCCL linked, aborting" << std::endl;
+        exit(-1);
+    }
 #endif
 
-	if (map_param_context.contains(param)) {
-		OK = false;
-		return;
-	}
-	// Both hand-rolled peer transports for the multi-GPU special-limb exchange race under GPU
-	// contention and return NaN: measured over AccumulateSum on loaded H100s, 12 failures in 30
-	// for cudaMemcpyPeerAsync and 2 in 4 for peer access, against 0 in 10 for the NCCL path that
-	// is now the default. It reaches everything that accumulates, and bootstrap whenever the
-	// slots are sparse (Bootstrap.cu calls Accumulate directly), and it reaches it silently --
-	// wrong values, no error. Selecting one of them is therefore refused rather than obeyed;
-	// nobody should end up on that path by inheriting an exported variable.
-	//
-	// Only multi-GPU is affected. With one device the exchange never runs and both flags are
-	// inert, so this does not fire on a single-GPU process that happens to have one set.
-	//
-	// FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT=1 lifts the refusal, for measuring what the peer path
-	// is worth on exclusive GPUs (~20% on AccumulateSum) and for working on the race itself.
-	if (GPUid.size() > 1 && (MEMCPY_PEER || PEER_ACCESS)) {
-		const char* ack		= std::getenv("FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT");
-		const char* selected = MEMCPY_PEER ? "FIDESLIB_USE_MEMCPY_PEER" : "FIDESLIB_USE_PEER_ACCESS";
-		if (!(ack && std::atoi(ack))) {
-			throw std::runtime_error(std::string(selected) +
-									 "=1 selects a multi-GPU transport for the special-limb exchange that races under "
-									 "GPU contention and silently returns NaN from AccumulateSum and from bootstrap "
-									 "with sparse slots. Unset it to use the NCCL path (the default), or set "
-									 "FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT=1 to proceed anyway. See "
-									 "docs/multigpu-plan.md.");
-		}
-		std::cerr << "FIDESlib: FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT is set, so " << selected
-				  << "=1 is being honoured. The multi-GPU special-limb exchange races under contention: results "
-					 "from AccumulateSum, and from bootstrap with sparse slots, are not trustworthy."
-				  << std::endl;
-	}
+    if (map_param_context.contains(param)) {
+        OK = false;
+        return;
+    }
+    // Both hand-rolled peer transports for the multi-GPU special-limb exchange race under GPU
+    // contention and return NaN: measured over AccumulateSum on loaded H100s, 12 failures in 30
+    // for cudaMemcpyPeerAsync and 2 in 4 for peer access, against 0 in 10 for the NCCL path that
+    // is now the default. It reaches everything that accumulates, and bootstrap whenever the
+    // slots are sparse (Bootstrap.cu calls Accumulate directly), and it reaches it silently --
+    // wrong values, no error. Selecting one of them is therefore refused rather than obeyed;
+    // nobody should end up on that path by inheriting an exported variable.
+    //
+    // Only multi-GPU is affected. With one device the exchange never runs and both flags are
+    // inert, so this does not fire on a single-GPU process that happens to have one set.
+    //
+    // FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT=1 lifts the refusal, for measuring what the peer path
+    // is worth on exclusive GPUs (~20% on AccumulateSum) and for working on the race itself.
+    if (GPUid.size() > 1 && (MEMCPY_PEER || PEER_ACCESS)) {
+        const char* ack = std::getenv("FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT");
+        const char* selected = MEMCPY_PEER ? "FIDESLIB_USE_MEMCPY_PEER" : "FIDESLIB_USE_PEER_ACCESS";
+        if (!(ack && std::atoi(ack))) {
+            throw std::runtime_error(std::string(selected) +
+                "=1 selects a multi-GPU transport for the special-limb exchange that races under "
+                "GPU contention and silently returns NaN from AccumulateSum and from bootstrap "
+                "with sparse slots. Unset it to use the NCCL path (the default), or set "
+                "FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT=1 to proceed anyway. See "
+                "docs/multigpu-plan.md.");
+        }
+        std::cerr << "FIDESlib: FIDESLIB_ALLOW_UNSAFE_PEER_TRANSPORT is set, so " << selected
+                  << "=1 is being honoured. The multi-GPU special-limb exchange races under contention: results "
+                     "from AccumulateSum, and from bootstrap with sparse slots, are not trustworthy."
+                  << std::endl;
+    }
 
-	// generateSplitSpecialMeta shares the K special primes out over the devices, so asking for
-	// more devices than there are special primes leaves some with none. That is supported -- the
-	// special-limb work simply skips those devices -- but it is almost never what the caller
-	// intended: those devices carry the regular limbs and the replicated key digits while
-	// contributing nothing to the key switch, and K is set indirectly, by dnum and the depth
-	// (K = ceil((L + 1) / dnum)). Say so once, at context creation, rather than let it show up as
-	// a puzzling load imbalance. Raising dnum lowers K; lowering it raises K.
-	{
-		std::vector<int> idle;
-		for (uint32_t i = 0; i < GPUid.size(); ++i)
-			if (splitSpecialMeta.at(i).empty())
-				idle.push_back(GPUid[i]);
-		if (!idle.empty()) {
-			std::cerr << "FIDESlib: " << GPUid.size() << " devices requested but only " << K
-					  << " special prime(s) available (L+1 = " << (L + 1) << ", dnum = " << dnum
-					  << "), so device(s)";
-			for (int d : idle)
-				std::cerr << ' ' << d;
-			std::cerr << " own none and take no part in key switching. Use at most " << K
-					  << " devices, or lower dnum to raise K." << std::endl;
-		}
-	}
+    // generateSplitSpecialMeta shares the K special primes out over the devices, so asking for
+    // more devices than there are special primes leaves some with none. That is supported -- the
+    // special-limb work simply skips those devices -- but it is almost never what the caller
+    // intended: those devices carry the regular limbs and the replicated key digits while
+    // contributing nothing to the key switch, and K is set indirectly, by dnum and the depth
+    // (K = ceil((L + 1) / dnum)). Say so once, at context creation, rather than let it show up as
+    // a puzzling load imbalance. Raising dnum lowers K; lowering it raises K.
+    {
+        std::vector<int> idle;
+        for (uint32_t i = 0; i < GPUid.size(); ++i)
+            if (splitSpecialMeta.at(i).empty())
+                idle.push_back(GPUid[i]);
+        if (!idle.empty()) {
+            std::cerr << "FIDESlib: " << GPUid.size() << " devices requested but only " << K << " special prime(s) available (L+1 = " << (L + 1)
+                      << ", dnum = " << dnum << "), so device(s)";
+            for (int d : idle)
+                std::cerr << ' ' << d;
+            std::cerr << " own none and take no part in key switching. Use at most " << K << " devices, or lower dnum to raise K." << std::endl;
+        }
+    }
 
+    // auto& constants = precom.constants;
+    // auto& globals = precom.globals;
+    auto [constants, globals] = SetupConstants<Parameters>(prime, meta, specialPrime, specialMeta.at(0), decompMeta, digitMeta, GPUdigits, GPUid, N, param);
 
-	// auto& constants = precom.constants;
-	// auto& globals = precom.globals;
-	auto [constants, globals] = SetupConstants<Parameters>(prime, meta, specialPrime, specialMeta.at(0), decompMeta, digitMeta, GPUdigits, GPUid, N, param);
+    precom.constants = constants;
+    precom.globals = std::move(globals);
 
-	precom.constants = constants;
-	precom.globals   = std::move(globals);
+    PrepareNCCLCommunication();
 
-	PrepareNCCLCommunication();
+    // CheckBitSecurity();
+    int bits = 0;
+    for (auto& j : { prime, specialPrime })
+        for (auto& i : j)
+            bits += i.bits;
 
-	// CheckBitSecurity();
-	int bits = 0;
-	for (auto& j : { prime, specialPrime })
-		for (auto& i : j)
-			bits += i.bits;
+    for (int dev : GPUid) {
+        cudaSetDevice(dev);
+        cudaMemPool_t mp;
+        cudaDeviceGetDefaultMemPool(&mp, dev);
+        uint64_t threshold = UINT64_MAX; // 5l * 1024l * 1024l * 1024l;  // One Gigabyte of memory
+        cudaMemPoolSetAttribute(mp, cudaMemPoolAttrReleaseThreshold, &threshold);
+        CudaCheckErrorModNoSync;
+    }
 
-	for (int dev : GPUid) {
-		cudaSetDevice(dev);
-		cudaMemPool_t mp;
-		cudaDeviceGetDefaultMemPool(&mp, dev);
-		uint64_t threshold = UINT64_MAX; // 5l * 1024l * 1024l * 1024l;  // One Gigabyte of memory
-		cudaMemPoolSetAttribute(mp, cudaMemPoolAttrReleaseThreshold, &threshold);
-		CudaCheckErrorModNoSync;
-	}
+    OK = true;
+    // The Context lifetime already opened above (my_range); fold the context-held GPU memory
+    // into that same timeline while keeping the two components separately labelled.
+    CudaNvtxLifetimeRegisterBytes(loc, this, [this] { return this->getPrecomputationsBytes(); }, "Precomputed");
+    CudaNvtxLifetimeRegisterBytes(loc, this, [this] { return this->getAuxBuffersBytes(); }, "Buffers");
+    CudaNvtxStop();
+}
 
-	OK = true;
-	CudaNvtxStop();
+uint64_t ContextData::getPrecomputationsBytes() const {
+    if (!precom.globals)
+        return 0;
+
+    // Per-prime per-device psi tables allocated in SetupConstants: psi, inv_psi, psi_middle_scale,
+    // inv_psi_middle_scale, psi_shoup, inv_psi_shoup hold N elements each (6 writes), while
+    // psi_no/inv_psi_no hold 2N each, i.e. 10x the per-element table size per prime.
+    const auto elemBytes = [](const PrimeRecord& p) {
+        const bool isU64 = p.type ? *p.type == U64 : p.bits > 30;
+        return isU64 ? (uint64_t)8 : (uint64_t)4;
+    };
+    const auto arrayBytes = [&](const std::vector<PrimeRecord>& primes) {
+        uint64_t bytes = 0;
+        for (const auto& p : primes)
+            bytes += 10ull * (uint64_t)N * elemBytes(p);
+        return bytes;
+    };
+
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < GPUid.size(); ++i) {
+        bytes += arrayBytes(prime);
+        bytes += arrayBytes(specialPrime);
+        bytes += sizeof(Global::Globals); // per-device moddown/modup matrix tables
+        bytes += sizeof(Constants);       // per-device __constant__ copy
+    }
+    return bytes;
+}
+
+uint64_t ContextData::getAuxBuffersBytes() const {
+    uint64_t bytes = 0;
+    if (key_switch_aux)
+        bytes += key_switch_aux->getBytes();
+    if (key_switch_aux2)
+        bytes += key_switch_aux2->getBytes();
+    for (const auto& aux : moddown_aux)
+        if (aux)
+            bytes += aux->getBytes();
+    for (const auto& [power, mon] : precom.monomialCache)
+        bytes += mon.getBytes();
+    for (size_t i = 0; i < top_limb_buffer.size(); ++i)
+        bytes += (uint64_t)N * sizeof(uint64_t);
+    for (size_t i = 0; i < top_limb_buffer2.size(); ++i)
+        bytes += (uint64_t)N * sizeof(uint64_t);
+    return bytes;
 }
 
 std::vector<dim3>
 ContextData::generateLimbGPUid(const std::vector<std::vector<LimbRecord>>& meta, const int L, const std::vector<std::vector<LimbRecord>>& SPECIALmeta, const int K) {
-	std::vector<dim3> res(L + 1 + K, 0);
-	for (int i = 0; i < static_cast<int>(meta.size()); ++i) {
-		for (size_t j = 0; j < meta.at(i).size(); ++j) {
-			res.at(meta[i][j].id) = { static_cast<uint32_t>(i), static_cast<uint32_t>(j), 0 };
-		}
-	}
+    std::vector<dim3> res(L + 1 + K, 0);
+    for (int i = 0; i < static_cast<int>(meta.size()); ++i) {
+        for (size_t j = 0; j < meta.at(i).size(); ++j) {
+            res.at(meta[i][j].id) = { static_cast<uint32_t>(i), static_cast<uint32_t>(j), 0 };
+        }
+    }
 
-	for (int i = 0; i < static_cast<int>(SPECIALmeta.size()); ++i) {
-		for (size_t j = 0; j < SPECIALmeta.at(i).size(); ++j) {
-			res.at(SPECIALmeta[i][j].id) = { static_cast<uint32_t>(i), static_cast<uint32_t>(j), 0 };
-		}
-	}
-	return res;
+    for (int i = 0; i < static_cast<int>(SPECIALmeta.size()); ++i) {
+        for (size_t j = 0; j < SPECIALmeta.at(i).size(); ++j) {
+            res.at(SPECIALmeta[i][j].id) = { static_cast<uint32_t>(i), static_cast<uint32_t>(j), 0 };
+        }
+    }
+    return res;
 }
 
 std::vector<std::vector<std::vector<LimbRecord>>> ContextData::generateDigitMeta(const std::vector<std::vector<LimbRecord>>& meta,
-  const std::vector<std::vector<LimbRecord>>& splitSpecialMeta,
-  const std::vector<LimbRecord>& specialMeta,
-  const std::vector<std::vector<int>>& digitGPUid,
-  const std::vector<int>& GPUid) {
-	std::vector<std::vector<std::vector<LimbRecord>>> digitMeta(meta.size());
+    const std::vector<std::vector<LimbRecord>>& splitSpecialMeta,
+    const std::vector<LimbRecord>& specialMeta,
+    const std::vector<std::vector<int>>& digitGPUid,
+    const std::vector<int>& GPUid) {
+    std::vector<std::vector<std::vector<LimbRecord>>> digitMeta(meta.size());
 
-	for (size_t i = 0; i < digitGPUid.size(); ++i) {
-		cudaSetDevice(GPUid[i]);
-		for (int d : digitGPUid.at(i)) {
-			digitMeta[i].emplace_back();
+    for (size_t i = 0; i < digitGPUid.size(); ++i) {
+        cudaSetDevice(GPUid[i]);
+        for (int d : digitGPUid.at(i)) {
+            digitMeta[i].emplace_back();
 
-			if constexpr (SPLIT_SPECIAL) {
-				for (auto& l : splitSpecialMeta.at(i)) {
-					digitMeta[i].back().emplace_back(LimbRecord{ .id = l.id, .type = l.type, .digit = l.digit });
-					digitMeta[i].back().back().stream.init();
-				}
-			} else {
-				for (auto& l : specialMeta) {
-					digitMeta[i].back().emplace_back(LimbRecord{ .id = l.id, .type = l.type, .digit = l.digit });
-					digitMeta[i].back().back().stream.init();
-				}
-			}
+            if constexpr (SPLIT_SPECIAL) {
+                for (auto& l : splitSpecialMeta.at(i)) {
+                    digitMeta[i].back().emplace_back(LimbRecord{ .id = l.id, .type = l.type, .digit = l.digit });
+                    digitMeta[i].back().back().stream.init();
+                }
+            } else {
+                for (auto& l : specialMeta) {
+                    digitMeta[i].back().emplace_back(LimbRecord{ .id = l.id, .type = l.type, .digit = l.digit });
+                    digitMeta[i].back().back().stream.init();
+                }
+            }
 
-			for (auto& l : meta.at(i)) {
-				if (l.digit != d) {
-					digitMeta[i].back().emplace_back(LimbRecord{ .id = l.id, .type = l.type, .digit = l.digit });
-					digitMeta[i].back().back().stream.init();
-				}
-			}
+            for (auto& l : meta.at(i)) {
+                if (l.digit != d) {
+                    digitMeta[i].back().emplace_back(LimbRecord{ .id = l.id, .type = l.type, .digit = l.digit });
+                    digitMeta[i].back().back().stream.init();
+                }
+            }
 
-			/*
-			std::sort(
-				digitMeta[i].back().begin() + specialMeta.size(), digitMeta[i].back().end(),
-				[](LimbRecord& a, LimbRecord& b) { return a.digit < b.digit || (a.digit == b.digit && a.id < b.id); });
-			*/
-		}
-	}
-	return digitMeta;
+            /*
+            std::sort(
+                digitMeta[i].back().begin() + specialMeta.size(), digitMeta[i].back().end(),
+                [](LimbRecord& a, LimbRecord& b) { return a.digit < b.digit || (a.digit == b.digit && a.id < b.id); });
+            */
+        }
+    }
+    return digitMeta;
 }
 
 std::vector<std::vector<std::vector<LimbRecord>>>
-ContextData::generateDecompMeta(const std::vector<std::vector<LimbRecord>>& meta,
-                                const std::vector<std::vector<int>> digitGPUid,
-                                const std::vector<int>& GPUid,
-                                int L) {
-	std::vector<std::vector<std::vector<LimbRecord>>> decompMeta(meta.size());
+ContextData::generateDecompMeta(const std::vector<std::vector<LimbRecord>>& meta, const std::vector<std::vector<int>> digitGPUid, const std::vector<int>& GPUid, int L) {
+    std::vector<std::vector<std::vector<LimbRecord>>> decompMeta(meta.size());
 
-	for (size_t i = 0; i < digitGPUid.size(); ++i) {
-		cudaSetDevice(GPUid[i]);
-		for (int d : digitGPUid.at(i)) {
-			decompMeta[i].emplace_back();
+    for (size_t i = 0; i < digitGPUid.size(); ++i) {
+        cudaSetDevice(GPUid[i]);
+        for (int d : digitGPUid.at(i)) {
+            decompMeta[i].emplace_back();
 
-			for (int primeid = 0; primeid <= L; ++primeid) {
-				for (auto& m : meta) {
-					for (auto& l : m) {
-						if (l.id == primeid && l.digit == d) {
-							decompMeta[i].back().push_back(LimbRecord{ .id = l.id, .type = l.type, .digit = l.digit });
-							decompMeta[i].back().back().stream.init();
-						}
-					}
-				}
-			}
-		}
-	}
+            for (int primeid = 0; primeid <= L; ++primeid) {
+                for (auto& m : meta) {
+                    for (auto& l : m) {
+                        if (l.id == primeid && l.digit == d) {
+                            decompMeta[i].back().push_back(LimbRecord{ .id = l.id, .type = l.type, .digit = l.digit });
+                            decompMeta[i].back().back().stream.init();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-	return decompMeta;
+    return decompMeta;
 }
 
 bool ContextData::isValidPrimeId(const int i) const {
-	return (i >= 0 && i < L + 1 + K);
+    return (i >= 0 && i < L + 1 + K);
 }
 
 int ContextData::computeLogQ(const int L, std::vector<PrimeRecord>& primes) {
-	int res = 0;
-	assert(L <= (int)primes.size());
-	for (int i = 0; i <= L; ++i) {
-		res += (primes[i].bits == -1) ? (primes[i].bits = (int)std::bit_width(primes[i].p)) : primes[i].bits;
-	}
-	return res;
+    int res = 0;
+    assert(L <= (int)primes.size());
+    for (int i = 0; i <= L; ++i) {
+        res += (primes[i].bits == -1) ? (primes[i].bits = (int)std::bit_width(primes[i].p)) : primes[i].bits;
+    }
+    return res;
 }
 
 const int& ContextData::validateDnum(const std::vector<int>& GPUid, const int& dnum) {
-	return dnum;
+    if (dnum < 1)
+        throw std::runtime_error("dnum must be >= 1 (the digit decomposition needs at least one digit)");
+    return dnum;
 }
 
 int findDigitOnParam(const Parameters& param, uint64_t modulus) {
-	for (size_t i = 0; i < param.raw->PARTITIONmoduli.size(); ++i) {
-		for (uint64_t j : param.raw->PARTITIONmoduli.at(i)) {
-			if (modulus == j)
-				return i;
-		}
-	}
-	return -1;
+    for (size_t i = 0; i < param.raw->PARTITIONmoduli.size(); ++i) {
+        for (uint64_t j : param.raw->PARTITIONmoduli.at(i)) {
+            if (modulus == j)
+                return i;
+        }
+    }
+    return -1;
 }
 
 std::vector<std::vector<LimbRecord>>
-ContextData::generateMeta(const std::vector<int>& GPUid,
-                          const int dnum,
-                          const std::vector<std::vector<int>> digitGPUid,
-                          const std::vector<PrimeRecord>& prime,
-                          const Parameters& param) {
-	int devs = GPUid.size();
-	std::vector<std::vector<LimbRecord>> meta(devs);
+ContextData::generateMeta(const std::vector<int>& GPUid, const int dnum, const std::vector<std::vector<int>> digitGPUid, const std::vector<PrimeRecord>& prime, const Parameters& param) {
+    int devs = GPUid.size();
+    std::vector<std::vector<LimbRecord>> meta(devs);
 
-	// for (int i = 0; i < devs; ++i) {
-	//  cudaSetDevice(GPUid.at(i));
-	//  meta.at(i).resize((prime.size() + devs - i - 1) / devs);
-	// }
+    // for (int i = 0; i < devs; ++i) {
+    //  cudaSetDevice(GPUid.at(i));
+    //  meta.at(i).resize((prime.size() + devs - i - 1) / devs);
+    // }
 
-	if constexpr (0) {
-		int threshhold1 = (prime.size() / 2 + devs - 1) / devs;
-		int threshhold2 = threshhold1 * devs;
-		int dev         = 0;
-		for (int i = 0; i < (int)prime.size(); ++i) {
-			int digit_ = !param.raw ? i % dnum : findDigitOnParam(param, prime.at(i).p);
+    if constexpr (0) {
+        int threshhold1 = (prime.size() / 2 + devs - 1) / devs;
+        int threshhold2 = threshhold1 * devs;
+        int dev = 0;
+        for (int i = 0; i < (int)prime.size(); ++i) {
+            int digit_ = !param.raw ? (int)((int64_t)i * dnum / (int)prime.size()) : findDigitOnParam(param, prime.at(i).p);
 
-			if (i < threshhold1) {
-			} else if (i < threshhold2) {
-				dev = (dev + 1) % devs;
-				if (dev == 0)
-					dev = (dev + 1) % devs;
-			} else {
-				dev = (dev + 1) % devs;
-			}
-			/*{
-			int dev = -1;
-			for (size_t j = 0; j < digitGPUid.size(); ++j) {
-				for (auto& k : digitGPUid.at(j))
-					if (k == digit)
-						dev = j;
-			}
-		}*/
+            if (i < threshhold1) {
+            } else if (i < threshhold2) {
+                dev = (dev + 1) % devs;
+                if (dev == 0)
+                    dev = (dev + 1) % devs;
+            } else {
+                dev = (dev + 1) % devs;
+            }
+            /*{
+            int dev = -1;
+            for (size_t j = 0; j < digitGPUid.size(); ++j) {
+                for (auto& k : digitGPUid.at(j))
+                    if (k == digit)
+                        dev = j;
+            }
+        }*/
 
-			cudaSetDevice(GPUid[dev]);
+            cudaSetDevice(GPUid[dev]);
 
-			meta[dev].push_back(LimbRecord{ .id = i, .type = (prime[i].type ? *(prime[i].type) : (prime[i].bits <= 30 ? U32 : U64)), .digit = digit_ });
-			meta[dev].back().stream.init();
-			// std::cout << "i: " << i << " gpu:" << dev << std::endl;
-		}
-	} else {
-		for (int i = 0; i < (int)prime.size(); ++i) {
-			int digit_ = !param.raw ? i % dnum : findDigitOnParam(param, prime.at(i).p);
+            meta[dev].push_back(LimbRecord{ .id = i, .type = (prime[i].type ? *(prime[i].type) : (prime[i].bits <= 30 ? U32 : U64)), .digit = digit_ });
+            meta[dev].back().stream.init();
+            // std::cout << "i: " << i << " gpu:" << dev << std::endl;
+        }
+    } else {
+        // Digits must be a *contiguous ascending partition* of the flat prime-id order: modup /
+        // moddown addressing (limb.at(S_d + i), digit sizes, num_primeid_digit_from/to tables) is
+        // built on digit d owning the flat id range [S_d, S_d + D_d). The old index-interleaved
+        // assignment (i % dnum) violates that (wrong source limbs, size != n_d_n shared-memory
+        // overflow in DecompAndModUpConv), so multi-digit non-raw configs use balanced contiguous
+        // chunking, and any other assignment (e.g. interleaved raw partitions) is rejected.
+        int prev_digit_ = -1;
+        for (int i = 0; i < (int)prime.size(); ++i) {
+            int digit_ = !param.raw ? (int)((int64_t)i * dnum / (int)prime.size()) : findDigitOnParam(param, prime.at(i).p);
+            // Reject anything that is not a contiguous ascending partition: interleaved/reordered
+            // digits break the flat limb addressing (size != n_d_n in modup/moddown), and values
+            // outside [0, dnum) (unpartitioned primes, more partitions than dnum) would index
+            // res[j.digit] out of bounds in generateDigitGPUid.
+            if (digit_ < prev_digit_ || digit_ < 0 || digit_ >= dnum)
+                throw std::runtime_error("digit decomposition must be a contiguous ascending partition of the prime order, with every prime assigned to "
+                                         "exactly one of the dnum digits");
+            prev_digit_ = digit_;
 
-			int dev = i % GPUid.size();
-			/*{
-			int dev = -1;
-			for (size_t j = 0; j < digitGPUid.size(); ++j) {
-				for (auto& k : digitGPUid.at(j))
-					if (k == digit)
-						dev = j;
-			}
-		}*/
-			cudaSetDevice(GPUid[dev]);
+            int dev = i % GPUid.size();
+            /*{
+            int dev = -1;
+            for (size_t j = 0; j < digitGPUid.size(); ++j) {
+                for (auto& k : digitGPUid.at(j))
+                    if (k == digit)
+                        dev = j;
+            }
+        }*/
+            cudaSetDevice(GPUid[dev]);
 
-			meta[dev].push_back(LimbRecord{ .id = i, .type = (prime[i].type ? *(prime[i].type) : (prime[i].bits <= 30 ? U32 : U64)), .digit = digit_ });
-			meta[dev].back().stream.init();
-		}
-	}
+            meta[dev].push_back(LimbRecord{ .id = i, .type = (prime[i].type ? *(prime[i].type) : (prime[i].bits <= 30 ? U32 : U64)), .digit = digit_ });
+            meta[dev].back().stream.init();
+        }
+    }
 
-	return meta;
+    return meta;
 }
 
 std::vector<int> ContextData::computeLogQ_d(const int dnum, const std::vector<std::vector<LimbRecord>>& meta, const std::vector<PrimeRecord>& prime) {
-	std::vector<int> logQ_d(dnum, 0);
+    std::vector<int> logQ_d(dnum, 0);
 
-	for (auto& i : meta)
-		for (auto& j : i)
-			logQ_d.at(j.digit) += prime.at(j.id).bits;
+    for (auto& i : meta)
+        for (auto& j : i)
+            logQ_d.at(j.digit) += prime.at(j.id).bits;
 
-	return logQ_d;
+    return logQ_d;
 }
 
 const int& ContextData::computeK(const std::vector<int>& logQ_d, std::vector<PrimeRecord>& Sprimes, Parameters& param) {
 
-	size_t res  = 0;
-	int logMaxD = *std::max_element(logQ_d.begin(), logQ_d.end());
-	int bits    = 0;
-	for (; bits < logMaxD && res < Sprimes.size(); ++res) {
-		bits += (Sprimes.at(res).bits <= 0) ? (Sprimes.at(res).bits = (int)std::bit_width(Sprimes.at(res).p)) - 1 : Sprimes.at(res).bits - 1;
-	}
+    size_t res = 0;
+    int logMaxD = *std::max_element(logQ_d.begin(), logQ_d.end());
+    int bits = 0;
+    for (; bits < logMaxD && res < Sprimes.size(); ++res) {
+        bits += (Sprimes.at(res).bits <= 0) ? (Sprimes.at(res).bits = (int)std::bit_width(Sprimes.at(res).p)) - 1 : Sprimes.at(res).bits - 1;
+    }
 
-	if (param.K != -1) {
-		return param.K;
-	}
+    if (param.K != -1) {
+        return param.K;
+    }
 
-	assert(bits >= logMaxD);
-	return param.K = res;
+    assert(bits >= logMaxD);
+    return param.K = res;
 }
 
 std::vector<std::vector<LimbRecord>>
-ContextData::generateSpecialMeta(const std::vector<std::vector<LimbRecord>>& meta,
-                                 const std::vector<PrimeRecord>& specialPrime,
-                                 const int ID0,
-                                 const std::vector<int>& GPUid) {
-	std::vector<std::vector<LimbRecord>> specialMeta(GPUid.size());
+ContextData::generateSpecialMeta(const std::vector<std::vector<LimbRecord>>& meta, const std::vector<PrimeRecord>& specialPrime, const int ID0, const std::vector<int>& GPUid) {
+    std::vector<std::vector<LimbRecord>> specialMeta(GPUid.size());
 
-	for (size_t d = 0; d < GPUid.size(); ++d) {
-		specialMeta.at(d).resize(specialPrime.size());
-		cudaSetDevice(GPUid[d]);
-		for (int i = 0; i < (int)specialPrime.size(); ++i) {
-			specialMeta.at(d).at(i).id   = ID0 + i;
-			specialMeta.at(d).at(i).type = (specialPrime[i].type ? *(specialPrime[i].type) : (specialPrime[i].bits <= 30 ? U32 : U64));
-			specialMeta.at(d).at(i).stream.init();
-		}
-	}
+    for (size_t d = 0; d < GPUid.size(); ++d) {
+        specialMeta.at(d).resize(specialPrime.size());
+        cudaSetDevice(GPUid[d]);
+        for (int i = 0; i < (int)specialPrime.size(); ++i) {
+            specialMeta.at(d).at(i).id = ID0 + i;
+            specialMeta.at(d).at(i).type = (specialPrime[i].type ? *(specialPrime[i].type) : (specialPrime[i].bits <= 30 ? U32 : U64));
+            specialMeta.at(d).at(i).stream.init();
+        }
+    }
 
-	return specialMeta;
+    return specialMeta;
 }
 
 std::vector<LimbRecord> ContextData::generateGatherMeta(const std::vector<std::vector<LimbRecord>>& meta, int L) {
-	std::vector<LimbRecord> gatherMeta(L + 1);
+    std::vector<LimbRecord> gatherMeta(L + 1);
 
-	for (int i = 0; i <= L; ++i) {
-		for (size_t j = 0; j < meta.size(); ++j) {
-			for (size_t k = 0; k < meta.at(j).size(); ++k) {
-				if (meta[j][k].id == i) {
-					gatherMeta.at(i).id    = i;
-					gatherMeta.at(i).digit = meta[j][k].digit;
-					gatherMeta.at(i).type  = meta[j][k].type;
-				}
-			}
-		}
-	}
+    for (int i = 0; i <= L; ++i) {
+        for (size_t j = 0; j < meta.size(); ++j) {
+            for (size_t k = 0; k < meta.at(j).size(); ++k) {
+                if (meta[j][k].id == i) {
+                    gatherMeta.at(i).id = i;
+                    gatherMeta.at(i).digit = meta[j][k].digit;
+                    gatherMeta.at(i).type = meta[j][k].type;
+                }
+            }
+        }
+    }
 
-	return gatherMeta;
+    return gatherMeta;
 }
 
 std::vector<std::vector<int>> ContextData::generateGPUdigits(const int dnum, const std::vector<int>& devs) {
-	std::vector<std::vector<int>> res(devs.size());
-	for (int d = 0; d < dnum; ++d) {
-		for (uint32_t gpu = 0; gpu < devs.size(); ++gpu) {
-			res[gpu].push_back(d);
-		}
-	}
-	return res;
+    std::vector<std::vector<int>> res(devs.size());
+    for (int d = 0; d < dnum; ++d) {
+        for (uint32_t gpu = 0; gpu < devs.size(); ++gpu) {
+            res[gpu].push_back(d);
+        }
+    }
+    return res;
 }
 
 // These key-switch/mod-down scratch polynomials are allocated lazily, once per context,
@@ -411,379 +471,406 @@ std::vector<std::vector<int>> ContextData::generateGPUdigits(const int dnum, con
 // cannot repair the already-corrupted buffer, so we drain once, before the first allocation,
 // closing the race for good.
 RNSPoly& ContextData::getKeySwitchAux() {
-	if (key_switch_aux == nullptr) {
-		cudaDeviceSynchronize();
-		key_switch_aux = std::make_unique<RNSPoly>(*this, L, false);
-	}
+    if (key_switch_aux == nullptr) {
+        cudaDeviceSynchronize();
+        key_switch_aux = std::make_unique<RNSPoly>(*this, L, false);
+        key_switch_aux->onSizeChanged = [] { CudaNvtxLifetimeRefresh(ContextData::loc); };
+    }
 
-	key_switch_aux->generateDecompAndDigit(false);
-	key_switch_aux->generateSpecialLimbs(false, false);
-	return *key_switch_aux;
+    key_switch_aux->generateDecompAndDigit(false);
+    key_switch_aux->generateSpecialLimbs(false, false);
+    return *key_switch_aux;
 }
 
 RNSPoly& ContextData::getKeySwitchAux2() {
-	if (key_switch_aux2 == nullptr) {
-		cudaDeviceSynchronize();
-		key_switch_aux2 = std::make_unique<RNSPoly>(*this, L, false);
-	}
-	key_switch_aux2->generateDecompAndDigit(false);
-	key_switch_aux2->generateSpecialLimbs(false, false);
-	return *key_switch_aux2;
+    if (key_switch_aux2 == nullptr) {
+        cudaDeviceSynchronize();
+        key_switch_aux2 = std::make_unique<RNSPoly>(*this, L, false);
+        key_switch_aux2->onSizeChanged = [] { CudaNvtxLifetimeRefresh(ContextData::loc); };
+    }
+    key_switch_aux2->generateDecompAndDigit(false);
+    key_switch_aux2->generateSpecialLimbs(false, false);
+    return *key_switch_aux2;
 }
 
 RNSPoly& ContextData::getModdownAux(const int num) {
-	if (moddown_aux[num % moddown_aux.size()] == nullptr) {
-		cudaDeviceSynchronize();
-		moddown_aux[num % moddown_aux.size()] = std::make_unique<RNSPoly>(*this, L, false);
-	}
-	moddown_aux[num % moddown_aux.size()]->generateSpecialLimbs(false, true);
-	return *moddown_aux[num % moddown_aux.size()];
+    if (moddown_aux[num % moddown_aux.size()] == nullptr) {
+        cudaDeviceSynchronize();
+        moddown_aux[num % moddown_aux.size()] = std::make_unique<RNSPoly>(*this, L, false);
+        moddown_aux[num % moddown_aux.size()]->onSizeChanged = [] { CudaNvtxLifetimeRefresh(ContextData::loc); };
+    }
+    moddown_aux[num % moddown_aux.size()]->generateSpecialLimbs(false, true);
+    return *moddown_aux[num % moddown_aux.size()];
 }
 
 std::vector<uint64_t> ContextData::ElemForEvalMult(int level, const double operand, int level_in) {
 
-	uint32_t numTowers = level + 1;
-	std::vector<lbcrypto::DCRTPoly::Integer> moduli(numTowers);
-	for (uint32_t i = 0; i < numTowers; i++) {
-		if (i < prime.size()) {
-			moduli[i] = prime[i].p;
-		} else {
-			moduli[i] = specialPrime[i - prime.size()].p;
-		}
-	}
+    uint32_t numTowers = level + 1;
+    std::vector<lbcrypto::DCRTPoly::Integer> moduli(numTowers);
+    for (uint32_t i = 0; i < numTowers; i++) {
+        if (i < prime.size()) {
+            moduli[i] = prime[i].p;
+        } else {
+            moduli[i] = specialPrime[i - prime.size()].p;
+        }
+    }
 
-	double scFactor;
-	if (level_in == -1 || level_in == level) {
-		if (level < param.ScalingFactorReal.size()) {
-			scFactor = param.ScalingFactorReal[level];
-		} else {
-			scFactor = moduli.back().ConvertToDouble();
-		}
-	} else {
-		/** Lets handle scale changes more efficiently!*/
-		assert(level > 0);
-		double scFactorIn      = param.ScalingFactorReal[level_in];
-		double scFactorOut     = param.ScalingFactorReal[level - 1];
-		double rescalingFactor = param.ModReduceFactor[level];
-		scFactor               = scFactorOut * rescalingFactor / scFactorIn;
+    double scFactor;
+    if (level_in == -1 || level_in == level) {
+        if (static_cast<size_t>(level) < param.ScalingFactorReal.size()) {
+            scFactor = param.ScalingFactorReal[level];
+        } else {
+            scFactor = moduli.back().ConvertToDouble();
+        }
+    } else {
+        /** Lets handle scale changes more efficiently!*/
+        assert(level > 0);
+        double scFactorIn = param.ScalingFactorReal[level_in];
+        double scFactorOut = param.ScalingFactorReal[level - 1];
+        double rescalingFactor = param.ModReduceFactor[level];
+        scFactor = scFactorOut * rescalingFactor / scFactorIn;
 
-		assert(abs(param.ScalingFactorReal[level - 1] * rescalingFactor - param.ScalingFactorReal[level] * param.ScalingFactorReal[level]) < 1e-9);
-		assert(abs(scFactorIn * scFactor / rescalingFactor - scFactorOut) < 1e-9);
-	}
+        assert(abs(param.ScalingFactorReal[level - 1] * rescalingFactor - param.ScalingFactorReal[level] * param.ScalingFactorReal[level]) < 1e-9);
+        assert(abs(scFactorIn * scFactor / rescalingFactor - scFactorOut) < 1e-9);
+    }
 
-	typedef int128_t DoubleInteger;
-	int32_t MAX_BITS_IN_WORD_LOCAL = 125;
+    typedef int128_t DoubleInteger;
+    int32_t MAX_BITS_IN_WORD_LOCAL = 125;
 
-	int32_t logApprox = 0;
-	const double res  = std::fabs(operand * scFactor);
-	if (res > 0) {
-		int32_t logSF    = static_cast<int32_t>(std::ceil(std::log2(res)));
-		int32_t logValid = (logSF <= MAX_BITS_IN_WORD_LOCAL) ? logSF : MAX_BITS_IN_WORD_LOCAL;
-		logApprox        = logSF - logValid;
-	}
-	double approxFactor = pow(2, logApprox);
+    int32_t logApprox = 0;
+    const double res = std::fabs(operand * scFactor);
+    if (res > 0) {
+        int32_t logSF = static_cast<int32_t>(std::ceil(std::log2(res)));
+        int32_t logValid = (logSF <= MAX_BITS_IN_WORD_LOCAL) ? logSF : MAX_BITS_IN_WORD_LOCAL;
+        logApprox = logSF - logValid;
+    }
+    double approxFactor = pow(2, logApprox);
 
-	DoubleInteger large     = static_cast<DoubleInteger>(operand / approxFactor * scFactor + 0.5);
-	DoubleInteger large_abs = (large < 0 ? -large : large);
-	DoubleInteger bound     = (uint64_t)1 << 63;
+    // Match OpenFHE's GetElementForEvalMult exactly: it evaluates
+    //     large = static_cast<DoubleInteger>(operand / approxFactor * scFactor + 0.5)
+    // and the OpenFHE build (baseline x86-64, no -mfma/-march=native) does NOT contract this to an
+    // FMA, so it rounds as a separate multiply then add. Using std::fma here (single rounding)
+    // shifts the integer factor by 1 LSB for some operands.
+    DoubleInteger large = static_cast<DoubleInteger>(operand / approxFactor * scFactor + 0.5);
+    DoubleInteger large_abs = (large < 0 ? -large : large);
+    DoubleInteger bound = (uint64_t)1 << 63;
 
-	std::vector<lbcrypto::DCRTPoly::Integer> factors(numTowers);
+    std::vector<lbcrypto::DCRTPoly::Integer> factors(numTowers);
 
-	if (large_abs > bound) {
-		for (uint32_t i = 0; i < numTowers; i++) {
-			DoubleInteger reduced = large % moduli[i].ConvertToInt();
+    if (large_abs > bound) {
+        for (uint32_t i = 0; i < numTowers; i++) {
+            DoubleInteger reduced = large % moduli[i].ConvertToInt();
 
-			factors[i] = (reduced < 0) ? static_cast<uint64_t>(reduced + moduli[i].ConvertToInt()) : static_cast<uint64_t>(reduced);
-		}
-	} else {
-		int64_t scConstant = static_cast<int64_t>(large);
-		for (uint32_t i = 0; i < numTowers; i++) {
-			int64_t reduced = scConstant % static_cast<int64_t>(moduli[i].ConvertToInt());
+            factors[i] = (reduced < 0) ? static_cast<uint64_t>(reduced + moduli[i].ConvertToInt()) : static_cast<uint64_t>(reduced);
+        }
+    } else {
+        int64_t scConstant = static_cast<int64_t>(large);
+        for (uint32_t i = 0; i < numTowers; i++) {
+            int64_t reduced = scConstant % static_cast<int64_t>(moduli[i].ConvertToInt());
 
-			factors[i] = (reduced < 0) ? reduced + moduli[i].ConvertToInt() : reduced;
-		}
-	}
+            factors[i] = (reduced < 0) ? reduced + moduli[i].ConvertToInt() : reduced;
+        }
+    }
 
-	// Scale back up by approxFactor within the CRT multiplications.
-	if (logApprox > 0) {
-		int32_t logStep = (logApprox <= lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP) ? logApprox : lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP;
-		lbcrypto::DCRTPoly::Integer intStep = uint64_t(1) << logStep;
-		std::vector<lbcrypto::DCRTPoly::Integer> crtApprox(numTowers, intStep);
-		logApprox -= logStep;
+    // Scale back up by approxFactor within the CRT multiplications.
+    if (logApprox > 0) {
+        int32_t logStep = (logApprox <= lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP) ? logApprox : lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP;
+        lbcrypto::DCRTPoly::Integer intStep = uint64_t(1) << logStep;
+        std::vector<lbcrypto::DCRTPoly::Integer> crtApprox(numTowers, intStep);
+        logApprox -= logStep;
 
-		while (logApprox > 0) {
-			int32_t logStep = (logApprox <= lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP) ? logApprox : lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP;
-			lbcrypto::DCRTPoly::Integer intStep = uint64_t(1) << logStep;
-			std::vector<lbcrypto::DCRTPoly::Integer> crtSF(numTowers, intStep);
-			crtApprox = lbcrypto::CKKSPackedEncoding::CRTMult(crtApprox, crtSF, moduli);
-			logApprox -= logStep;
-		}
-		factors = lbcrypto::CKKSPackedEncoding::CRTMult(factors, crtApprox, moduli);
-	}
+        while (logApprox > 0) {
+            int32_t logStep = (logApprox <= lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP) ? logApprox : lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP;
+            lbcrypto::DCRTPoly::Integer intStep = uint64_t(1) << logStep;
+            std::vector<lbcrypto::DCRTPoly::Integer> crtSF(numTowers, intStep);
+            crtApprox = lbcrypto::CKKSPackedEncoding::CRTMult(crtApprox, crtSF, moduli);
+            logApprox -= logStep;
+        }
+        factors = lbcrypto::CKKSPackedEncoding::CRTMult(factors, crtApprox, moduli);
+    }
 
-	std::vector<uint64_t> result(numTowers);
-	for (uint32_t i = 0; i < result.size(); ++i) {
-		result[i] = factors[i].ConvertToInt();
-		if (i < prime.size()) {
-			result[i] = result[i] % prime[i].p;
-		} else {
-			result[i] = result[i] % specialPrime[i - prime.size()].p;
-		}
-	}
+    std::vector<uint64_t> result(numTowers);
+    for (uint32_t i = 0; i < result.size(); ++i) {
+        result[i] = factors[i].ConvertToInt();
+        if (i < prime.size()) {
+            result[i] = result[i] % prime[i].p;
+        } else {
+            result[i] = result[i] % specialPrime[i - prime.size()].p;
+        }
+    }
 
-	return result;
+    return result;
 }
 
 std::ostream& operator<<(std::ostream& o, const uint128_t& x) {
-	if (x == std::numeric_limits<uint128_t>::min())
-		return o << "0";
-	if (x < 10)
-		return o << (char)(x + '0');
-	return o << x / 10 << (char)(x % 10 + '0');
+    if (x == std::numeric_limits<uint128_t>::min())
+        return o << "0";
+    if (x < 10)
+        return o << (char)(x + '0');
+    return o << x / 10 << (char)(x % 10 + '0');
 }
 
 std::vector<uint64_t> ContextData::ElemForEvalAddOrSub(const int level, const double operand, const int noise_deg) {
-	uint32_t sizeQl = level + 1;
-	std::vector<lbcrypto::DCRTPoly::Integer> moduli(sizeQl);
-	for (uint32_t i = 0; i < sizeQl; i++) {
-		moduli[i] = prime[i].p;
-	}
+    uint32_t sizeQl = level + 1;
+    std::vector<lbcrypto::DCRTPoly::Integer> moduli(sizeQl);
+    for (uint32_t i = 0; i < sizeQl; i++) {
+        moduli[i] = prime[i].p;
+    }
 
-	// double scFactor = param.ScalingFactorReal.at(level);
-	double scFactor = 0;
-	if (this->rescaleTechnique == FLEXIBLEAUTOEXT && level == L) {
-		scFactor = param.ScalingFactorRealBig.at(level); // cryptoParams->GetScalingFactorRealBig(ciphertext->GetLevel());
-	} else {
-		scFactor = param.ScalingFactorReal.at(level); // cryptoParams->GetScalingFactorReal(ciphertext->GetLevel());
-	}
+    // double scFactor = param.ScalingFactorReal.at(level);
+    double scFactor = 0;
+    if (this->rescaleTechnique == FLEXIBLEAUTOEXT && level == L) {
+        scFactor = param.ScalingFactorRealBig.at(level); // cryptoParams->GetScalingFactorRealBig(ciphertext->GetLevel());
+    } else {
+        scFactor = param.ScalingFactorReal.at(level); // cryptoParams->GetScalingFactorReal(ciphertext->GetLevel());
+    }
 
-	int32_t logApprox = 0;
-	const double res  = std::fabs(operand * scFactor);
-	if (res > 0) {
-		int32_t logSF    = static_cast<int32_t>(std::ceil(std::log2(res)));
-		int32_t logValid = (logSF <= lbcrypto::LargeScalingFactorConstants::MAX_BITS_IN_WORD) ? logSF : lbcrypto::LargeScalingFactorConstants::MAX_BITS_IN_WORD;
-		logApprox        = logSF - logValid;
-	}
-	double approxFactor = pow(2, logApprox);
+    int32_t logApprox = 0;
+    const double res = std::fabs(operand * scFactor);
+    if (res > 0) {
+        int32_t logSF = static_cast<int32_t>(std::ceil(std::log2(res)));
+        int32_t logValid = (logSF <= lbcrypto::LargeScalingFactorConstants::MAX_BITS_IN_WORD) ? logSF : lbcrypto::LargeScalingFactorConstants::MAX_BITS_IN_WORD;
+        logApprox = logSF - logValid;
+    }
+    double approxFactor = pow(2, logApprox);
 
-	lbcrypto::DCRTPoly::Integer scConstant = static_cast<uint64_t>(operand * scFactor / approxFactor + 0.5);
-	std::vector<lbcrypto::DCRTPoly::Integer> crtConstant(sizeQl, scConstant);
+    lbcrypto::DCRTPoly::Integer scConstant = static_cast<uint64_t>(operand * scFactor / approxFactor + 0.5);
+    std::vector<lbcrypto::DCRTPoly::Integer> crtConstant(sizeQl, scConstant);
 
-	// Scale back up by approxFactor within the CRT multiplications.
-	if (logApprox > 0) {
-		int32_t logStep = (logApprox <= lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP) ? logApprox : lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP;
-		lbcrypto::DCRTPoly::Integer intStep = uint64_t(1) << logStep;
-		std::vector<lbcrypto::DCRTPoly::Integer> crtApprox(sizeQl, intStep);
-		logApprox -= logStep;
+    // Scale back up by approxFactor within the CRT multiplications.
+    if (logApprox > 0) {
+        int32_t logStep = (logApprox <= lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP) ? logApprox : lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP;
+        lbcrypto::DCRTPoly::Integer intStep = uint64_t(1) << logStep;
+        std::vector<lbcrypto::DCRTPoly::Integer> crtApprox(sizeQl, intStep);
+        logApprox -= logStep;
 
-		while (logApprox > 0) {
-			int32_t logStep = (logApprox <= lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP) ? logApprox : lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP;
-			lbcrypto::DCRTPoly::Integer intStep = uint64_t(1) << logStep;
-			std::vector<lbcrypto::DCRTPoly::Integer> crtSF(sizeQl, intStep);
-			crtApprox = lbcrypto::CKKSPackedEncoding::CRTMult(crtApprox, crtSF, moduli);
-			logApprox -= logStep;
-		}
-		crtConstant = lbcrypto::CKKSPackedEncoding::CRTMult(crtConstant, crtApprox, moduli);
-	}
+        while (logApprox > 0) {
+            int32_t logStep = (logApprox <= lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP) ? logApprox : lbcrypto::LargeScalingFactorConstants::MAX_LOG_STEP;
+            lbcrypto::DCRTPoly::Integer intStep = uint64_t(1) << logStep;
+            std::vector<lbcrypto::DCRTPoly::Integer> crtSF(sizeQl, intStep);
+            crtApprox = lbcrypto::CKKSPackedEncoding::CRTMult(crtApprox, crtSF, moduli);
+            logApprox -= logStep;
+        }
+        crtConstant = lbcrypto::CKKSPackedEncoding::CRTMult(crtConstant, crtApprox, moduli);
+    }
 
-	// In FLEXIBLEAUTOEXT mode at level 0, we don't use the depth to calculate the scaling factor,
-	// so we return the value before taking the depth into account.
-	if (this->rescaleTechnique == FLEXIBLEAUTOEXT && level == L) {
-		std::vector<uint128_t> result(sizeQl);
-		for (uint32_t i = 0; i < result.size(); ++i) {
-			result[i] = crtConstant[i].ConvertToInt<uint128_t>();
-		}
+    // In FLEXIBLEAUTOEXT mode at level 0, we don't use the depth to calculate the scaling factor,
+    // so we return the value before taking the depth into account.
+    if (this->rescaleTechnique == FLEXIBLEAUTOEXT && level == L) {
+        std::vector<uint128_t> result(sizeQl);
+        for (uint32_t i = 0; i < result.size(); ++i) {
+            result[i] = crtConstant[i].ConvertToInt<uint128_t>();
+        }
 
-		for (uint32_t i = 0; i < result.size(); ++i) {
-			result[i] = result[i] % prime[i].p;
-		}
+        for (uint32_t i = 0; i < result.size(); ++i) {
+            result[i] = result[i] % prime[i].p;
+        }
 
-		std::vector<uint64_t> result2(crtConstant.size());
-		for (uint32_t i = 0; i < result.size(); ++i) {
-			result2[i] = result[i];
-		}
+        std::vector<uint64_t> result2(crtConstant.size());
+        for (uint32_t i = 0; i < result.size(); ++i) {
+            result2[i] = result[i];
+        }
 
-		return result2;
-	}
+        return result2;
+    }
 
-	lbcrypto::DCRTPoly::Integer intScFactor = static_cast<uint64_t>(scFactor + 0.5);
-	std::vector<lbcrypto::DCRTPoly::Integer> crtScFactor(sizeQl, intScFactor);
+    lbcrypto::DCRTPoly::Integer intScFactor = static_cast<uint64_t>(scFactor + 0.5);
+    std::vector<lbcrypto::DCRTPoly::Integer> crtScFactor(sizeQl, intScFactor);
 
-	for (uint32_t i = 1; i < static_cast<uint32_t>(noise_deg); i++) {
-		crtConstant = lbcrypto::CKKSPackedEncoding::CRTMult(crtConstant, crtScFactor, moduli);
-	}
+    // OpenFHE 1.6.0 (4a31f521) ScaleConstantToDegree: for FIXEDMANUAL/FIXEDAUTO the (deg-1)
+    // per-degree multiplications of a constant use the modulus of the tower the corresponding
+    // rescale drops (q_l), not the scaling factor Delta — the rescale divides by q_l, so a
+    // constant encoded as c*Delta^d would land at c*Delta/q_l (a ~2^-33 shift of the Chebyshev
+    // T_2 = 2x^2-1 constant). Guarded by i < numTowers like the reference.
+    const bool fixedScaling = (this->rescaleTechnique == FIXEDMANUAL || this->rescaleTechnique == FIXEDAUTO);
+    const uint32_t numTowers = sizeQl;
+    for (uint32_t i = 1; i < static_cast<uint32_t>(noise_deg); i++) {
+        if (fixedScaling && i < numTowers) {
+            std::vector<lbcrypto::DCRTPoly::Integer> crtQ(numTowers);
+            for (uint32_t j = 0; j < numTowers; ++j)
+                crtQ[j] = moduli[numTowers - i].Mod(moduli[j]);
+            crtConstant = lbcrypto::CKKSPackedEncoding::CRTMult(crtConstant, crtQ, moduli);
+        } else {
+            crtConstant = lbcrypto::CKKSPackedEncoding::CRTMult(crtConstant, crtScFactor, moduli);
+        }
+    }
 
-	std::vector<uint128_t> result(sizeQl);
-	for (uint32_t i = 0; i < result.size(); ++i) {
-		result[i] = crtConstant[i].ConvertToInt<uint128_t>();
-	}
+    std::vector<uint128_t> result(sizeQl);
+    for (uint32_t i = 0; i < result.size(); ++i) {
+        result[i] = crtConstant[i].ConvertToInt<uint128_t>();
+    }
 
-	for (uint32_t i = 0; i < result.size(); ++i) {
-		result[i] = result[i] % prime[i].p;
-	}
+    for (uint32_t i = 0; i < result.size(); ++i) {
+        result[i] = result[i] % prime[i].p;
+    }
 
-	std::vector<uint64_t> result2(crtConstant.size());
-	for (uint32_t i = 0; i < result.size(); ++i) {
-		result2[i] = result[i];
-	}
+    std::vector<uint64_t> result2(crtConstant.size());
+    for (uint32_t i = 0; i < result.size(); ++i) {
+        result2[i] = result[i];
+    }
 
-	return result2;
+    return result2;
 }
 
 std::vector<double>& ContextData::GetCoeffsChebyshev() {
-	assert(param.raw);
-	return param.raw->coefficientsCheby;
+    assert(param.raw);
+    return param.raw->coefficientsCheby;
 }
 
 int ContextData::GetDoubleAngleIts() {
-	assert(param.raw);
-	return param.raw ? param.raw->doubleAngleIts : 3;
+    assert(param.raw);
+    return param.raw ? param.raw->doubleAngleIts : 3;
 }
 
-int ContextData::GetBootK() {
-	assert(param.raw);
-	return param.raw ? param.raw->bootK : 1;
+double ContextData::GetBootK() {
+    assert(param.raw);
+    return param.raw ? param.raw->bootK : 1;
 }
 
 bool ContextData::HasBootPrecomputation(int slots) {
 
-	return precom.boot.contains(slots);
+    return precom.boot.contains(slots);
 }
 
 BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
-	if (!precom.boot.contains(slots))
-		assert("No precomputation." == nullptr);
-	return precom.boot[slots];
+    auto it = precom.boot.find(slots);
+    if (it == precom.boot.end()) {
+        // Guardrail, not a get-or-create: AddBootPrecomputation() is the creator. A raw
+        // assert here (or the map's operator[]) left release builds silently using a
+        // default-constructed precomputation.
+        throw std::runtime_error("No bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup/EvalBootstrapKeyGen before LoadContext)");
+    }
+    return it->second;
 }
 
 void Precomputations::KeyPrecomputations::touch(const int index) {
-	auto it = lru_pos.find(index);
-	if (it != lru_pos.end()) {
-		lru_order.splice(lru_order.begin(), lru_order, it->second);
-	} else {
-		lru_order.emplace_front(index);
-		lru_pos[index] = lru_order.begin();
-	}
+    auto it = lru_pos.find(index);
+    if (it != lru_pos.end()) {
+        lru_order.splice(lru_order.begin(), lru_order, it->second);
+    } else {
+        lru_order.emplace_front(index);
+        lru_pos[index] = lru_order.begin();
+    }
 }
 
 bool Precomputations::KeyPrecomputations::offloadKey(const int index) {
-	auto it = rot_keys.find(index);
-	if (it == rot_keys.end() || !it->second.isResident() || !it->second.hasSnapshot())
-		return false;
-	it->second.offload();
-	resident_bytes -= it->second.limbBytes();
-	auto lit = lru_pos.find(index);
-	if (lit != lru_pos.end()) {
-		lru_order.erase(lit->second);
-		lru_pos.erase(lit);
-	}
-	return true;
+    auto it = rot_keys.find(index);
+    if (it == rot_keys.end() || !it->second.isResident() || !it->second.hasSnapshot())
+        return false;
+    it->second.offload();
+    resident_bytes -= it->second.limbBytes();
+    auto lit = lru_pos.find(index);
+    if (lit != lru_pos.end()) {
+        lru_order.erase(lit->second);
+        lru_pos.erase(lit);
+    }
+    return true;
 }
 
 void Precomputations::KeyPrecomputations::evictToFit(const size_t budget, const size_t incoming) {
-	while (resident_bytes + incoming > budget) {
-		bool evicted = false;
-		for (auto it = lru_order.rbegin(); it != lru_order.rend(); ++it) {
-			if (!pinned.contains(*it)) {
-				offloadKey(*it); // erases *it from lru_order; we break right away
-				evicted = true;
-				break;
-			}
-		}
-		if (!evicted) {
-			// Everything resident is pinned (or has no snapshot): the budget is
-			// unsatisfiable; overshoot it rather than break correctness.
-			return;
-		}
-	}
+    while (resident_bytes + incoming > budget) {
+        bool evicted = false;
+        for (auto it = lru_order.rbegin(); it != lru_order.rend(); ++it) {
+            if (!pinned.contains(*it)) {
+                offloadKey(*it); // erases *it from lru_order; we break right away
+                evicted = true;
+                break;
+            }
+        }
+        if (!evicted) {
+            // Everything resident is pinned (or has no snapshot): the budget is
+            // unsatisfiable; overshoot it rather than break correctness.
+            return;
+        }
+    }
 }
 
 KeySwitchingKey& Precomputations::KeyPrecomputations::ensureResident(const int index, const size_t budget, const bool may_evict) {
-	auto it = rot_keys.find(index);
-	if (it == rot_keys.end())
-		throw std::runtime_error("Rotation key " + std::to_string(index) + " not found");
-	KeySwitchingKey& ksk = it->second;
-	if (!ksk.isResident()) {
-		if (may_evict) {
-			// Evict BEFORE loading so peak VRAM stays at budget (+1 key when the budget
-			// itself is smaller than a single key).
-			evictToFit(budget, ksk.limbBytes());
-		}
-		ksk.ensureResident();
-		resident_bytes += ksk.limbBytes();
-	}
-	touch(index);
-	return ksk;
+    auto it = rot_keys.find(index);
+    if (it == rot_keys.end())
+        throw std::runtime_error("Rotation key " + std::to_string(index) + " not found");
+    KeySwitchingKey& ksk = it->second;
+    if (!ksk.isResident()) {
+        if (may_evict) {
+            // Evict BEFORE loading so peak VRAM stays at budget (+1 key when the budget
+            // itself is smaller than a single key).
+            evictToFit(budget, ksk.limbBytes());
+        }
+        ksk.ensureResident();
+        resident_bytes += ksk.limbBytes();
+    }
+    touch(index);
+    return ksk;
 }
 
 void Precomputations::KeyPrecomputations::registerKey(const int index, KeySwitchingKey& ksk) {
-	if (ksk.isResident()) {
-		resident_bytes += ksk.limbBytes();
-	}
-	// Offloaded (lazy) keys enter the LRU on their first use.
+    if (ksk.isResident()) {
+        resident_bytes += ksk.limbBytes();
+    }
+    // Offloaded (lazy) keys enter the LRU on their first use.
 }
 
 void Precomputations::KeyPrecomputations::resetCacheBookkeeping() {
-	resident_bytes = 0;
-	lru_order.clear();
-	lru_pos.clear();
-	pinned.clear();
+    resident_bytes = 0;
+    lru_order.clear();
+    lru_pos.clear();
+    pinned.clear();
 }
 
 void Precomputations::KeyPrecomputations::enforceBudget(const size_t budget) {
-	evictToFit(budget, 0);
+    evictToFit(budget, 0);
 }
 
 void ContextData::SetRotationKeyCache(const size_t bytes) {
-	rotation_key_cache_bytes = bytes;
-	for (auto& [keyID, kp] : precom.keys) {
-		kp.enforceBudget(bytes);
-	}
+    rotation_key_cache_bytes = bytes;
+    for (auto& [keyID, kp] : precom.keys) {
+        kp.enforceBudget(bytes);
+    }
 }
 
 void ContextData::OffloadRotationKeys(const std::vector<int>& indexes, const KeyHash& keyID) {
-	for (auto& [kid, kp] : precom.keys) {
-		if (!keyID.empty() && kid != keyID)
-			continue;
-		for (auto& [idx, ksk] : kp.rot_keys) {
-			if (!indexes.empty() && std::find(indexes.begin(), indexes.end(), idx) == indexes.end())
-				continue;
-			kp.offloadKey(idx);
-		}
-	}
+    for (auto& [kid, kp] : precom.keys) {
+        if (!keyID.empty() && kid != keyID)
+            continue;
+        for (auto& [idx, ksk] : kp.rot_keys) {
+            if (!indexes.empty() && std::find(indexes.begin(), indexes.end(), idx) == indexes.end())
+                continue;
+            kp.offloadKey(idx);
+        }
+    }
 }
 
 void ContextData::PinRotationKey(const int index, const bool pin, const KeyHash& keyID) {
-	for (auto& [kid, kp] : precom.keys) {
-		if (!keyID.empty() && kid != keyID)
-			continue;
-		if (!kp.rot_keys.contains(index))
-			continue;
-		if (pin) {
-			kp.pinned.insert(index);
-		} else {
-			kp.pinned.erase(index);
-		}
-	}
+    for (auto& [kid, kp] : precom.keys) {
+        if (!keyID.empty() && kid != keyID)
+            continue;
+        if (!kp.rot_keys.contains(index))
+            continue;
+        if (pin) {
+            kp.pinned.insert(index);
+        } else {
+            kp.pinned.erase(index);
+        }
+    }
 }
 
 bool ContextData::IsRotationKeyResident(const int index, const KeyHash& keyID) const {
-	for (const auto& [kid, kp] : precom.keys) {
-		if (!keyID.empty() && kid != keyID)
-			continue;
-		auto it = kp.rot_keys.find(index);
-		if (it != kp.rot_keys.end())
-			return it->second.isResident();
-	}
-	return false;
+    for (const auto& [kid, kp] : precom.keys) {
+        if (!keyID.empty() && kid != keyID)
+            continue;
+        auto it = kp.rot_keys.find(index);
+        if (it != kp.rot_keys.end())
+            return it->second.isResident();
+    }
+    return false;
 }
 
 size_t ContextData::RotationKeyCacheResidentBytes() const {
-	size_t bytes = 0;
-	for (const auto& [keyID, kp] : precom.keys) {
-		bytes += kp.resident_bytes;
-	}
-	return bytes;
+    size_t bytes = 0;
+    for (const auto& [keyID, kp] : precom.keys) {
+        bytes += kp.resident_bytes;
+    }
+    return bytes;
 }
 
 namespace {
@@ -792,741 +879,772 @@ namespace {
  * on the ciphertext's streams rather than on their own, so -- as for KeySwitchingKey::offload --
  * only a full drain proves that freeing them (or using freshly uploaded ones) is safe. */
 void synchronizeContextDevices(const ContextData& cc) {
-	int current;
-	cudaGetDevice(&current);
-	for (int dev : std::set<int>(cc.GPUid.begin(), cc.GPUid.end())) {
-		cudaSetDevice(dev);
-		cudaDeviceSynchronize();
-	}
-	cudaSetDevice(current);
+    int current;
+    cudaGetDevice(&current);
+    for (int dev : std::set<int>(cc.GPUid.begin(), cc.GPUid.end())) {
+        cudaSetDevice(dev);
+        cudaDeviceSynchronize();
+    }
+    cudaSetDevice(current);
 }
 
 /** Free the device limbs of every plaintext in the groups. Synchronizes first. */
 void freeBootBlocks(const ContextData& cc, const std::vector<std::pair<BootCacheBlock*, std::vector<Plaintext>*>>& blocks) {
-	if (blocks.empty())
-		return;
-	synchronizeContextDevices(cc);
-	FIDESlib::gpufree_presynced = true;
-	for (auto& [block, pts] : blocks) {
-		for (auto& pt : *pts) {
-			pt.c0.freeSpecialLimbs();
-			pt.c0.freeGPU();
-		}
-		block->resident = false;
-	}
-	FIDESlib::gpufree_presynced = false;
+    if (blocks.empty())
+        return;
+    synchronizeContextDevices(cc);
+    FIDESlib::gpufree_presynced = true;
+    for (auto& [block, pts] : blocks) {
+        for (auto& pt : *pts) {
+            pt.c0.freeSpecialLimbs();
+            pt.c0.freeGPU();
+        }
+        block->resident = false;
+    }
+    FIDESlib::gpufree_presynced = false;
 }
 
 /** Evict groups, most recently used first, until resident + incoming <= budget. Skips `keep` and
  * groups without a snapshot; overshoots when nothing evictable is left. */
 void evictBootstrapCache(ContextData& cc, const size_t budget, const size_t incoming, const BootCacheBlock* keep) {
-	size_t resident = cc.BootstrapCacheResidentBytes();
-	if (resident + incoming <= budget)
-		return;
-	std::vector<std::pair<BootCacheBlock*, std::vector<Plaintext>*>> candidates;
-	for (auto& [slots, precomp] : cc.precom.boot) {
-		precomp.forEachBlock([&](BootCacheBlock& block, std::vector<Plaintext>& pts) {
-			if (block.resident && block.hasSnapshot() && &block != keep)
-				candidates.emplace_back(&block, &pts);
-		});
-	}
-	std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first->last_use > b.first->last_use; });
-	size_t n = 0;
-	while (n < candidates.size() && resident + incoming > budget) {
-		resident -= candidates[n].first->bytes;
-		++n;
-	}
-	candidates.resize(n);
-	freeBootBlocks(cc, candidates);
+    size_t resident = cc.BootstrapCacheResidentBytes();
+    if (resident + incoming <= budget)
+        return;
+    std::vector<std::pair<BootCacheBlock*, std::vector<Plaintext>*>> candidates;
+    for (auto& [slots, precomp] : cc.precom.boot) {
+        precomp.forEachBlock([&](BootCacheBlock& block, std::vector<Plaintext>& pts) {
+            if (block.resident && block.hasSnapshot() && &block != keep)
+                candidates.emplace_back(&block, &pts);
+        });
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first->last_use > b.first->last_use; });
+    size_t n = 0;
+    while (n < candidates.size() && resident + incoming > budget) {
+        resident -= candidates[n].first->bytes;
+        ++n;
+    }
+    candidates.resize(n);
+    freeBootBlocks(cc, candidates);
 }
 
 } // namespace
 
 BootSnapshot::BootSnapshot(const std::vector<RawPlainText>& raws, const size_t n) {
-	size_t total_rows = 0;
-	for (const auto& raw : raws) {
-		Entry e;
-		e.first_row	  = total_rows;
-		e.moduli	  = raw.moduli;
-		e.noise		  = raw.Noise;
-		e.noise_level = raw.NoiseLevel;
-		e.slots		  = raw.slots;
-		if (raw.moduli.size() != raw.sub_0.size())
-			throw std::invalid_argument("BootSnapshot: plaintext with " + std::to_string(raw.sub_0.size()) + " limbs but " +
-										std::to_string(raw.moduli.size()) + " moduli");
-		total_rows += raw.sub_0.size();
-		entries.push_back(std::move(e));
-	}
-	buffer = HostRows(total_rows, n);
-	std::vector<std::pair<const uint64_t*, uint64_t*>> copies;
-	for (size_t i = 0; i < raws.size(); ++i) {
-		for (size_t r = 0; r < raws[i].sub_0.size(); ++r) {
-			if (raws[i].sub_0[r].size() != n)
-				throw std::invalid_argument("BootSnapshot: limb of " + std::to_string(raws[i].sub_0[r].size()) + " words, expected " +
-											std::to_string(n));
-			copies.emplace_back(raws[i].sub_0[r].data(), buffer.row(entries[i].first_row + r));
-		}
-	}
-#pragma omp parallel for
-	for (size_t i = 0; i < copies.size(); ++i)
-		std::memcpy(copies[i].second, copies[i].first, n * sizeof(uint64_t));
+    size_t total_rows = 0;
+    for (const auto& raw : raws) {
+        Entry e;
+        e.first_row = total_rows;
+        e.moduli = raw.moduli;
+        e.noise = raw.Noise;
+        e.noise_level = raw.NoiseLevel;
+        e.slots = raw.slots;
+        if (raw.moduli.size() != raw.sub_0.size())
+            throw std::invalid_argument("BootSnapshot: plaintext with " + std::to_string(raw.sub_0.size()) + " limbs but " + std::to_string(raw.moduli.size()) + " moduli");
+        total_rows += raw.sub_0.size();
+        entries.push_back(std::move(e));
+    }
+    size_t row_words = 0;
+    for (const auto& raw : raws)
+        row_words = std::max(row_words, static_cast<size_t>(2 * raw.slots));
+    buffer = HostRows(total_rows, row_words);
+    for (size_t i = 0; i < raws.size(); ++i) {
+        const size_t words = 2 * raws[i].slots;
+        if (words == 0 || words > n || n % words != 0)
+            throw std::invalid_argument("BootSnapshot: invalid slot count");
+        for (size_t r = 0; r < raws[i].sub_0.size(); ++r) {
+            const auto& src = raws[i].sub_0[r];
+            if (src.size() != n)
+                throw std::invalid_argument("BootSnapshot: invalid limb size");
+            auto* dst = buffer.row(entries[i].first_row + r);
+            for (size_t j = 0; j < words; ++j)
+                dst[j] = src[j * (n / words)];
+        }
+    }
 }
 
 std::vector<const uint64_t*> BootSnapshot::rows(const size_t i) const {
-	const Entry& e = entries.at(i);
-	std::vector<const uint64_t*> out(e.moduli.size());
-	for (size_t r = 0; r < out.size(); ++r)
-		out[r] = buffer.row(e.first_row + r);
-	return out;
+    const Entry& e = entries.at(i);
+    std::vector<const uint64_t*> out(e.moduli.size());
+    for (size_t r = 0; r < out.size(); ++r)
+        out[r] = buffer.row(e.first_row + r);
+    return out;
 }
 
 void ContextData::SetBootstrapCache(const size_t bytes) {
-	bootstrap_cache_bytes = bytes;
-	evictBootstrapCache(*this, bytes, 0, nullptr);
+    bootstrap_cache_bytes = bytes;
+    evictBootstrapCache(*this, bytes, 0, nullptr);
 }
 
 void ContextData::OffloadBootstrapPrecomputation() {
-	evictBootstrapCache(*this, 0, 0, nullptr);
+    evictBootstrapCache(*this, 0, 0, nullptr);
 }
 
 size_t ContextData::BootstrapCacheResidentBytes() const {
-	size_t bytes = 0;
-	for (const auto& [slots, precomp] : precom.boot) {
-		precomp.forEachBlock([&](const BootCacheBlock& block, const std::vector<Plaintext>&) {
-			if (block.resident)
-				bytes += block.bytes;
-		});
-	}
-	return bytes;
+    size_t bytes = 0;
+    for (const auto& [slots, precomp] : precom.boot) {
+        precomp.forEachBlock([&](const BootCacheBlock& block, const std::vector<Plaintext>&) {
+            if (block.resident)
+                bytes += block.bytes;
+        });
+    }
+    return bytes;
 }
 
 void ContextData::AdmitBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts, std::vector<RawPlainText>&& raws) {
-	block.bytes = 0;
-	for (const auto& pt : pts)
-		block.bytes += pt.limbBytes();
-	block.resident = true;
-	if (!bootstrapPrecomputationLazy() || pts.empty())
-		return;
-	assert(raws.size() == pts.size());
-	block.snapshot = BootSnapshot(raws, static_cast<size_t>(N));
-	raws.clear();
-	// The group is not in precom.boot yet (the precomputation is still being built), so free it
-	// directly rather than through the eviction loop.
-	freeBootBlocks(*this, { { &block, &pts } });
+    block.bytes = 0;
+    for (const auto& pt : pts)
+        block.bytes += pt.limbBytes();
+    block.resident = true;
+    if (!bootstrapPrecomputationLazy() || pts.empty())
+        return;
+    assert(raws.size() == pts.size());
+    block.snapshot = BootSnapshot(raws, static_cast<size_t>(N));
+    raws.clear();
+    // The group is not in precom.boot yet (the precomputation is still being built), so free it
+    // directly rather than through the eviction loop.
+    freeBootBlocks(*this, { { &block, &pts } });
 }
 
 std::vector<Plaintext>& ContextData::AcquireBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts) {
-	block.last_use = ++bootstrap_cache_clock;
-	if (block.resident)
-		return pts;
-	assert(block.hasSnapshot() && block.snapshot.size() == pts.size());
-	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
-	// Evict BEFORE loading, so VRAM peaks at the budget (+ this group if it does not fit alone).
-	evictBootstrapCache(*this, bootstrap_cache_bytes, block.bytes, &block);
-	for (size_t i = 0; i < pts.size(); ++i) {
-		// What Plaintext::load(RawPlainText) does, reading the limbs from the snapshot buffer.
-		const BootSnapshot::Entry& e = block.snapshot.entry(i);
-		CKKS::SetCurrentContext(pts[i].cc_);
-		pts[i].c0.loadConstant(block.snapshot.rows(i), block.snapshot.rowWords(), e.moduli);
-		pts[i].NoiseFactor = e.noise;
-		pts[i].NoiseLevel  = e.noise_level;
-		pts[i].slots	   = e.slots;
-	}
-	block.resident = true;
-	bootstrap_cache_loaded_bytes += block.bytes;
-	synchronizeContextDevices(*this);
-	return pts;
+    block.last_use = ++bootstrap_cache_clock;
+    if (block.resident)
+        return pts;
+    assert(block.hasSnapshot() && block.snapshot.size() == pts.size());
+    CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+    // Evict BEFORE loading, so VRAM peaks at the budget (+ this group if it does not fit alone).
+    evictBootstrapCache(*this, bootstrap_cache_bytes, block.bytes, &block);
+    for (size_t i = 0; i < pts.size(); ++i) {
+        // What Plaintext::load(RawPlainText) does, reading the limbs from the snapshot buffer.
+        const BootSnapshot::Entry& e = block.snapshot.entry(i);
+        CKKS::SetCurrentContext(pts[i].cc_);
+        pts[i].c0.loadConstant(block.snapshot.rows(i), static_cast<size_t>(2 * e.slots), e.moduli, e.slots, true);
+        pts[i].NoiseFactor = e.noise;
+        pts[i].NoiseLevel = e.noise_level;
+        pts[i].slots = e.slots;
+    }
+    block.resident = true;
+    bootstrap_cache_loaded_bytes += block.bytes;
+    synchronizeContextDevices(*this);
+    return pts;
 }
 
 KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID) {
 
-	if (!precom.keys.at(keyID).rot_keys.contains(index)) {
-		throw std::runtime_error("Rotation index " + std::to_string(index) + " not found");
-	}
+    if (!precom.keys.at(keyID).rot_keys.contains(index)) {
+        throw std::runtime_error("Rotation index " + std::to_string(index) + " not found");
+    }
 
-	return precom.keys.at(keyID).ensureResident(index, rotation_key_cache_bytes, rotation_key_eviction_hold == 0);
+    return precom.keys.at(keyID).ensureResident(index, rotation_key_cache_bytes, rotation_key_eviction_hold == 0);
 }
 
 KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID, int slots, int& actual_index) {
-	if (index != 2 * N - 1) {
-		// Handle conjugate key independently
-		index = index % (N / 2);
-		if (index < 0)
-			index += this->N / 2;
-		// if (index > slots / 2)
-		//	index += N / 2 - slots;
+    if (index != 2 * N - 1) {
+        // Handle conjugate key independently
+        index = index % (N / 2);
+        if (index < 0)
+            index += this->N / 2;
+        // if (index > slots / 2)
+        //	index += N / 2 - slots;
 
-		if (!precom.keys.at(keyID).rot_keys.contains(index)) {
-			if (slots != -1 && slots != N / 2) {
-				// std::cout << "Looking for alternative key modulo-slot compatible to " << index << std::endl;
+        if (!precom.keys.at(keyID).rot_keys.contains(index)) {
+            if (slots != -1 && slots != N / 2) {
+                // std::cout << "Looking for alternative key modulo-slot compatible to " << index << std::endl;
 
-				for (int i = 1; i < N / 2 / slots; ++i) {
-					int index_ = (index + i * slots) % (N / 2);
-					if (precom.keys.at(keyID).rot_keys.contains(index_)) {
-						index = index_;
-						break;
-					}
-				}
-			}
-			if (!precom.keys.at(keyID).rot_keys.contains(index)) {
-				std::cout << "Rotation index " << index << "/ " << index - slots << "not found." << std::endl;
-				throw std::runtime_error("Rotation index" + std::to_string(index) + " not found");
-			}
-		}
-	}
+                for (int i = 1; i < N / 2 / slots; ++i) {
+                    int index_ = (index + i * slots) % (N / 2);
+                    if (precom.keys.at(keyID).rot_keys.contains(index_)) {
+                        index = index_;
+                        break;
+                    }
+                }
+            }
+            if (!precom.keys.at(keyID).rot_keys.contains(index)) {
+                std::cout << "Rotation index " << index << "/ " << index - slots << "not found." << std::endl;
+                throw std::runtime_error("Rotation index" + std::to_string(index) + " not found");
+            }
+        }
+    }
 
-	actual_index = index;
-	return precom.keys.at(keyID).ensureResident(index, rotation_key_cache_bytes, rotation_key_eviction_hold == 0);
+    actual_index = index;
+    return precom.keys.at(keyID).ensureResident(index, rotation_key_cache_bytes, rotation_key_eviction_hold == 0);
 }
 
 void ContextData::AddRotationKey(int index, KeySwitchingKey&& ksk) {
-	// index = index % (cc.N / 2);
-	while (index < 0)
-		index += this->N / 2;
-	if (!precom.keys.contains(ksk.keyID))
-		precom.keys[ksk.keyID] = Precomputations::KeyPrecomputations{};
-	const KeyHash keyID = ksk.keyID;
-	precom.keys.at(keyID).rot_keys.emplace(index, std::move(ksk));
-	precom.keys.at(keyID).registerKey(index, precom.keys.at(keyID).rot_keys.at(index));
+    // index = index % (cc.N / 2);
+    while (index < 0)
+        index += this->N / 2;
+    if (!precom.keys.contains(ksk.keyID))
+        precom.keys[ksk.keyID] = Precomputations::KeyPrecomputations{};
+    const KeyHash keyID = ksk.keyID;
+    precom.keys.at(keyID).rot_keys.emplace(index, std::move(ksk));
+    precom.keys.at(keyID).registerKey(index, precom.keys.at(keyID).rot_keys.at(index));
 }
 
 bool ContextData::HasRotationKey(int index, const KeyHash& keyID) {
-	// index = index % (cc.N / 2);
-	while (index < 0)
-		index += this->N / 2;
-	if (!precom.keys.contains(keyID))
-		precom.keys[keyID] = Precomputations::KeyPrecomputations{};
-	return precom.keys.at(keyID).rot_keys.contains(index);
+    // index = index % (cc.N / 2);
+    while (index < 0)
+        index += this->N / 2;
+    if (!precom.keys.contains(keyID))
+        precom.keys[keyID] = Precomputations::KeyPrecomputations{};
+    return precom.keys.at(keyID).rot_keys.contains(index);
 }
 
 void ContextData::AddEvalKey(KeySwitchingKey&& ksk) {
-	if (!precom.keys.contains(ksk.keyID))
-		precom.keys[ksk.keyID] = Precomputations::KeyPrecomputations{};
-	std::unique_ptr<KeySwitchingKey> key       = std::make_unique<KeySwitchingKey>(std::move(ksk));
-	std::unique_ptr<KeySwitchingKey>& dest_key = precom.keys.at(key->keyID).eval_key;
-	dest_key                                   = std::move(key);
+    if (!precom.keys.contains(ksk.keyID))
+        precom.keys[ksk.keyID] = Precomputations::KeyPrecomputations{};
+    std::unique_ptr<KeySwitchingKey> key = std::make_unique<KeySwitchingKey>(std::move(ksk));
+    std::unique_ptr<KeySwitchingKey>& dest_key = precom.keys.at(key->keyID).eval_key;
+    dest_key = std::move(key);
 }
 
 KeySwitchingKey& ContextData::GetEvalKey(const KeyHash& keyID) {
-	assert(precom.keys.contains(keyID));
-	assert(precom.keys[keyID].eval_key);
-	return *precom.keys.at(keyID).eval_key;
+    // Fail loudly (also in Release, where the previous assert() was compiled out): a missing key
+    // tag must not surface as a cryptic std::map::at out_of_range. The usual cause is a
+    // ciphertext that lost/never had its key tag (see Ciphertext::mult's adoption of the
+    // operand tag).
+    if (!precom.keys.contains(keyID) || !precom.keys[keyID].eval_key) {
+        throw std::runtime_error("ContextData::GetEvalKey: no evaluation/relinearization key registered for "
+                                 "key tag '" +
+            keyID + "' (the ciphertext key tag and the uploaded eval key must match)");
+    }
+    return *precom.keys.at(keyID).eval_key;
 }
 
 void ContextData::AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp) {
-	{
-		// Sized from the bytes each group recorded when it was built: under a bootstrap-cache
-		// budget the groups are already offloaded here, so their limbs cannot be inspected.
-		size_t count = 0, bytes = 0;
-		precomp.forEachBlock([&](const BootCacheBlock& block, const std::vector<Plaintext>& pts) {
-			count += pts.size();
-			bytes += block.bytes;
-		});
-		std::cout << "Adding bootstrap precomputation to GPU for " << slots << " slots.\n"
-				  << "Plaintexts loaded: " << count << " ~ " << bytes / (1 << 20) << "MB"
-				  << (bootstrapPrecomputationLazy() ? " (offloaded to host RAM until first use)" : "") << "\n";
-	}
 
-	precom.boot.emplace(slots, std::move(precomp));
+    {
+        // Sized from the bytes each group recorded when it was built: under a bootstrap-cache
+        // budget the groups are already offloaded here, so their limbs cannot be inspected.
+        size_t count = 0, bytes = 0;
+        precomp.forEachBlock([&](const BootCacheBlock& block, const std::vector<Plaintext>& pts) {
+            count += pts.size();
+            bytes += block.bytes;
+        });
+        std::cout << "Adding bootstrap precomputation to GPU for " << slots << " slots.\n"
+                  << "Plaintexts loaded: " << count << " ~ " << bytes / (1 << 20) << "MB"
+                  << (bootstrapPrecomputationLazy() ? " (offloaded to host RAM until first use)" : "") << "\n";
+    }
+
+    precom.boot.emplace(slots, std::move(precomp));
 }
 
 FIDESlib::CKKS::RESCALE_TECHNIQUE ContextData::translateRescalingTechnique(lbcrypto::ScalingTechnique technique) {
-	return technique == lbcrypto::ScalingTechnique::FIXEDAUTO  ? FIDESlib::CKKS::FIXEDAUTO :
-	  technique == lbcrypto::ScalingTechnique::FIXEDMANUAL	   ? FIDESlib::CKKS::FIXEDMANUAL :
-	  technique == lbcrypto::ScalingTechnique::FLEXIBLEAUTOEXT ? FIDESlib::CKKS::FLEXIBLEAUTOEXT :
-	  technique == lbcrypto::ScalingTechnique::FLEXIBLEAUTO	   ? FIDESlib::CKKS::FLEXIBLEAUTO :
-																 FIDESlib::CKKS::NO_RESCALE;
+    return technique == lbcrypto::ScalingTechnique::FIXEDAUTO    ? FIDESlib::CKKS::FIXEDAUTO :
+        technique == lbcrypto::ScalingTechnique::FIXEDMANUAL     ? FIDESlib::CKKS::FIXEDMANUAL :
+        technique == lbcrypto::ScalingTechnique::FLEXIBLEAUTOEXT ? FIDESlib::CKKS::FLEXIBLEAUTOEXT :
+        technique == lbcrypto::ScalingTechnique::FLEXIBLEAUTO    ? FIDESlib::CKKS::FLEXIBLEAUTO :
+                                                                   FIDESlib::CKKS::NO_RESCALE;
 }
 
 void ContextData::PrepareNCCLCommunication() {
 
-	if (GPUid.size() > 1) {
+    if (GPUid.size() > 1) {
 
-		std::set<int> ids;
-		for (int i : GPUid)
-			ids.insert(i);
-		int num_ranks = ids.size();
+        std::set<int> ids;
+        for (int i : GPUid)
+            ids.insert(i);
+        int num_ranks = ids.size();
 
-		bool p2p = true;
-		for (auto& i : ids) {
-			cudaSetDevice(i);
-			for (auto& j : ids) {
-				if (i != j) {
-					int canAccessPeer;
-					cudaDeviceCanAccessPeer(&canAccessPeer, i, j);
-					if (canAccessPeer)
-						cudaDeviceEnablePeerAccess(j, 0);
-					else
-						p2p = false;
+        bool p2p = true;
+        for (auto& i : ids) {
+            cudaSetDevice(i);
+            for (auto& j : ids) {
+                if (i != j) {
+                    int canAccessPeer;
+                    cudaDeviceCanAccessPeer(&canAccessPeer, i, j);
+                    if (canAccessPeer)
+                        cudaDeviceEnablePeerAccess(j, 0);
+                    else
+                        p2p = false;
 
-					cudaDeviceCanAccessPeer(&canAccessPeer, j, i);
-					if (canAccessPeer)
-						cudaDeviceEnablePeerAccess(j, 0);
-					else
-						p2p = false;
-				}
-			}
-		}
-		this->canP2P = p2p;
-		std::cout << "GPU P2P? " << this->canP2P << std::endl;
+                    cudaDeviceCanAccessPeer(&canAccessPeer, j, i);
+                    if (canAccessPeer)
+                        cudaDeviceEnablePeerAccess(j, 0);
+                    else
+                        p2p = false;
+                }
+            }
+        }
+        this->canP2P = p2p;
+        std::cout << "GPU P2P? " << this->canP2P << std::endl;
 
-		/*
-		if (GPUid.size() > 1) {
-			if (this->canP2P)
-				std::cout << "P2P (Nvlink?) detected" << std::endl;
-			else
-				std::cout << "NO P2P" << std::endl;
-		}*/
+        /*
+        if (GPUid.size() > 1) {
+            if (this->canP2P)
+                std::cout << "P2P (Nvlink?) detected" << std::endl;
+            else
+                std::cout << "NO P2P" << std::endl;
+        }*/
 #ifdef NCCL
-		NCCLCHECK(ncclGetUniqueId(&communicatorID));
-		GPUrank.resize(GPUid.size());
-		ncclGroupStart();
-		for (uint32_t i = 0; i < GPUid.size(); i++) {
-			cudaSetDevice(GPUid[i]);
-			if (precom.dev_to_communicator[GPUid[i]] == nullptr) {
-				NCCLCHECK(ncclCommInitRank(GPUrank.data() + i, num_ranks, communicatorID, i));
-				precom.dev_to_communicator[GPUid[i]] = GPUrank.data() + i;
-			} else {
-				GPUrank[i] = *precom.dev_to_communicator[GPUid[i]];
-			}
-		}
-		ncclGroupEnd();
+        NCCLCHECK(ncclGetUniqueId(&communicatorID));
+        GPUrank.resize(GPUid.size());
+        ncclGroupStart();
+        for (uint32_t i = 0; i < GPUid.size(); i++) {
+            cudaSetDevice(GPUid[i]);
+            if (precom.dev_to_communicator[GPUid[i]] == nullptr) {
+                NCCLCHECK(ncclCommInitRank(GPUrank.data() + i, num_ranks, communicatorID, i));
+                precom.dev_to_communicator[GPUid[i]] = GPUrank.data() + i;
+            } else {
+                GPUrank[i] = *precom.dev_to_communicator[GPUid[i]];
+            }
+        }
+        ncclGroupEnd();
 #endif
-		cudaDeviceSynchronize();
-	}
+        cudaDeviceSynchronize();
+    }
 
-	top_limb_stream.resize(2 * GPUid.size());
-	top_limb_stream2.resize(2 * GPUid.size());
-	top_limb_buffer.resize(2 * GPUid.size());
-	top_limb_buffer2.resize(2 * GPUid.size());
-	top_limb_buffer_handle.resize(2 * GPUid.size());
-	top_limb_buffer2_handle.resize(2 * GPUid.size());
-	for (size_t i = 0; i < 2 * GPUid.size(); ++i) {
-		int g = i % GPUid.size();
-		cudaSetDevice(GPUid[g]);
+    top_limb_stream.resize(2 * GPUid.size());
+    top_limb_stream2.resize(2 * GPUid.size());
+    top_limb_buffer.resize(2 * GPUid.size());
+    top_limb_buffer2.resize(2 * GPUid.size());
+    top_limb_buffer_handle.resize(2 * GPUid.size());
+    top_limb_buffer2_handle.resize(2 * GPUid.size());
+    for (size_t i = 0; i < 2 * GPUid.size(); ++i) {
+        int g = i % GPUid.size();
+        cudaSetDevice(GPUid[g]);
 
-		top_limb_stream[g].init(100);
-		top_limb_stream2[g].init(100);
+        top_limb_stream[g].init(100);
+        top_limb_stream2[g].init(100);
 
-		if (GPUid.size() > 1) {
+        if (GPUid.size() > 1) {
 #ifdef NCCL
-			NCCLCHECK(ncclMemAlloc((void**)&top_limb_buffer[i], sizeof(uint64_t) * N));
-			NCCLCHECK(ncclCommRegister(GPUrank[g], top_limb_buffer[i], sizeof(uint64_t) * N, &top_limb_buffer_handle[i]));
-			NCCLCHECK(ncclMemAlloc((void**)&top_limb_buffer2[i], sizeof(uint64_t) * N));
-			NCCLCHECK(ncclCommRegister(GPUrank[g], top_limb_buffer2[i], sizeof(uint64_t) * N, &top_limb_buffer2_handle[i]));
+            NCCLCHECK(ncclMemAlloc((void**)&top_limb_buffer[i], sizeof(uint64_t) * N));
+            NCCLCHECK(ncclCommRegister(GPUrank[g], top_limb_buffer[i], sizeof(uint64_t) * N, &top_limb_buffer_handle[i]));
+            NCCLCHECK(ncclMemAlloc((void**)&top_limb_buffer2[i], sizeof(uint64_t) * N));
+            NCCLCHECK(ncclCommRegister(GPUrank[g], top_limb_buffer2[i], sizeof(uint64_t) * N, &top_limb_buffer2_handle[i]));
 #else
-			cudaMalloc((void**)&top_limb_buffer[i], sizeof(uint64_t) * N);
-			cudaMalloc((void**)&top_limb_buffer2[i], sizeof(uint64_t) * N);
+            cudaMalloc((void**)&top_limb_buffer[i], sizeof(uint64_t) * N);
+            cudaMalloc((void**)&top_limb_buffer2[i], sizeof(uint64_t) * N);
 #endif
-		} else {
-			cudaMalloc((void**)&top_limb_buffer[i], sizeof(uint64_t) * N);
-			cudaMalloc((void**)&top_limb_buffer2[i], sizeof(uint64_t) * N);
-		}
-		// cudaDeviceSynchronize();
-		top_limbptr.emplace_back(top_limb_stream[g], 1, GPUid[g], (void**)&top_limb_buffer[i]);
-		top_limbptr2.emplace_back(top_limb_stream2[g], 1, GPUid[g], (void**)&top_limb_buffer2[i]);
-		gatherStream.resize(GPUid.size());
+        } else {
+            cudaMalloc((void**)&top_limb_buffer[i], sizeof(uint64_t) * N);
+            cudaMalloc((void**)&top_limb_buffer2[i], sizeof(uint64_t) * N);
+        }
+        // cudaDeviceSynchronize();
+        top_limbptr.emplace_back(top_limb_stream[g], 1, GPUid[g], (void**)&top_limb_buffer[i]);
+        top_limbptr2.emplace_back(top_limb_stream2[g], 1, GPUid[g], (void**)&top_limb_buffer2[i]);
+        gatherStream.resize(GPUid.size());
 
-		for (size_t i = 0; i < GPUid.size(); ++i) {
-			gatherStream[i].resize(GPUid.size());
-			for (size_t j = 0; j < GPUid.size(); ++j) {
-				cudaSetDevice(GPUid[j]);
-				gatherStream[i][j].init(100);
-			}
-		}
+        for (size_t i = 0; i < GPUid.size(); ++i) {
+            gatherStream[i].resize(GPUid.size());
+            for (size_t j = 0; j < GPUid.size(); ++j) {
+                cudaSetDevice(GPUid[j]);
+                gatherStream[i][j].init(100);
+            }
+        }
 
-		/* for (int i = 0; i < dnum; ++i) {
-			key_switch_digits.emplace_back(*this, L, true);
-			key_switch_digits.back().generateSpecialLimbs();
-		}*/
+        /* for (int i = 0; i < dnum; ++i) {
+            key_switch_digits.emplace_back(*this, L, true);
+            key_switch_digits.back().generateSpecialLimbs();
+        }*/
 
-		CudaCheckErrorModNoSync;
-	}
+        CudaCheckErrorModNoSync;
+    }
 
-	digitStream.resize(dnum);
-	digitStreamForMemcpyPeer.resize(dnum);
-	for (int i = 0; i < dnum; ++i) {
-		digitStream[i].resize(GPUid.size());
-		digitStreamForMemcpyPeer[i].resize(GPUid.size());
-		for (size_t j = 0; j < GPUid.size(); ++j) {
-			cudaSetDevice(GPUid[j]);
-			digitStream[i][j].init(100);
-			digitStreamForMemcpyPeer[i][j].resize(GPUid.size());
-			for (size_t k = 0; k < GPUid.size(); ++k) {
-				digitStreamForMemcpyPeer[i][j][k].init(100);
-			}
-		}
-	}
+    digitStream.resize(dnum);
+    digitStreamForMemcpyPeer.resize(dnum);
+    for (int i = 0; i < dnum; ++i) {
+        digitStream[i].resize(GPUid.size());
+        digitStreamForMemcpyPeer[i].resize(GPUid.size());
+        for (size_t j = 0; j < GPUid.size(); ++j) {
+            cudaSetDevice(GPUid[j]);
+            digitStream[i][j].init(100);
+            digitStreamForMemcpyPeer[i][j].resize(GPUid.size());
+            for (size_t k = 0; k < GPUid.size(); ++k) {
+                digitStreamForMemcpyPeer[i][j][k].init(100);
+            }
+        }
+    }
 
-	digitStream2.resize(dnum);
-	for (int i = 0; i < dnum; ++i) {
-		digitStream2[i].resize(GPUid.size());
-		for (size_t j = 0; j < GPUid.size(); ++j) {
-			cudaSetDevice(GPUid[j]);
-			digitStream2[i][j].init();
-		}
-	}
+    digitStream2.resize(dnum);
+    for (int i = 0; i < dnum; ++i) {
+        digitStream2[i].resize(GPUid.size());
+        for (size_t j = 0; j < GPUid.size(); ++j) {
+            cudaSetDevice(GPUid[j]);
+            digitStream2[i][j].init();
+        }
+    }
 }
 
 const std::vector<int> ContextData::generateDigitGPUid(std::vector<std::vector<LimbRecord>>& meta, const int L, const int dnum) {
-	std::vector<int> res(dnum);
-	for (size_t i = 0; i < meta.size(); ++i) {
-		for (auto& j : meta[i]) {
-			res[j.digit] = i;
-		}
-	}
-	return res;
+    std::vector<int> res(dnum);
+    for (size_t i = 0; i < meta.size(); ++i) {
+        for (auto& j : meta[i]) {
+            res[j.digit] = i;
+        }
+    }
+    return res;
 }
 
 std::vector<std::vector<LimbRecord>> ContextData::generateSplitSpecialMeta(std::vector<LimbRecord>& specialMeta, const std::vector<int> GPUid) {
-	std::vector<std::vector<LimbRecord>> res(GPUid.size());
+    std::vector<std::vector<LimbRecord>> res(GPUid.size());
 
-	int init = 0;
-	for (uint32_t i = 0; i < GPUid.size(); ++i) {
-		cudaSetDevice(GPUid[i]);
-		int num = (specialMeta.size() - init) / (GPUid.size() - i);
-		for (int j = init; j < init + num; ++j) {
-			res[i].emplace_back(LimbRecord{ .id = specialMeta[j].id, .type = specialMeta[j].type, .digit = specialMeta[j].digit });
-			res[i].back().stream.init();
-		}
-		init += num;
-	}
-	return res;
+    int init = 0;
+    for (uint32_t i = 0; i < GPUid.size(); ++i) {
+        cudaSetDevice(GPUid[i]);
+        int num = (specialMeta.size() - init) / (GPUid.size() - i);
+        for (int j = init; j < init + num; ++j) {
+            res[i].emplace_back(LimbRecord{ .id = specialMeta[j].id, .type = specialMeta[j].type, .digit = specialMeta[j].digit });
+            res[i].back().stream.init();
+        }
+        init += num;
+    }
+    return res;
 }
 
 ContextData::~ContextData() {
-	for (uint32_t i = 0; i < GPUid.size(); ++i) {
-		cudaSetDevice(GPUid[i]);
-		CudaCheckErrorMod;
-	}
-	// map_param_switch is global and outlives us, but the keys in it hold a reference to
-	// the context they were built for. Leaving ours behind makes every later touch of that
-	// store -- clearParamSwitchKeys(), DeregisterAllContexts(), or the map's own destructor
-	// at exit -- destroy a KeySwitchingKey whose context is gone, and ~LimbPartition reads
-	// that reference. Take them with us while `this` is still whole.
-	std::erase_if(map_param_switch, [this](const auto& entry) { return entry.first.first == param || entry.first.second == param; });
-	key_switch_aux.reset(nullptr);
-	//   CudaCheckErrorMod;
-	key_switch_aux2.reset(nullptr);
-	//   CudaCheckErrorMod;
-	for (auto& i : moddown_aux) {
-		i.reset(nullptr);
-	}
-	//   CudaCheckErrorMod;
-	precom.auxPoly.clear();
-	//   CudaCheckErrorMod;
-	precom.monomialCache.clear();
-	//   CudaCheckErrorMod;
-	precom.boot.clear();
-	//   CudaCheckErrorMod;
-	for (size_t i = 0; i < top_limbptr.size(); ++i) {
-		int g = i % GPUid.size();
-		cudaSetDevice(GPUid[g]);
-		if (GPUid.size() > 1) {
+    // Drop the registry entries while all members are still alive (my_range stops the lifetime after
+    // this body runs).
+    CudaNvtxLifetimeUnregisterBytes(loc, this, "Precomputed");
+    CudaNvtxLifetimeUnregisterBytes(loc, this, "Buffers");
+    for (uint32_t i = 0; i < GPUid.size(); ++i) {
+        cudaSetDevice(GPUid[i]);
+        CudaCheckErrorMod;
+    }
+    // map_param_switch is global and outlives us, but the keys in it hold a reference to
+    // the context they were built for. Leaving ours behind makes every later touch of that
+    // store -- clearParamSwitchKeys(), DeregisterAllContexts(), or the map's own destructor
+    // at exit -- destroy a KeySwitchingKey whose context is gone, and ~LimbPartition reads
+    // that reference. Take them with us while `this` is still whole.
+    std::erase_if(map_param_switch, [this](const auto& entry) { return entry.first.first == param || entry.first.second == param; });
+    key_switch_aux.reset(nullptr);
+    //   CudaCheckErrorMod;
+    key_switch_aux2.reset(nullptr);
+    //   CudaCheckErrorMod;
+    for (auto& i : moddown_aux) {
+        i.reset(nullptr);
+    }
+    //   CudaCheckErrorMod;
+    precom.auxPoly.clear();
+    //   CudaCheckErrorMod;
+    precom.monomialCache.clear();
+    //   CudaCheckErrorMod;
+    precom.boot.clear();
+    //   CudaCheckErrorMod;
+    for (size_t i = 0; i < top_limbptr.size(); ++i) {
+        int g = i % GPUid.size();
+        cudaSetDevice(GPUid[g]);
+        if (GPUid.size() > 1) {
 #ifdef NCCL
-			if (top_limb_buffer_handle[i])
-				NCCLCHECK(ncclCommDeregister(GPUrank[g], top_limb_buffer_handle[i]));
-			if (top_limb_buffer2_handle[i])
-				NCCLCHECK(ncclCommDeregister(GPUrank[g], top_limb_buffer2_handle[i]));
-			NCCLCHECK(ncclMemFree(top_limb_buffer[i]));
-			NCCLCHECK(ncclMemFree(top_limb_buffer2[i]));
+            if (top_limb_buffer_handle[i])
+                NCCLCHECK(ncclCommDeregister(GPUrank[g], top_limb_buffer_handle[i]));
+            if (top_limb_buffer2_handle[i])
+                NCCLCHECK(ncclCommDeregister(GPUrank[g], top_limb_buffer2_handle[i]));
+            NCCLCHECK(ncclMemFree(top_limb_buffer[i]));
+            NCCLCHECK(ncclMemFree(top_limb_buffer2[i]));
 #else
 
-			cudaFree(top_limb_buffer[i]);
-			cudaFree(top_limb_buffer2[i]);
+            cudaFree(top_limb_buffer[i]);
+            cudaFree(top_limb_buffer2[i]);
 #endif
-		} else {
-			cudaFree(top_limb_buffer[i]);
-			cudaFree(top_limb_buffer2[i]);
-		}
-		top_limbptr[i].free(top_limb_stream[g]);
-		top_limbptr2[i].free(top_limb_stream2[g]);
-	}
-	top_limbptr.clear();
-	top_limbptr2.clear();
-	CudaCheckErrorMod;
+        } else {
+            cudaFree(top_limb_buffer[i]);
+            cudaFree(top_limb_buffer2[i]);
+        }
+        top_limbptr[i].free(top_limb_stream[g]);
+        top_limbptr2[i].free(top_limb_stream2[g]);
+    }
+    top_limbptr.clear();
+    top_limbptr2.clear();
+    CudaCheckErrorMod;
 #ifdef NCCL
-	NCCLCHECK(ncclGroupStart());
-	for (auto rank : precom.dev_to_communicator) {
-		if (rank.second) {
-			cudaSetDevice(rank.first);
-			NCCLCHECK(ncclCommFinalize(*rank.second));
-			// CudaCheckErrorMod;
-			NCCLCHECK(ncclCommDestroy(*rank.second));
-			// CudaCheckErrorMod;
-		}
-	}
-	NCCLCHECK(ncclGroupEnd());
+    NCCLCHECK(ncclGroupStart());
+    for (auto rank : precom.dev_to_communicator) {
+        if (rank.second) {
+            cudaSetDevice(rank.first);
+            NCCLCHECK(ncclCommFinalize(*rank.second));
+            // CudaCheckErrorMod;
+            NCCLCHECK(ncclCommDestroy(*rank.second));
+            // CudaCheckErrorMod;
+        }
+    }
+    NCCLCHECK(ncclGroupEnd());
 #endif
-	Ciphertext::clearOpRecord();
+    Ciphertext::clearOpRecord();
 }
 
 bool ContextData::hasAuxilarPoly() const {
-	return precom.auxPoly.empty();
+    return precom.auxPoly.empty();
 }
 
 RNSPoly ContextData::getAuxilarPoly() {
-
-	if (precom.auxPoly.empty()) {
-		return RNSPoly(*this);
-	} else {
-		RNSPoly res(std::move(precom.auxPoly.back()));
-		precom.auxPoly.pop_back();
-		return res;
-	}
+    if (precom.auxPoly.empty()) {
+        return RNSPoly(*this);
+    } else {
+        RNSPoly res(std::move(precom.auxPoly.back()));
+        precom.auxPoly.pop_back();
+        return res;
+    }
 }
 
 void ContextData::returnAuxilarPoly(RNSPoly&& c) {
-	// The auxiliary RNSPoly cache sits above GPUmalloc's pool. An unbounded cache can
-	// strand tens of GiB in full-size polynomials that unrelated allocations (notably
-	// Plaintext::grow) cannot reuse. Keep upstream behavior unless an explicit profiling/
-	// deployment limit is requested.
-	static const size_t cacheLimit = [] {
-		const char* value = std::getenv("FIDESLIB_AUX_POLY_CACHE_LIMIT");
-		if (!value || !*value)
-			return std::numeric_limits<size_t>::max();
-		char* end = nullptr;
-		const unsigned long long parsed = std::strtoull(value, &end, 10);
-		return end != value && *end == '\0' ? static_cast<size_t>(parsed)
-		                                     : std::numeric_limits<size_t>::max();
-	}();
-	if (precom.auxPoly.size() < cacheLimit)
-		precom.auxPoly.emplace_back(std::move(c));
+    // The auxiliary RNSPoly cache sits above GPUmalloc's pool. An unbounded cache can
+    // strand tens of GiB in full-size polynomials that unrelated allocations (notably
+    // Plaintext::grow) cannot reuse. Keep upstream behavior unless an explicit profiling/
+    // deployment limit is requested.
+    static const size_t cacheLimit = [] {
+        const char* value = std::getenv("FIDESLIB_AUX_POLY_CACHE_LIMIT");
+        if (!value || !*value)
+            return std::numeric_limits<size_t>::max();
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        return end != value && *end == '\0' ? static_cast<size_t>(parsed) : std::numeric_limits<size_t>::max();
+    }();
+    if (precom.auxPoly.size() < cacheLimit)
+        precom.auxPoly.emplace_back(std::move(c));
 }
 
 void ContextData::trimAuxilarPoly(size_t size) {
-	while (precom.auxPoly.size() > size)
-		precom.auxPoly.pop_back();
-	// precom.auxPoly.erase(precom.auxPoly.begin() + std::min(size, precom.auxPoly.size()), precom.auxPoly.end());
+    while (precom.auxPoly.size() > size)
+        precom.auxPoly.pop_back();
+    // precom.auxPoly.erase(precom.auxPoly.begin() + std::min(size, precom.auxPoly.size()), precom.auxPoly.end());
 }
 
 void ContextData::clearAuxilarPoly() {
-	// The pool can hold hundreds of RNSPolys with tens of pooled limb buffers each. Every pooled free records an event on
-	// the freeing stream and makes the pool stream wait on it, so a clear costs thousands of event operations (nsys, H200,
-	// N = 2^16, 104 polys: 4816 cudaEventRecord + 4816 cudaStreamWaitEvent, 12.6 ms of host time). After one device-wide
-	// synchronize no buffer is in use any more, so those waits are redundant: skip them while the pool is being cleared.
-	// The polys span every GPU of the context, so every one of them has to be synchronized, not just the current one.
-	int current;
-	cudaGetDevice(&current);
-	for (int dev : std::set<int>(GPUid.begin(), GPUid.end())) {
-		cudaSetDevice(dev);
-		cudaDeviceSynchronize();
-	}
-	cudaSetDevice(current);
-	FIDESlib::gpufree_presynced = true;
-	precom.auxPoly.clear();
-	FIDESlib::gpufree_presynced = false;
+    // The pool can hold hundreds of RNSPolys with tens of pooled limb buffers each. Every pooled free records an event on
+    // the freeing stream and makes the pool stream wait on it, so a clear costs thousands of event operations (nsys, H200,
+    // N = 2^16, 104 polys: 4816 cudaEventRecord + 4816 cudaStreamWaitEvent, 12.6 ms of host time). After one device-wide
+    // synchronize no buffer is in use any more, so those waits are redundant: skip them while the pool is being cleared.
+    // The polys span every GPU of the context, so every one of them has to be synchronized, not just the current one.
+    int current;
+    cudaGetDevice(&current);
+    for (int dev : std::set<int>(GPUid.begin(), GPUid.end())) {
+        cudaSetDevice(dev);
+        cudaDeviceSynchronize();
+    }
+    cudaSetDevice(current);
+    FIDESlib::gpufree_presynced = true;
+    precom.auxPoly.clear();
+    FIDESlib::gpufree_presynced = false;
 }
 
 void ContextData::clearAutomorphismKeys(const KeyHash& KeyID) {
-	for (auto& i : precom.keys) {
-		if (KeyID.empty() || KeyID == i.first) {
-			i.second.rot_keys.clear();
-			i.second.resetCacheBookkeeping();
-		}
-	}
+    for (auto& i : precom.keys) {
+        if (KeyID.empty() || KeyID == i.first) {
+            i.second.rot_keys.clear();
+            i.second.resetCacheBookkeeping();
+        }
+    }
 }
 
 void ContextData::clearEvalMultKeys(const KeyHash& KeyID) {
-	for (auto& i : precom.keys) {
-		if (KeyID.empty() || KeyID == i.first) {
-			i.second.eval_key.reset();
-		}
-	}
+    for (auto& i : precom.keys) {
+        if (KeyID.empty() || KeyID == i.first) {
+            i.second.eval_key.reset();
+        }
+    }
 }
 
 void ContextData::clearBootPrecomputation(const int slots) {
-	if (slots == -1)
-		precom.boot.clear();
-	else {
-		if (precom.boot.contains(slots)) {
-			precom.boot.erase(slots);
-		}
-	}
+    if (slots == -1)
+        precom.boot.clear();
+    else {
+        if (precom.boot.contains(slots)) {
+            precom.boot.erase(slots);
+        }
+    }
 }
 
 void ContextData::clearParamSwitchKeys(const KeyHash& KeyID) {
 
-	if (KeyID.empty())
-		map_param_switch.clear();
-	else {
-		for (auto& i : map_param_switch) {
-			if ((i.first.first == this->param || i.first.second == this->param)) {
-				if (i.second) {
-					if (i.second->contains(KeyID)) {
-						i.second->erase(KeyID);
-					}
-				}
-			}
-		}
-	}
+    if (KeyID.empty())
+        map_param_switch.clear();
+    else {
+        for (auto& i : map_param_switch) {
+            if ((i.first.first == this->param || i.first.second == this->param)) {
+                if (i.second) {
+                    if (i.second->contains(KeyID)) {
+                        i.second->erase(KeyID);
+                    }
+                }
+            }
+        }
+    }
 }
 
 Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& devs) {
+    // The per-device stream / memory pools are `[MAXG]` arrays indexed by device id and are touched
+    // while the ContextData below is being set up, before any constants check could run (the
+    // `[MAXD]`/`[MAXP]` tables are validated inside SetupConstants).
+    if (devs.size() > (size_t)MAXG)
+        throw std::runtime_error("FIDESlib: cannot build a context for " + std::to_string(devs.size()) +
+            " devices: the per-device pools hold MAXG = " + std::to_string(MAXG) + ". Use fewer devices, or raise MAXG in src/forwardDefs.cuh and rebuild.");
 
-	ContextData* data = new ContextData(param, devs);
-	if (OK) {
-		// Context cc();
-		Context cc(data); //= std::make_shared<ContextData>(param, devs);
-		// Context cc;
+    ContextData* data = new ContextData(param, devs);
+    if (OK) {
+        // Context cc();
+        Context cc(data); //= std::make_shared<ContextData>(param, devs);
+        // Context cc;
 
-		map_param_context[data->param] = cc;
+        map_param_context[data->param] = cc;
 
-		// if (!currentContext)
-		SetCurrentContext(cc);
-	} else {
-		SetCurrentContext(map_param_context[data->param]);
-		delete data;
-	}
-	Context res = GetCurrentContext();
-	return res;
+        // if (!currentContext)
+        SetCurrentContext(cc);
+    } else {
+        SetCurrentContext(map_param_context[data->param]);
+        delete data;
+    }
+    Context res = GetCurrentContext();
+    return res;
 }
 
 void DeregisterCryptoContextGPU(const Parameters& param) {
-	map_param_context.erase(param);
-	if (currentContext && currentContext->param == param) {
-		currentContext.reset();
-	}
+    // Purge the secret-switching keys that touch this context BEFORE its last shared_ptr can be
+    // released. KeySwitchingKey / RNSPoly / LimbPartition hold a raw ContextData& (not a
+    // shared_ptr), so a firing key would dereference a dead context: observed as a use-after-free
+    // SIGSEGV inside LimbPartition::~LimbPartition at process teardown when the api
+    // CryptoContextImpl destructor released its GPU context (DeregisterCryptoContextGPU +
+    // gpu.reset()) while the ENCAPS switching keys were still registered in map_param_switch.
+    // Clearing the per-pair key maps here runs the key destructors while the context is still
+    // alive in map_param_context (erased below).
+    for (auto& i : map_param_switch) {
+        if (i.first.first == param || i.first.second == param) {
+            i.second->clear();
+        }
+    }
+    map_param_context.erase(param);
+    if (currentContext && currentContext->param == param) {
+        currentContext.reset();
+    }
 }
 
 void DeregisterCryptoContextGPU(Context cc) {
-	DeregisterCryptoContextGPU(cc->param);
+    DeregisterCryptoContextGPU(cc->param);
 }
 
 void TrimGPUMemoryPool(Context cc) {
-	for (int id : cc->GPUid) {
-		GPUtrim(id);
-	}
+    for (int id : cc->GPUid) {
+        GPUtrim(id);
+    }
 }
 
 Context GetCurrentContext() {
-	return currentContext;
+    return currentContext;
 }
 
 __global__ void dummy() {
 }
 
 void SetCurrentContext(Context& cc) {
-	if (cc != currentContext) {
-		CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
-		currentContext = cc;
-		if (currentContext) {
+    if (cc != currentContext) {
+        CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+        currentContext = cc;
+        if (currentContext) {
 
-			parallel_for(0, currentContext->GPUid.size(), 1, [&](int i) {
-				// for (size_t i = 0; i < currentContext->GPUid.size(); ++i) {
-				cudaSetDevice(currentContext->GPUid[i]);
-				// cudaDeviceSynchronize();
-				cudaMemcpyToSymbolAsync(FIDESlib::constants, &(currentContext->precom.constants[i]), sizeof(FIDESlib::Constants), 0, cudaMemcpyHostToDevice, 0);
-				// cudaDeviceSynchronize();
-			});
-		}
-	}
+            parallel_for(0, currentContext->GPUid.size(), 1, [&](int i) {
+                // for (size_t i = 0; i < currentContext->GPUid.size(); ++i) {
+                cudaSetDevice(currentContext->GPUid[i]);
+                // cudaDeviceSynchronize();
+                cudaMemcpyToSymbolAsync(FIDESlib::constants, &(currentContext->precom.constants[i]), sizeof(FIDESlib::Constants), 0, cudaMemcpyHostToDevice, 0);
+                // cudaDeviceSynchronize();
+            });
+        }
+    }
 }
 
 void AddSecretSwitchingKey(KeySwitchingKey&& ksk_a, KeySwitchingKey&& ksk_b) {
 
-	KeyHash id_a        = ksk_a.keyID;
-	KeyHash id_b        = ksk_b.keyID;
-	Parameters& param_a = ksk_a.cc->param;
-	Parameters& param_b = ksk_b.cc->param;
+    KeyHash id_a = ksk_a.keyID;
+    KeyHash id_b = ksk_b.keyID;
+    Parameters& param_a = ksk_a.cc->param;
+    Parameters& param_b = ksk_b.cc->param;
 
-	{
-		std::pair<std::pair<Parameters, Parameters>, std::unique_ptr<std::map<KeyHash, KeySwitchingKey>>>* entry = nullptr;
-		for (auto& i : map_param_switch) {
-			if (i.first.first == param_a && i.first.second == param_b) {
-				entry = &i;
-			}
-		}
+    {
+        std::pair<std::pair<Parameters, Parameters>, std::unique_ptr<std::map<KeyHash, KeySwitchingKey>>>* entry = nullptr;
+        for (auto& i : map_param_switch) {
+            if (i.first.first == param_a && i.first.second == param_b) {
+                entry = &i;
+            }
+        }
 
-		if (!entry) {
-			map_param_switch.emplace_back(std::pair<Parameters, Parameters>{ param_a, param_b }, std::make_unique<std::map<KeyHash, KeySwitchingKey>>());
-			entry = &map_param_switch.back();
-		}
-		entry->second->emplace(id_b, std::move(ksk_b));
-	}
+        if (!entry) {
+            map_param_switch.emplace_back(std::pair<Parameters, Parameters>{ param_a, param_b }, std::make_unique<std::map<KeyHash, KeySwitchingKey>>());
+            entry = &map_param_switch.back();
+        }
+        entry->second->emplace(id_b, std::move(ksk_b));
+    }
 
-	{
-		std::pair<std::pair<Parameters, Parameters>, std::unique_ptr<std::map<KeyHash, KeySwitchingKey>>>* entry = nullptr;
-		for (auto& i : map_param_switch) {
-			if (i.first.first == param_b && i.first.second == param_a) {
-				entry = &i;
-			}
-		}
+    {
+        std::pair<std::pair<Parameters, Parameters>, std::unique_ptr<std::map<KeyHash, KeySwitchingKey>>>* entry = nullptr;
+        for (auto& i : map_param_switch) {
+            if (i.first.first == param_b && i.first.second == param_a) {
+                entry = &i;
+            }
+        }
 
-		if (!entry) {
-			map_param_switch.emplace_back(std::pair<Parameters, Parameters>{ param_b, param_a }, std::make_unique<std::map<KeyHash, KeySwitchingKey>>());
-			entry = &map_param_switch.back();
-		}
-		entry->second->emplace(id_a, std::move(ksk_a));
-	}
+        if (!entry) {
+            map_param_switch.emplace_back(std::pair<Parameters, Parameters>{ param_b, param_a }, std::make_unique<std::map<KeyHash, KeySwitchingKey>>());
+            entry = &map_param_switch.back();
+        }
+        entry->second->emplace(id_a, std::move(ksk_a));
+    }
 
-	/*
-	if (!map_param_switch[{param_a, param_b}])
-		map_param_switch[{param_a, param_b}] = std::make_shared<std::map<KeyHash, KeySwitchingKey>>();
-	map_param_switch[{param_a, param_b}]->emplace(id_b, std::move(ksk_b));
+    /*
+    if (!map_param_switch[{param_a, param_b}])
+        map_param_switch[{param_a, param_b}] = std::make_shared<std::map<KeyHash, KeySwitchingKey>>();
+    map_param_switch[{param_a, param_b}]->emplace(id_b, std::move(ksk_b));
 
-	if (!map_param_switch[{param_b, param_a}])
-		map_param_switch[{param_b, param_a}] = std::make_shared<std::map<KeyHash, KeySwitchingKey>>();
-	map_param_switch[{param_b, param_a}]->emplace(id_a, std::move(ksk_a));
-	*/
+    if (!map_param_switch[{param_b, param_a}])
+        map_param_switch[{param_b, param_a}] = std::make_shared<std::map<KeyHash, KeySwitchingKey>>();
+    map_param_switch[{param_b, param_a}]->emplace(id_a, std::move(ksk_a));
+    */
 }
 
 bool HasSecretSwitchingKey(const Context& a, const Context& b, const KeyHash& key_b) {
-	/*
-	if (map_param_switch[{a->param, b->param}] != nullptr) {
-		if (map_param_switch[{a->param, b->param}]->contains(key_b)) {
-			return true;
-		}
-	}
-	*/
-	for (auto& i : map_param_switch) {
-		if (i.first.first == a->param && i.first.second == b->param) {
-			return i.second->contains(key_b);
-		}
-	}
-	return false;
+    /*
+    if (map_param_switch[{a->param, b->param}] != nullptr) {
+        if (map_param_switch[{a->param, b->param}]->contains(key_b)) {
+            return true;
+        }
+    }
+    */
+    for (auto& i : map_param_switch) {
+        if (i.first.first == a->param && i.first.second == b->param) {
+            return i.second->contains(key_b);
+        }
+    }
+    return false;
 }
 
 KeySwitchingKey& GetSecretSwitchingKey(const Context& a, const Context& b, const KeyHash& key_b) {
-	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
-	/*
-	std::pair<Parameters, Parameters> param_key{a->param, b->param};
-	if (map_param_switch.contains(param_key)) {
-		auto entry = map_param_switch.find(param_key);
-		if (entry != map_param_switch.end() && entry->second) {
-			auto & key = entry->second->find(key_b);
-			if (key != entry->second->end()) {
-				return key->second;
-			}
-		}
-	}
-	*/
-	for (auto& i : map_param_switch) {
-		if (i.first.first == a->param && i.first.second == b->param) {
-			auto key = i.second->find(key_b);
-			if (key != i.second->end()) {
-				return key->second;
-			}
-		}
-	}
+    CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+    /*
+    std::pair<Parameters, Parameters> param_key{a->param, b->param};
+    if (map_param_switch.contains(param_key)) {
+        auto entry = map_param_switch.find(param_key);
+        if (entry != map_param_switch.end() && entry->second) {
+            auto & key = entry->second->find(key_b);
+            if (key != entry->second->end()) {
+                return key->second;
+            }
+        }
+    }
+    */
+    for (auto& i : map_param_switch) {
+        if (i.first.first == a->param && i.first.second == b->param) {
+            auto key = i.second->find(key_b);
+            if (key != i.second->end()) {
+                return key->second;
+            }
+        }
+    }
 
-	assert("No key present");
-	exit(-1);
+    throw std::runtime_error("No secret switching key present for the requested parameter pair");
 }
 
 int32_t normalyzeIndex(int32_t index, int32_t slots, int32_t N) {
-	index = index % slots;
-	if (index < 0)
-		index += slots;
-	if (index > slots / 2)
-		index += N / 2 - slots;
-	return index;
+    index = index % slots;
+    if (index < 0)
+        index += slots;
+    if (index > slots / 2)
+        index += N / 2 - slots;
+    return index;
 }
 
 void DeregisterAllContexts() {
-	map_param_switch.clear();
-	map_param_context.clear();
-	currentContext.reset();
+    map_param_switch.clear();
+    map_param_context.clear();
+    currentContext.reset();
 }
 
 } // namespace FIDESlib::CKKS

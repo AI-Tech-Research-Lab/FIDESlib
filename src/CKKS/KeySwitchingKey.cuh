@@ -13,68 +13,84 @@
 
 namespace FIDESlib {
 namespace CKKS {
-
 class KeySwitchingKey {
-	static constexpr const char* loc{ "KeySwitchingKey" };
-	CudaNvtxRange my_range;
+    static constexpr const char* loc{ "KeySwitchingKey" };
+    CudaNvtxRange my_range;
 
   public:
-	KeyHash keyID;
-	Context& cc;
-	RNSPoly a;
-	RNSPoly b;
+    KeyHash keyID;
+    Context& cc;
+    RNSPoly a;
+    RNSPoly b;
 
-	/** Host-side (RAM) snapshot of the raw key material. Retained when the key is created
-	 * with Initialize(..., lazy = true) (i.e. the rotation-key VRAM cache is active); it is
-	 * what offload()/ensureResident() round-trip through. Empty (has_snapshot == false)
-	 * otherwise: such keys cannot be offloaded and are treated as pinned by the cache.
-	 * The limbs sit in one pinned buffer (see HostRows), so a reload is a straight DMA. */
-	struct Snapshot {
-		HostRows rows;										 ///< every limb of a, then of b, digit by digit
-		std::vector<std::vector<std::vector<uint64_t>>> moduli; ///< [poly][digit][limb], as RawKeySwitchKey::r_key_moduli
-		std::vector<std::vector<size_t>> first_row;			 ///< [poly][digit]: index of the digit's first limb
-	} snapshot;
-	bool resident	 = false;
-	bool has_snapshot = false;
+    /** Host-side (RAM) snapshot of the raw key material. Retained when the key is created
+     * with Initialize(..., lazy = true) (i.e. the rotation-key VRAM cache is active); it is
+     * what offload()/ensureResident() round-trip through. Empty (has_snapshot == false)
+     * otherwise: such keys cannot be offloaded and are treated as pinned by the cache.
+     * The limbs sit in one pinned buffer (see HostRows), so a reload is a straight DMA. */
+    struct Snapshot {
+        HostRows rows;                                          ///< every limb of a, then of b, digit by digit
+        std::vector<std::vector<std::vector<uint64_t>>> moduli; ///< [poly][digit][limb], as RawKeySwitchKey::r_key_moduli
+        std::vector<std::vector<size_t>> first_row;             ///< [poly][digit]: index of the digit's first limb
+    } snapshot;
 
-	explicit KeySwitchingKey(Context& cc);
+    bool resident = false;
+    bool has_snapshot = false;
 
-	/** Load the key into VRAM from `rkk`. With lazy = true (rotation-key VRAM cache
-	 * active), no VRAM is allocated here at all: only a host RAM snapshot is kept and
-	 * the limbs are generated on first use via ensureResident(). */
-	void Initialize(RawKeySwitchKey& rkk, bool lazy = false);
+    explicit KeySwitchingKey(Context& cc);
+    KeySwitchingKey(KeySwitchingKey&& k) noexcept;
+    ~KeySwitchingKey();
 
-	[[nodiscard]] bool isResident() const { return resident; }
-	[[nodiscard]] bool hasSnapshot() const { return has_snapshot; }
+    /** Load the key into VRAM from `rkk`. With lazy = true (rotation-key VRAM cache
+     * active), no VRAM is allocated here at all: only a host RAM snapshot is kept and
+     * the limbs are generated on first use via ensureResident(). */
+    void Initialize(RawKeySwitchKey& rkk, bool lazy = false);
 
-	/** VRAM bytes occupied by this key's DECOMP/DIGIT limbs (plus multi-GPU regular
-	 * limbs). Computed from context metadata in Initialize(), valid for resident and
-	 * offloaded keys alike. */
-	[[nodiscard]] size_t limbBytes() const { return limb_bytes; }
+    [[nodiscard]] bool isResident() const {
+        return resident;
+    }
 
-	/** Free every VRAM limb of a and b, keeping the host snapshot for a later
-	 * ensureResident(). No-op if already offloaded. Requires has_snapshot.
-	 * Synchronizes every device first: KSK limbs are read by kernels enqueued on other
-	 * partitions'/auxiliary streams (dotKSK, fused hoisting), so stream-ordered frees
-	 * alone cannot prove safety. */
-	void offload();
+    [[nodiscard]] bool hasSnapshot() const {
+        return has_snapshot;
+    }
 
-	/** (Re)generate the VRAM limbs from the host snapshot. No-op if resident.
-	 * Synchronizes before returning, since callers launch kernels right after. */
-	void ensureResident();
+    /** VRAM bytes occupied by this key's DECOMP/DIGIT limbs (plus multi-GPU regular
+     * limbs). Computed from context metadata in Initialize(), valid for resident and
+     * offloaded keys alike. */
+    [[nodiscard]] size_t limbBytes() const {
+        return limb_bytes;
+    }
+
+    /** Free every VRAM limb of a and b, keeping the host snapshot for a later
+     * ensureResident(). No-op if already offloaded. Requires has_snapshot.
+     * Synchronizes every device first: KSK limbs are read by kernels enqueued on other
+     * partitions'/auxiliary streams (dotKSK, fused hoisting), so stream-ordered frees
+     * alone cannot prove safety. */
+    void offload();
+
+    /** (Re)generate the VRAM limbs from the host snapshot. No-op if resident.
+     * Synchronizes before returning, since callers launch kernels right after. */
+    void ensureResident();
 
   private:
-	void loadLimbs(RawKeySwitchKey& rkk);
-	void loadLimbsFromSnapshot();
-	/** Allocate the DECOMP/DIGIT limbs (and, multi-GPU, the regular ones) before an upload. */
-	void allocateLimbs();
-	/** Wait for every device of the context: uploads from pinned memory are asynchronous and
-	 * land on several devices' streams, while callers launch kernels right after. */
-	void synchronizeDevices();
-	[[nodiscard]] size_t computeLimbBytes() const;
-	size_t limb_bytes = 0;
-};
+    void loadLimbs(RawKeySwitchKey& rkk);
+    void loadLimbsFromSnapshot();
+    /** Allocate the DECOMP/DIGIT limbs (and, multi-GPU, the regular ones) before an upload. */
+    void allocateLimbs();
+    /** Wait for every device of the context: uploads from pinned memory are asynchronous and
+     * land on several devices' streams, while callers launch kernels right after. */
+    void synchronizeDevices();
+    [[nodiscard]] size_t computeLimbBytes() const;
+    size_t limb_bytes = 0;
 
+  public:
+    // Sparse secret-encapsulation (GHS) switching key: a/b live over the sparse basis Ql*P' and
+    // are used directly (no RNS digit decomposition), so they are loaded as plain RNSPolys.
+    void InitializeSparse(RawKeySwitchKey& rkk);
+
+    /** Total GPU bytes held by this key (its a + b polynomials). */
+    uint64_t getMemoryUsage() const;
+};
 } // namespace CKKS
 } // namespace FIDESlib
 

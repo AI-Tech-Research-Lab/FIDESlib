@@ -8,6 +8,10 @@ endif()
 ############### Macros ###################
 
 include(CMakeFindDependencyMacro)
+find_dependency(OpenFHE 1.6.1 CONFIG EXACT PATHS "@OPENFHE_INSTALL_PREFIX@" NO_DEFAULT_PATH)
+target_include_directories(fideslib::fideslib SYSTEM INTERFACE
+    "${OpenFHE_INCLUDE}"
+    "${OpenFHE_INCLUDE}/core" "${OpenFHE_INCLUDE}/pke" "${OpenFHE_INCLUDE}/binfhe")
 
 ############### Exports ###################
 

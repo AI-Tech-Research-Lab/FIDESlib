@@ -21,29 +21,31 @@
 
 #if 0
 #define CUDA_CHECK(call)                                                                                \
-	do {                                                                                                \
-		cudaError_t err__ = (call);                                                                     \
-		if (err__ != cudaSuccess) {                                                                     \
-			fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(err__), __FILE__, __LINE__); \
-			std::exit(EXIT_FAILURE);                                                                    \
-		}                                                                                               \
-	} while (0)
+    do {                                                                                                \
+        cudaError_t err__ = (call);                                                                     \
+        if (err__ != cudaSuccess) {                                                                     \
+            fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(err__), __FILE__, __LINE__); \
+            std::exit(EXIT_FAILURE);                                                                    \
+        }                                                                                               \
+    } while (0)
 
 // Adjust this if you change the body of the loop
 #ifndef OPS_PER_ITER
 #define OPS_PER_ITER 8 // 4 int32 ALU ops per loop iteration
 #endif
 
-__global__ void int32_iops_kernel(int* out, int iters) {
+__global__ void int32_iops_kernel(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	int4 x	 = { tid, tid << 1, tid << 2, tid << 3 };
-	int4 y	 = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	int4 acc = { 0, 0, 0, 0 };
+    int4 x = {tid, tid << 1, tid << 2, tid << 3};
+    int4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    int4 acc = {0, 0, 0, 0};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = x.x + y.x;
 		x.y = x.y + y.y;
@@ -59,16 +61,18 @@ __global__ void int32_iops_kernel(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w;
 }
 
-__global__ void int32_xor(int* out, int iters) {
+__global__ void int32_xor(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	int4 x	 = { tid, tid << 1, tid << 2, tid << 3 };
-	int4 y	 = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	int4 acc = { 0, 0, 0, 0 };
+    int4 x = {tid, tid << 1, tid << 2, tid << 3};
+    int4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    int4 acc = {0, 0, 0, 0};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = x.x ^ y.x;
 		x.y = x.y ^ y.y;
@@ -84,17 +88,19 @@ __global__ void int32_xor(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w;
 }
 
-__global__ void int32_mult(int* out, int iters) {
+__global__ void int32_mult(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	int4 x	 = { tid, tid << 1, tid << 2, tid << 3 };
-	int4 y	 = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	int4 z	 = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	int4 acc = { 0, 0, 0, 0 };
+    int4 x = {tid, tid << 1, tid << 2, tid << 3};
+    int4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    int4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
+    int4 acc = {0, 0, 0, 0};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = x.x * y.x;
 		x.y = x.y * y.y;
@@ -110,17 +116,19 @@ __global__ void int32_mult(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w + z.x + z.y + z.z + z.w;
 }
 
-__global__ void int32_add(int* out, int iters) {
+__global__ void int32_add(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	int4 x	 = { tid, tid << 1, tid << 2, tid << 3 };
-	int4 y	 = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	int4 z	 = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	int4 acc = { 0, 0, 0, 0 };
+    int4 x = {tid, tid << 1, tid << 2, tid << 3};
+    int4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    int4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
+    int4 acc = {0, 0, 0, 0};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = x.x + y.x;
 		x.y = x.y + y.y;
@@ -136,18 +144,20 @@ __global__ void int32_add(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w + z.x + z.y + z.z + z.w;
 }
 
-__global__ void int32_mac(int* out, int iters) {
+__global__ void int32_mac(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	int4 x	 = { tid, tid << 1, tid << 2, tid << 3 };
-	int4 y	 = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	int4 z	 = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	int4 t	 = { tid << 9, tid << 10, tid << 11, tid << 12 };
-	int4 acc = { 0, 0, 0, 0 };
+    int4 x = {tid, tid << 1, tid << 2, tid << 3};
+    int4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    int4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
+    int4 t = {tid << 9, tid << 10, tid << 11, tid << 12};
+    int4 acc = {0, 0, 0, 0};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = x.x * t.x + y.x;
 		x.y = x.y * t.y + y.y;
@@ -163,16 +173,18 @@ __global__ void int32_mac(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w + z.x + z.y + z.z + z.w;
 }
 
-__global__ void int64_add(int* out, int iters) {
+__global__ void int64_add(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	longlong4 x = { tid, tid << 1, tid << 2, tid << 3 };
-	longlong4 y = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	longlong4 z = { tid << 5, tid << 6, tid << 7, tid << 8 };
+    longlong4 x = {tid, tid << 1, tid << 2, tid << 3};
+    longlong4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    longlong4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = x.x + y.x;
 		x.y = x.y + y.y;
@@ -188,16 +200,18 @@ __global__ void int64_add(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w + z.x + z.y + z.z + z.w;
 }
 
-__global__ void int64_mult(int* out, int iters) {
+__global__ void int64_mult(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	longlong4 x = { tid, tid << 1, tid << 2, tid << 3 };
-	longlong4 y = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	longlong4 z = { tid << 5, tid << 6, tid << 7, tid << 8 };
+    longlong4 x = {tid, tid << 1, tid << 2, tid << 3};
+    longlong4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    longlong4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = x.x * y.x;
 		x.y = x.y * y.y;
@@ -213,17 +227,19 @@ __global__ void int64_mult(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w + z.x + z.y + z.z + z.w;
 }
 
-__global__ void int64_mac(int* out, int iters) {
+__global__ void int64_mac(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	longlong4 x = { tid, tid << 1, tid << 2, tid << 3 };
-	longlong4 y = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	longlong4 z = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	longlong4 t = { tid << 9, tid << 10, tid << 11, tid << 12 };
+    longlong4 x = {tid, tid << 1, tid << 2, tid << 3};
+    longlong4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    longlong4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
+    longlong4 t = {tid << 9, tid << 10, tid << 11, tid << 12};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = x.x * t.x + y.x;
 		x.y = x.y * t.y + y.y;
@@ -239,18 +255,20 @@ __global__ void int64_mac(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w + z.x + z.y + z.z + z.w;
 }
 
-__global__ void int64_modadd(int* out, int iters) {
+__global__ void int64_modadd(int* out, int iters)
+{
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	longlong4 x = { tid, tid << 1, tid << 2, tid << 3 };
-	longlong4 y = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	longlong4 z = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	longlong4 t = { tid << 9, tid << 10, tid << 11, tid << 12 };
+    longlong4 x = {tid, tid << 1, tid << 2, tid << 3};
+    longlong4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    longlong4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
+    longlong4 t = {tid << 9, tid << 10, tid << 11, tid << 12};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
 #pragma unroll 16
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = FIDESlib::modadd(x.x, y.x, 0);
 		x.y = FIDESlib::modadd(x.y, y.y, 0);
@@ -266,14 +284,15 @@ __global__ void int64_modadd(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w + z.x + z.y + z.z + z.w;
 }
 
-__global__ void int64_modadd2(int* out, int iters) {
+__global__ void int64_modadd2(int* out, int iters)
+{
 	uint tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	ulonglong4 x = { tid, tid << 1, tid << 2, tid << 3 };
-	ulonglong4 y = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	ulonglong4 z = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	ulonglong4 t = { tid << 9, tid << 10, tid << 11, tid << 12 };
+    ulonglong4 x = {tid, tid << 1, tid << 2, tid << 3};
+    ulonglong4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    ulonglong4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
+    ulonglong4 t = {tid << 9, tid << 10, tid << 11, tid << 12};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
 	const uint64_t prime_p = tid << 32 ^ tid;
@@ -298,7 +317,8 @@ __global__ void int64_modadd2(int* out, int iters) {
 		z.w = z.w >= prime_p ? z.w - prime_p : z.w;
 	}*/
 #pragma unroll 1
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		asm volatile(
 		  // x.x += y.x; if >= prime_p x.x -= prime_p  (repeat pattern for all 8)
 		  ".reg .pred p0, p1, p2, p3, p4, p5, p6, p7; \n\t"
@@ -356,16 +376,17 @@ __global__ void int64_modadd2(int* out, int iters) {
 	out[tid] = x.x + x.y + x.z + x.w + z.x + z.y + z.z + z.w;
 }
 
-__global__ void int64_modadd3(int* out, int iters) {
+__global__ void int64_modadd3(int* out, int iters)
+{
 	uint tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
 	uint32_t x[8];
-	((ulonglong4*)x)[0] = { tid, tid << 1, tid << 2, tid << 3 };
-	ulonglong4 y		= { tid << 4, tid << 5, tid << 6, tid << 7 };
+    ((ulonglong4*)x)[0] = {tid, tid << 1, tid << 2, tid << 3};
+    ulonglong4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
 	uint32_t z[8];
-	((ulonglong4*)z)[8] = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	ulonglong4 t		= { tid << 9, tid << 10, tid << 11, tid << 12 };
+    ((ulonglong4*)z)[8] = {tid << 5, tid << 6, tid << 7, tid << 8};
+    ulonglong4 t = {tid << 9, tid << 10, tid << 11, tid << 12};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
 	const uint64_t prime_p = tid << 32 ^ tid;
@@ -390,8 +411,8 @@ __global__ void int64_modadd3(int* out, int iters) {
 		z.w = z.w >= prime_p ? z.w - prime_p : z.w;
 	}*/
 #pragma unroll 16
-	for (int i = 0; i < iters; ++i) {
-
+    for (int i = 0; i < iters; ++i)
+    {
 		asm(
 
 		  //  ".func (.reg .u32 lo, .reg .u32 hi) modadd (.reg .u32 a0, .reg .u32 a1, .reg .u32 b0, .reg .u32 b1, .reg .u32 p0, .reg .u32 p1)\n\t"
@@ -473,25 +494,29 @@ __global__ void int64_modadd3(int* out, int iters) {
 		  "r"(((uint2)prime_p).y));
 	}
 	if (tid == 5555)
-		printf("%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d \n", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7]);
+        printf("%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d \n", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+               z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7]);
 
 	// Prevent the compiler from optimizing the loop away
-	out[tid] = x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7] + z[0] + z[1] + z[2] + z[3] + z[4] + z[5] + z[6] + z[7];
+    out[tid] = x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7] + z[0] + z[1] + z[2] + z[3] + z[4] + z[5] + z[6] +
+        z[7];
 }
 
-__global__ void int64_modadd4(int* out, int iters) {
+__global__ void int64_modadd4(int* out, int iters)
+{
 	uint tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	uint32_t x[8] = { tid, tid << 1, tid << 2, tid << 3, tid << 5, tid << 6, tid << 7, tid << 8 };
-	uint32_t y[8] = { tid, tid << 1, tid << 2, tid << 3, tid << 5, tid << 6, tid << 7, tid << 8 };
+    uint32_t x[8] = {tid, tid << 1, tid << 2, tid << 3, tid << 5, tid << 6, tid << 7, tid << 8};
+    uint32_t y[8] = {tid, tid << 1, tid << 2, tid << 3, tid << 5, tid << 6, tid << 7, tid << 8};
 	// ulonglong4 y  = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	uint32_t z[8] = { tid, tid << 11, tid << 12, tid << 13, tid << 15, tid << 16, tid << 17, tid << 18 };
+    uint32_t z[8] = {tid, tid << 11, tid << 12, tid << 13, tid << 15, tid << 16, tid << 17, tid << 18};
 	//((ulonglong4*)z)[8] = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	ulonglong4 t = { tid << 9, tid << 10, tid << 11, tid << 12 };
+    ulonglong4 t = {tid << 9, tid << 10, tid << 11, tid << 12};
 
 	if (tid == 111111)
-		printf("%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d \n", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7]);
+        printf("%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d \n", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+               z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7]);
 
 	// Unroll to reduce loop overhead and help reach peak throughput
 	const uint64_t prime_p = tid << 32 ^ tid;
@@ -516,8 +541,8 @@ __global__ void int64_modadd4(int* out, int iters) {
 		z.w = z.w >= prime_p ? z.w - prime_p : z.w;
 	}*/
 #pragma unroll 1
-	for (int i = 0; i < iters; ++i) {
-
+    for (int i = 0; i < iters; ++i)
+    {
 		asm volatile(
 
 		  //  ".func (.reg .u32 lo, .reg .u32 hi) modadd (.reg .u32 a0, .reg .u32 a1, .reg .u32 b0, .reg .u32 b1, .reg .u32 p0, .reg .u32 p1)\n\t"
@@ -588,25 +613,30 @@ __global__ void int64_modadd4(int* out, int iters) {
 		  "+r"(z[5]),
 		  "+r"(z[6]),
 		  "+r"(z[7])
-		  : "r"(y[0]), "r"(y[1]), "r"(y[2]), "r"(y[3]), "r"(y[4]), "r"(y[5]), "r"(y[6]), "r"(y[7]), "r"(((uint2)prime_p).x), "r"(((uint2)prime_p).y));
+            : "r"(y[0]), "r"(y[1]), "r"(y[2]), "r"(y[3]), "r"(y[4]), "r"(y[5]), "r"(y[6]), "r"(y[7]), "r"(((uint2)
+                prime_p).x), "r"(((uint2)prime_p).y));
 	}
 	if (tid == 111111)
-		printf("%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d \n", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7]);
+        printf("%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d \n", x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+               z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7]);
 	// Prevent the compiler from optimizing the loop away
-	out[tid] = x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7] + z[0] + z[1] + z[2] + z[3] + z[4] + z[5] + z[6] + z[7];
+    out[tid] = x[0] + x[1] + x[2] + x[3] + x[4] + x[5] + x[6] + x[7] + z[0] + z[1] + z[2] + z[3] + z[4] + z[5] + z[6] +
+        z[7];
 }
 
-__global__ void int64_modmult(int* out, int iters) {
+__global__ void int64_modmult(int* out, int iters)
+{
 	uint tid = blockDim.x * blockIdx.x + threadIdx.x;
 
 	// Simple integer state
-	ulonglong4 x = { tid, tid << 1, tid << 2, tid << 3 };
-	ulonglong4 y = { tid << 4, tid << 5, tid << 6, tid << 7 };
-	ulonglong4 z = { tid << 5, tid << 6, tid << 7, tid << 8 };
-	ulonglong4 t = { tid << 9, tid << 10, tid << 11, tid << 12 };
+    ulonglong4 x = {tid, tid << 1, tid << 2, tid << 3};
+    ulonglong4 y = {tid << 4, tid << 5, tid << 6, tid << 7};
+    ulonglong4 z = {tid << 5, tid << 6, tid << 7, tid << 8};
+    ulonglong4 t = {tid << 9, tid << 10, tid << 11, tid << 12};
 
 	// Unroll to reduce loop overhead and help reach peak throughput
-	for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i)
+    {
 		// 1) add
 		x.x = FIDESlib::modmult<FIDESlib::ALGO_BARRETT>((uint64_t)x.x, y.x, 0);
 		x.y = FIDESlib::modmult<FIDESlib::ALGO_BARRETT>((uint64_t)x.y, y.y, 0);
@@ -623,69 +653,70 @@ __global__ void int64_modmult(int* out, int iters) {
 }
 
 #define bench(func)                                                                                                       \
-	{                                                                                                                     \
-		int device = 0;                                                                                                   \
-		CUDA_CHECK(cudaSetDevice(device));                                                                                \
+    {                                                                                                                     \
+        int device = 0;                                                                                                   \
+        CUDA_CHECK(cudaSetDevice(device));                                                                                \
                                                                                                                           \
-		cudaDeviceProp prop;                                                                                              \
-		CUDA_CHECK(cudaGetDeviceProperties(&prop, device));                                                               \
+        cudaDeviceProp prop;                                                                                              \
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));                                                               \
                                                                                                                           \
-		int iters			= 100'000;                                                                                    \
-		int threadsPerBlock = 128;                                                                                        \
-		int blocks			= prop.multiProcessorCount * 48;                                                              \
+        int iters = 100'000;                                                                                              \
+        int threadsPerBlock = 128;                                                                                        \
+        int blocks = prop.multiProcessorCount * 48;                                                                       \
                                                                                                                           \
-		const long long numThreads = 1LL * threadsPerBlock * blocks;                                                      \
+        const long long numThreads = 1LL * threadsPerBlock * blocks;                                                      \
                                                                                                                           \
-		printf("Device: %s\n", prop.name);                                                                                \
-		printf("SMs: %d, clock: %.3f MHz\n", prop.multiProcessorCount, prop.clockRate / 1000.0);                          \
-		printf("Launch config: blocks=%d, threadsPerBlock=%d, totalThreads=%lld\n", blocks, threadsPerBlock, numThreads); \
-		printf("Loop iters per thread: %d, OPS_PER_ITER=%d\n", iters, OPS_PER_ITER);                                      \
+        printf("Device: %s\n", prop.name);                                                                                \
+        printf("SMs: %d, clock: %.3f MHz\n", prop.multiProcessorCount, prop.clockRate / 1000.0);                          \
+        printf("Launch config: blocks=%d, threadsPerBlock=%d, totalThreads=%lld\n", blocks, threadsPerBlock, numThreads); \
+        printf("Loop iters per thread: %d, OPS_PER_ITER=%d\n", iters, OPS_PER_ITER);                                      \
                                                                                                                           \
-		int* d_out = nullptr;                                                                                             \
-		CUDA_CHECK(cudaMalloc(&d_out, numThreads * sizeof(int)));                                                         \
+        int* d_out = nullptr;                                                                                             \
+        CUDA_CHECK(cudaMalloc(&d_out, numThreads * sizeof(int)));                                                         \
                                                                                                                           \
-		func<<<blocks, threadsPerBlock>>>(d_out, iters);                                                                  \
-		CUDA_CHECK(cudaGetLastError());                                                                                   \
-		CUDA_CHECK(cudaDeviceSynchronize());                                                                              \
+        func<<<blocks, threadsPerBlock>>>(d_out, iters);                                                                  \
+        CUDA_CHECK(cudaGetLastError());                                                                                   \
+        CUDA_CHECK(cudaDeviceSynchronize());                                                                              \
                                                                                                                           \
-		cudaEvent_t start, stop;                                                                                          \
-		CUDA_CHECK(cudaEventCreate(&start));                                                                              \
-		CUDA_CHECK(cudaEventCreate(&stop));                                                                               \
+        cudaEvent_t start, stop;                                                                                          \
+        CUDA_CHECK(cudaEventCreate(&start));                                                                              \
+        CUDA_CHECK(cudaEventCreate(&stop));                                                                               \
                                                                                                                           \
-		CUDA_CHECK(cudaEventRecord(start));                                                                               \
-		func<<<blocks, threadsPerBlock>>>(d_out, iters);                                                                  \
-		CUDA_CHECK(cudaGetLastError());                                                                                   \
-		CUDA_CHECK(cudaEventRecord(stop));                                                                                \
-		CUDA_CHECK(cudaEventSynchronize(stop));                                                                           \
+        CUDA_CHECK(cudaEventRecord(start));                                                                               \
+        func<<<blocks, threadsPerBlock>>>(d_out, iters);                                                                  \
+        CUDA_CHECK(cudaGetLastError());                                                                                   \
+        CUDA_CHECK(cudaEventRecord(stop));                                                                                \
+        CUDA_CHECK(cudaEventSynchronize(stop));                                                                           \
                                                                                                                           \
-		float ms = 0.0f;                                                                                                  \
-		CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));                                                               \
+        float ms = 0.0f;                                                                                                  \
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));                                                               \
                                                                                                                           \
-		CUDA_CHECK(cudaEventDestroy(start));                                                                              \
-		CUDA_CHECK(cudaEventDestroy(stop));                                                                               \
+        CUDA_CHECK(cudaEventDestroy(start));                                                                              \
+        CUDA_CHECK(cudaEventDestroy(stop));                                                                               \
                                                                                                                           \
-		double seconds	   = ms * 1e-3;                                                                                   \
-		double total_iters = static_cast<double>(iters) * static_cast<double>(numThreads);                                \
-		double total_ops   = total_iters * static_cast<double>(OPS_PER_ITER);                                             \
-		double iops		   = total_ops / seconds;                                                                         \
-		double gops		   = iops / 1e9;                                                                                  \
-		double tops		   = iops / 1e12;                                                                                 \
-		double iops_per_sm = iops / prop.multiProcessorCount;                                                             \
+        double seconds = ms * 1e-3;                                                                                       \
+        double total_iters = static_cast<double>(iters) * static_cast<double>(numThreads);                                \
+        double total_ops = total_iters * static_cast<double>(OPS_PER_ITER);                                               \
+        double iops = total_ops / seconds;                                                                                \
+        double gops = iops / 1e9;                                                                                         \
+        double tops = iops / 1e12;                                                                                        \
+        double iops_per_sm = iops / prop.multiProcessorCount;                                                             \
                                                                                                                           \
-		printf("\nKernel time: %.3f ms\n", ms);                                                                           \
-		printf("Total int32 ops: %.3e\n", total_ops);                                                                     \
-		printf("Integer throughput: %.3e ops/s (%.3f GOPS, %.3f TOPS)\n", iops, gops, tops);                              \
-		printf("Per-SM integer throughput: %.3e ops/s per SM\n", iops_per_sm);                                            \
+        printf("\nKernel time: %.3f ms\n", ms);                                                                           \
+        printf("Total int32 ops: %.3e\n", total_ops);                                                                     \
+        printf("Integer throughput: %.3e ops/s (%.3f GOPS, %.3f TOPS)\n", iops, gops, tops);                              \
+        printf("Per-SM integer throughput: %.3e ops/s per SM\n", iops_per_sm);                                            \
                                                                                                                           \
-		int sample = 0;                                                                                                   \
-		CUDA_CHECK(cudaMemcpy(&sample, d_out + 1, sizeof(int), cudaMemcpyDeviceToHost));                                  \
-		printf("Sample output[0] = %d\n", sample);                                                                        \
+        int sample = 0;                                                                                                   \
+        CUDA_CHECK(cudaMemcpy(&sample, d_out + 1, sizeof(int), cudaMemcpyDeviceToHost));                                  \
+        printf("Sample output[0] = %d\n", sample);                                                                        \
                                                                                                                           \
-		CUDA_CHECK(cudaFree(d_out));                                                                                      \
-		CUDA_CHECK(cudaDeviceReset());                                                                                    \
-	}
+        CUDA_CHECK(cudaFree(d_out));                                                                                      \
+        CUDA_CHECK(cudaDeviceReset());                                                                                    \
+    }
 
-TEST(Microbench, int32) {
+TEST(Microbench, int32)
+{
 	bench(int32_mult);
 	bench(int32_add);
 	bench(int32_mac);

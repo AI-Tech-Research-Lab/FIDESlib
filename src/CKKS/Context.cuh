@@ -27,49 +27,49 @@ struct BootCacheBlock;
 struct RawPlainText;
 
 struct Precomputations {
-	std::vector<Constants> constants;
-	std::unique_ptr<Global> globals;
-	std::map<int, BootstrapPrecomputation> boot;
-	std::vector<RNSPoly> auxPoly;
-	std::map<int, RNSPoly> monomialCache;
+    std::vector<Constants> constants;
+    std::unique_ptr<Global> globals;
+    std::map<int, BootstrapPrecomputation> boot;
+    std::vector<RNSPoly> auxPoly;
+    std::map<int, RNSPoly> monomialCache;
 #ifdef NCCL
-	std::map<int, ncclComm_t*> dev_to_communicator;
+    std::map<int, ncclComm_t*> dev_to_communicator;
 #else
-	std::map<int, void*> dev_to_communicator;
+    std::map<int, void*> dev_to_communicator;
 #endif
-	struct KeyPrecomputations {
-		std::unique_ptr<KeySwitchingKey> eval_key;
-		std::map<int, KeySwitchingKey> rot_keys;
+    struct KeyPrecomputations {
+        std::unique_ptr<KeySwitchingKey> eval_key;
+        std::map<int, KeySwitchingKey> rot_keys;
 
-		/** VRAM cache bookkeeping for the rotation keys in `rot_keys`. lru_order only
-		 * ever holds resident keys (back = least recently used); offloaded keys re-enter
-		 * on their next touch. Budget is per key set (per KeyHash): contexts normally
-		 * hold a single secret-key set, which makes this equal to the global budget. */
-		size_t resident_bytes = 0;
-		std::list<int> lru_order;
-		std::map<int, std::list<int>::iterator> lru_pos;
-		std::set<int> pinned;
+        /** VRAM cache bookkeeping for the rotation keys in `rot_keys`. lru_order only
+         * ever holds resident keys (back = least recently used); offloaded keys re-enter
+         * on their next touch. Budget is per key set (per KeyHash): contexts normally
+         * hold a single secret-key set, which makes this equal to the global budget. */
+        size_t resident_bytes = 0;
+        std::list<int> lru_order;
+        std::map<int, std::list<int>::iterator> lru_pos;
+        std::set<int> pinned;
 
-		void touch(int index);
-		/** Stream-ordered offload of rot_keys[index]; updates bookkeeping. Returns
-		 * false if the key does not exist, is already offloaded or has no snapshot. */
-		bool offloadKey(int index);
-		/** Evict LRU keys until resident_bytes + incoming <= budget. Skips pinned
-		 * keys and keys without a host snapshot; gives up (transient overshoot)
-		 * when nothing evictable remains. */
-		void evictToFit(size_t budget, size_t incoming);
-		/** Make rot_keys[index] resident, honoring `budget` with evict-before-load
-		 * so peak VRAM never exceeds budget + one key. */
-		KeySwitchingKey& ensureResident(int index, size_t budget, bool may_evict);
-		/** Account a key registered via AddRotationKey. */
-		void registerKey(int index, KeySwitchingKey& ksk);
-		/** Reset the bookkeeping (must be called whenever rot_keys is cleared). */
-		void resetCacheBookkeeping();
-		/** Immediately evict down to `budget` (runtime budget change). */
-		void enforceBudget(size_t budget);
-	};
+        void touch(int index);
+        /** Stream-ordered offload of rot_keys[index]; updates bookkeeping. Returns
+         * false if the key does not exist, is already offloaded or has no snapshot. */
+        bool offloadKey(int index);
+        /** Evict LRU keys until resident_bytes + incoming <= budget. Skips pinned
+         * keys and keys without a host snapshot; gives up (transient overshoot)
+         * when nothing evictable remains. */
+        void evictToFit(size_t budget, size_t incoming);
+        /** Make rot_keys[index] resident, honoring `budget` with evict-before-load
+         * so peak VRAM never exceeds budget + one key. */
+        KeySwitchingKey& ensureResident(int index, size_t budget, bool may_evict);
+        /** Account a key registered via AddRotationKey. */
+        void registerKey(int index, KeySwitchingKey& ksk);
+        /** Reset the bookkeeping (must be called whenever rot_keys is cleared). */
+        void resetCacheBookkeeping();
+        /** Immediately evict down to `budget` (runtime budget change). */
+        void enforceBudget(size_t budget);
+    };
 
-	std::map<KeyHash, KeyPrecomputations> keys;
+    std::map<KeyHash, KeyPrecomputations> keys;
 };
 
 enum RESCALE_TECHNIQUE { NO_RESCALE, FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO, FLEXIBLEAUTOEXT };
@@ -78,211 +78,234 @@ extern std::atomic_uint64_t next_uid;
 
 class ContextData {
   public:
-	static constexpr const char* loc{ "Context" };
-	CudaNvtxRange my_range;
-	Parameters param;
-	Precomputations precom;
-	const int logN;
-	const int N;
-	const RESCALE_TECHNIQUE rescaleTechnique;
-	const int& L;
-	const int logQ;
-	int batch;
-	const std::vector<int> GPUid;
-	const int& dnum;
-	std::vector<std::vector<int>> GPUdigits;
-	const std::vector<PrimeRecord>& prime;
-	std::vector<std::vector<LimbRecord>> meta;
-	const std::vector<int> logQ_d;
-	const int& K;
-	const int logP;
-	const std::vector<PrimeRecord>& specialPrime;
+    static constexpr const char* loc{ "Context" };
+    CudaNvtxRange my_range;
+    Parameters param;
+    Precomputations precom;
+    const int logN;
+    const int N;
+    const RESCALE_TECHNIQUE rescaleTechnique;
+    const int& L;
+    const int logQ;
+    int batch;
+    const std::vector<int> GPUid;
+    const int& dnum;
+    std::vector<std::vector<int>> GPUdigits;
+    const std::vector<PrimeRecord>& prime;
+    std::vector<std::vector<LimbRecord>> meta;
+    const std::vector<int> logQ_d;
+    const int& K;
+    const int logP;
+    const std::vector<PrimeRecord>& specialPrime;
 
-	std::vector<std::vector<LimbRecord>> specialMeta; // Make const maybe
-	std::vector<std::vector<LimbRecord>> splitSpecialMeta;
-	std::vector<std::vector<std::vector<LimbRecord>>> decompMeta; // Make const maybe
-	std::vector<std::vector<std::vector<LimbRecord>>> digitMeta;  // Make const maybe
-	std::vector<LimbRecord> gatherMeta;
+    std::vector<std::vector<LimbRecord>> specialMeta; // Make const maybe
+    std::vector<std::vector<LimbRecord>> splitSpecialMeta;
+    std::vector<std::vector<std::vector<LimbRecord>>> decompMeta; // Make const maybe
+    std::vector<std::vector<std::vector<LimbRecord>>> digitMeta;  // Make const maybe
+    std::vector<LimbRecord> gatherMeta;
 
-	const std::vector<dim3> limbGPUid;
-	const std::vector<int> digitGPUid;
+    const std::vector<dim3> limbGPUid;
+    const std::vector<int> digitGPUid;
 
 #ifdef NCCL
-	ncclUniqueId communicatorID;
-	std::vector<ncclComm_t> GPUrank;
+    ncclUniqueId communicatorID;
+    std::vector<ncclComm_t> GPUrank;
 #else
-	std::vector<int> GPUrank;
+    std::vector<int> GPUrank;
 #endif
 
-	std::unique_ptr<RNSPoly> key_switch_aux				= nullptr;
-	std::unique_ptr<RNSPoly> key_switch_aux2			= nullptr;
-	std::array<std::unique_ptr<RNSPoly>, 2> moddown_aux = { nullptr };
-	std::vector<Stream> top_limb_stream;
-	std::vector<uint64_t*> top_limb_buffer;
-	std::vector<void*> top_limb_buffer_handle;
-	std::vector<VectorGPU<void*>> top_limbptr;
+    std::unique_ptr<RNSPoly> key_switch_aux = nullptr;
+    std::unique_ptr<RNSPoly> key_switch_aux2 = nullptr;
+    std::array<std::unique_ptr<RNSPoly>, 2> moddown_aux = { nullptr };
+    std::vector<Stream> top_limb_stream;
+    std::vector<uint64_t*> top_limb_buffer;
+    std::vector<void*> top_limb_buffer_handle;
+    std::vector<VectorGPU<void*>> top_limbptr;
 
-	std::vector<Stream> top_limb_stream2;
-	std::vector<uint64_t*> top_limb_buffer2;
-	std::vector<void*> top_limb_buffer2_handle;
-	std::vector<VectorGPU<void*>> top_limbptr2;
+    std::vector<Stream> top_limb_stream2;
+    std::vector<uint64_t*> top_limb_buffer2;
+    std::vector<void*> top_limb_buffer2_handle;
+    std::vector<VectorGPU<void*>> top_limbptr2;
 
-	std::vector<std::vector<Stream>> gatherStream;
-	std::vector<std::vector<Stream>> digitStream;
-	std::vector<std::vector<std::vector<Stream>>> digitStreamForMemcpyPeer;
-	std::vector<std::vector<Stream>> digitStream2;
+    std::vector<std::vector<Stream>> gatherStream;
+    std::vector<std::vector<Stream>> digitStream;
+    std::vector<std::vector<std::vector<Stream>>> digitStreamForMemcpyPeer;
+    std::vector<std::vector<Stream>> digitStream2;
 
-	// std::vector<RNSPoly> key_switch_digits;
-	bool canP2P = false;
-	std::list<uint64_t*> free_limb;
+    // std::vector<RNSPoly> key_switch_digits;
+    bool canP2P = false;
+    std::list<uint64_t*> free_limb;
 
-	//      std::array<Stream, 8> blockingStream;
-	//      std::vector<std::vector<Stream>> asyncStream;
-	RNSPoly& getKeySwitchAux();
-	RNSPoly& getKeySwitchAux2();
-	RNSPoly& getModdownAux(const int num);
+    //      std::array<Stream, 8> blockingStream;
+    //      std::vector<std::vector<Stream>> asyncStream;
+    RNSPoly& getKeySwitchAux();
+    RNSPoly& getKeySwitchAux2();
+    RNSPoly& getModdownAux(const int num);
 
-	bool isValidPrimeId(const int i) const;
-
-  public:
-	ContextData(const Parameters& param_, const std::vector<int>& devs, const int secBits = 0);
-	~ContextData();
-
-	static int computeLogQ(const int L, std::vector<PrimeRecord>& primes);
-
-	static const int& validateDnum(const std::vector<int>& GPUid, const int& dnum);
-
-	static std::vector<std::vector<LimbRecord>>
-	generateMeta(const std::vector<int>& GPUid, const int dnum, const std::vector<std::vector<int>> digitGPUid, const std::vector<PrimeRecord>& prime, const Parameters& param);
-
-	static std::vector<int> computeLogQ_d(const int dnum, const std::vector<std::vector<LimbRecord>>& meta, const std::vector<PrimeRecord>& prime);
-
-	static const int& computeK(const std::vector<int>& logQ_d, std::vector<PrimeRecord>& Sprimes, Parameters& param);
-
-	static std::vector<std::vector<LimbRecord>>
-	generateSpecialMeta(const std::vector<std::vector<LimbRecord>>& meta, const std::vector<PrimeRecord>& specialPrime, const int ID0, const std::vector<int>& GPUid);
-
-	static std::vector<std::vector<std::vector<LimbRecord>>>
-	generateDecompMeta(const std::vector<std::vector<LimbRecord>>& meta, const std::vector<std::vector<int>> dnum, const std::vector<int>& vector, int L);
-
-	static std::vector<std::vector<std::vector<LimbRecord>>> generateDigitMeta(const std::vector<std::vector<LimbRecord>>& meta,
-	  const std::vector<std::vector<LimbRecord>>& splitSpecialMeta,
-	  const std::vector<LimbRecord>& specialMeta,
-	  const std::vector<std::vector<int>>& digitGPUid,
-	  const std::vector<int>& GPUid);
-
-	static std::vector<dim3>
-	generateLimbGPUid(const std::vector<std::vector<LimbRecord>>& meta, const int L, const std::vector<std::vector<LimbRecord>>& SPECIALmeta, int K);
-
-	static std::vector<std::vector<int>> generateGPUdigits(const int dnum, const std::vector<int>& devs);
-	static std::vector<std::vector<LimbRecord>> generateSplitSpecialMeta(std::vector<LimbRecord>& specialMeta, const std::vector<int> GPUid);
-	static std::vector<LimbRecord> generateGatherMeta(const std::vector<std::vector<LimbRecord>>& meta, int L);
+    bool isValidPrimeId(const int i) const;
 
   public:
-	std::vector<uint64_t> ElemForEvalMult(int level, const double operand, int level_in = -1);
-	std::vector<uint64_t> ElemForEvalAddOrSub(const int level, const double operand, const int noise_deg);
-	std::vector<double>& GetCoeffsChebyshev();
-	int GetDoubleAngleIts();
-	void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp);
-	bool HasBootPrecomputation(int slots);
-	BootstrapPrecomputation& GetBootPrecomputation(int slots);
-	void AddRotationKey(int index, KeySwitchingKey&& ksk);
-	KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID);
-	KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID, int slots, int& actual_index);
-	bool HasRotationKey(int index, const KeyHash& keyID);
-	void AddEvalKey(KeySwitchingKey&& ksk);
-	KeySwitchingKey& GetEvalKey(const KeyHash& keyID);
-	int GetBootK();
-	// int GetBootCorrectionFactor();
-	static RESCALE_TECHNIQUE translateRescalingTechnique(lbcrypto::ScalingTechnique technique);
-	void PrepareNCCLCommunication();
-	const std::vector<int> generateDigitGPUid(std::vector<std::vector<LimbRecord>>& meta, const int L, const int dnum);
+    ContextData(const Parameters& param_, const std::vector<int>& devs, const int secBits = 0);
+    ~ContextData();
 
-	bool hasAuxilarPoly() const;
-	RNSPoly getAuxilarPoly();
-	void returnAuxilarPoly(RNSPoly&& c);
-	void trimAuxilarPoly(size_t size);
-	void clearAuxilarPoly();
-	void clearAutomorphismKeys(const KeyHash& KeyID = {});
-	void clearEvalMultKeys(const KeyHash& KeyID = {});
-	void clearBootPrecomputation(int slots = -1);
-	void clearParamSwitchKeys(const KeyHash& KeyID = {});
+    /** Total GPU bytes of the precomputed tables (per-prime psi tables + per-device Global/Constants). */
+    uint64_t getPrecomputationsBytes() const;
+    /** Total GPU bytes of the auxiliary buffers (key-switch/moddown aux polys, monomial cache, MGPU top-limb buffers). */
+    uint64_t getAuxBuffersBytes() const;
 
-	/** @name Rotation-key VRAM cache
-	 * Offload rotation keys to host RAM and reload them on the fly so the VRAM spent on
-	 * rotation keys stays within `rotation_key_cache_bytes` (steady state). Keys registered
-	 * while a finite budget is set are created VRAM-free (host snapshot only) and load
-	 * lazily on first use. The budget is soft: ops that need several keys at once (hoisted
-	 * rotation, bootstrap's linear transforms) transiently overshoot it; eviction resumes
-	 * on the next load. Keys created before a budget was set (no host snapshot) and keys
-	 * explicitly pinned are never offloaded. SIZE_MAX restores legacy behavior (all keys
-	 * permanently resident). The eval/relin key is not part of this cache.
-	 * @{ */
-	void SetRotationKeyCache(size_t bytes);
-	[[nodiscard]] size_t GetRotationKeyCache() const { return rotation_key_cache_bytes; }
-	/** True while a finite cache budget is set; rotation keys created now start offloaded. */
-	[[nodiscard]] bool rotationKeysLazy() const { return rotation_key_cache_bytes != SIZE_MAX; }
-	/** Manually offload rotation keys to host RAM. Empty `indexes` = all, empty `keyID` =
-	 * every key set. Requires the keys to have host snapshots (see rotationKeysLazy()). */
-	void OffloadRotationKeys(const std::vector<int>& indexes = {}, const KeyHash& keyID = {});
-	/** Pin/unpin a rotation key: pinned keys are never evicted by the cache. */
-	void PinRotationKey(int index, bool pin = true, const KeyHash& keyID = {});
-	[[nodiscard]] bool IsRotationKeyResident(int index, const KeyHash& keyID = {}) const;
-	/** Sum of VRAM bytes currently spent on resident rotation keys (all key sets). */
-	[[nodiscard]] size_t RotationKeyCacheResidentBytes() const;
-	/** }@ */
+    static int computeLogQ(const int L, std::vector<PrimeRecord>& primes);
 
-	/** @name Bootstrap-precomputation VRAM cache
-	 * Bound the VRAM spent on the linear-transform plaintexts of the bootstrap precomputation
-	 * (the CoeffsToSlots/SlotsToCoeffs matrices) to `bootstrap_cache_bytes`. The unit of the
-	 * cache is a group of plaintexts consumed together (one transform stage), which is loaded
-	 * from a host RAM snapshot right before the stage runs. Same rules as the rotation-key
-	 * cache: only groups built while a finite budget is set have a snapshot, and they cost no
-	 * VRAM until first used; groups built without one stay resident for good. SIZE_MAX keeps
-	 * the legacy behavior (everything resident, no snapshot).
-	 *
-	 * Eviction takes the most recently used group first, not the least recently used one: a
-	 * bootstrap visits its stages in the same order every time, and under that cyclic pattern
-	 * LRU always evicts the group needed soonest -- with a budget below the total it would
-	 * reload every stage of every bootstrap. Evicting the most recent one keeps a fixed subset
-	 * resident and streams only the rest. The budget is soft by one group: the group being
-	 * loaded is never evicted, so a budget smaller than a stage still runs that stage.
-	 * @{ */
-	void SetBootstrapCache(size_t bytes);
-	[[nodiscard]] size_t GetBootstrapCache() const { return bootstrap_cache_bytes; }
-	/** True while a finite budget is set; groups built now keep a snapshot and start offloaded. */
-	[[nodiscard]] bool bootstrapPrecomputationLazy() const { return bootstrap_cache_bytes != SIZE_MAX; }
-	/** Offload every group that has a snapshot, now. */
-	void OffloadBootstrapPrecomputation();
-	/** Sum of VRAM bytes currently held by resident groups (every slot count). */
-	[[nodiscard]] size_t BootstrapCacheResidentBytes() const;
-	/** Total bytes ever reloaded from host snapshots: its growth over one bootstrap is what the
-	 * budget costs per bootstrap. */
-	[[nodiscard]] uint64_t BootstrapCacheLoadedBytes() const { return bootstrap_cache_loaded_bytes; }
-	/** Account a group that has just been built, resident, in `pts`. Under a finite budget
-	 * `raws` (the host data it was built from) becomes its snapshot and the group is
-	 * offloaded right away, so building a precomputation never needs more than one group of
-	 * VRAM; otherwise `raws` is dropped. */
-	void AdmitBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts, std::vector<RawPlainText>&& raws);
-	/** Make a group resident (evicting others to fit the budget) right before a linear
-	 * transform consumes it. Returns `pts`. */
-	std::vector<Plaintext>& AcquireBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts);
-	/** }@ */
+    static const int& validateDnum(const std::vector<int>& GPUid, const int& dnum);
 
-	/** @cond */
-	size_t bootstrap_cache_bytes  = SIZE_MAX;
-	uint64_t bootstrap_cache_clock = 0;
-	uint64_t bootstrap_cache_loaded_bytes = 0;
-	size_t rotation_key_cache_bytes = SIZE_MAX;
-	/** Depth of active RotationKeyEvictionHold scopes. */
-	int rotation_key_eviction_hold = 0;
-	/** @endcond */
+    static std::vector<std::vector<LimbRecord>>
+    generateMeta(const std::vector<int>& GPUid, const int dnum, const std::vector<std::vector<int>> digitGPUid, const std::vector<PrimeRecord>& prime, const Parameters& param);
 
-	friend Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& devs);
-	friend void DeregisterCryptoContextGPU(const Parameters& param);
-	friend void DeregisterCryptoContextGPU(Context cc);
-	friend Context GetCurrentContext();
-	friend void SetCurrentContext(Context&);
+    static std::vector<int> computeLogQ_d(const int dnum, const std::vector<std::vector<LimbRecord>>& meta, const std::vector<PrimeRecord>& prime);
+
+    static const int& computeK(const std::vector<int>& logQ_d, std::vector<PrimeRecord>& Sprimes, Parameters& param);
+
+    static std::vector<std::vector<LimbRecord>>
+    generateSpecialMeta(const std::vector<std::vector<LimbRecord>>& meta, const std::vector<PrimeRecord>& specialPrime, const int ID0, const std::vector<int>& GPUid);
+
+    static std::vector<std::vector<std::vector<LimbRecord>>>
+    generateDecompMeta(const std::vector<std::vector<LimbRecord>>& meta, const std::vector<std::vector<int>> dnum, const std::vector<int>& vector, int L);
+
+    static std::vector<std::vector<std::vector<LimbRecord>>> generateDigitMeta(const std::vector<std::vector<LimbRecord>>& meta,
+        const std::vector<std::vector<LimbRecord>>& splitSpecialMeta,
+        const std::vector<LimbRecord>& specialMeta,
+        const std::vector<std::vector<int>>& digitGPUid,
+        const std::vector<int>& GPUid);
+
+    static std::vector<dim3>
+    generateLimbGPUid(const std::vector<std::vector<LimbRecord>>& meta, const int L, const std::vector<std::vector<LimbRecord>>& SPECIALmeta, int K);
+
+    static std::vector<std::vector<int>> generateGPUdigits(const int dnum, const std::vector<int>& devs);
+    static std::vector<std::vector<LimbRecord>> generateSplitSpecialMeta(std::vector<LimbRecord>& specialMeta, const std::vector<int> GPUid);
+    static std::vector<LimbRecord> generateGatherMeta(const std::vector<std::vector<LimbRecord>>& meta, int L);
+
+  public:
+    std::vector<uint64_t> ElemForEvalMult(int level, const double operand, int level_in = -1);
+    std::vector<uint64_t> ElemForEvalAddOrSub(const int level, const double operand, const int noise_deg);
+    std::vector<double>& GetCoeffsChebyshev();
+    int GetDoubleAngleIts();
+    void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp);
+    bool HasBootPrecomputation(int slots);
+    BootstrapPrecomputation& GetBootPrecomputation(int slots);
+    void AddRotationKey(int index, KeySwitchingKey&& ksk);
+    KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID);
+    KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID, int slots, int& actual_index);
+    bool HasRotationKey(int index, const KeyHash& keyID);
+    void AddEvalKey(KeySwitchingKey&& ksk);
+    KeySwitchingKey& GetEvalKey(const KeyHash& keyID);
+    double GetBootK();
+    // int GetBootCorrectionFactor();
+    static RESCALE_TECHNIQUE translateRescalingTechnique(lbcrypto::ScalingTechnique technique);
+    void PrepareNCCLCommunication();
+    const std::vector<int> generateDigitGPUid(std::vector<std::vector<LimbRecord>>& meta, const int L, const int dnum);
+
+    bool hasAuxilarPoly() const;
+    RNSPoly getAuxilarPoly();
+    void returnAuxilarPoly(RNSPoly&& c);
+    void trimAuxilarPoly(size_t size);
+    void clearAuxilarPoly();
+    void clearAutomorphismKeys(const KeyHash& KeyID = {});
+    void clearEvalMultKeys(const KeyHash& KeyID = {});
+    void clearBootPrecomputation(int slots = -1);
+    void clearParamSwitchKeys(const KeyHash& KeyID = {});
+
+    /** @name Rotation-key VRAM cache
+     * Offload rotation keys to host RAM and reload them on the fly so the VRAM spent on
+     * rotation keys stays within `rotation_key_cache_bytes` (steady state). Keys registered
+     * while a finite budget is set are created VRAM-free (host snapshot only) and load
+     * lazily on first use. The budget is soft: ops that need several keys at once (hoisted
+     * rotation, bootstrap's linear transforms) transiently overshoot it; eviction resumes
+     * on the next load. Keys created before a budget was set (no host snapshot) and keys
+     * explicitly pinned are never offloaded. SIZE_MAX restores legacy behavior (all keys
+     * permanently resident). The eval/relin key is not part of this cache.
+     * @{ */
+    void SetRotationKeyCache(size_t bytes);
+
+    [[nodiscard]] size_t GetRotationKeyCache() const {
+        return rotation_key_cache_bytes;
+    }
+
+    /** True while a finite cache budget is set; rotation keys created now start offloaded. */
+    [[nodiscard]] bool rotationKeysLazy() const {
+        return rotation_key_cache_bytes != SIZE_MAX;
+    }
+
+    /** Manually offload rotation keys to host RAM. Empty `indexes` = all, empty `keyID` =
+     * every key set. Requires the keys to have host snapshots (see rotationKeysLazy()). */
+    void OffloadRotationKeys(const std::vector<int>& indexes = {}, const KeyHash& keyID = {});
+    /** Pin/unpin a rotation key: pinned keys are never evicted by the cache. */
+    void PinRotationKey(int index, bool pin = true, const KeyHash& keyID = {});
+    [[nodiscard]] bool IsRotationKeyResident(int index, const KeyHash& keyID = {}) const;
+    /** Sum of VRAM bytes currently spent on resident rotation keys (all key sets). */
+    [[nodiscard]] size_t RotationKeyCacheResidentBytes() const;
+    /** }@ */
+
+    /** @name Bootstrap-precomputation VRAM cache
+     * Bound the VRAM spent on the linear-transform plaintexts of the bootstrap precomputation
+     * (the CoeffsToSlots/SlotsToCoeffs matrices) to `bootstrap_cache_bytes`. The unit of the
+     * cache is a group of plaintexts consumed together (one transform stage), which is loaded
+     * from a host RAM snapshot right before the stage runs. Same rules as the rotation-key
+     * cache: only groups built while a finite budget is set have a snapshot, and they cost no
+     * VRAM until first used; groups built without one stay resident for good. SIZE_MAX keeps
+     * the legacy behavior (everything resident, no snapshot).
+     *
+     * Eviction takes the most recently used group first, not the least recently used one: a
+     * bootstrap visits its stages in the same order every time, and under that cyclic pattern
+     * LRU always evicts the group needed soonest -- with a budget below the total it would
+     * reload every stage of every bootstrap. Evicting the most recent one keeps a fixed subset
+     * resident and streams only the rest. The budget is soft by one group: the group being
+     * loaded is never evicted, so a budget smaller than a stage still runs that stage.
+     * @{ */
+    void SetBootstrapCache(size_t bytes);
+
+    [[nodiscard]] size_t GetBootstrapCache() const {
+        return bootstrap_cache_bytes;
+    }
+
+    /** True while a finite budget is set; groups built now keep a snapshot and start offloaded. */
+    [[nodiscard]] bool bootstrapPrecomputationLazy() const {
+        return bootstrap_cache_bytes != SIZE_MAX;
+    }
+
+    /** Offload every group that has a snapshot, now. */
+    void OffloadBootstrapPrecomputation();
+    /** Sum of VRAM bytes currently held by resident groups (every slot count). */
+    [[nodiscard]] size_t BootstrapCacheResidentBytes() const;
+
+    /** Total bytes ever reloaded from host snapshots: its growth over one bootstrap is what the
+     * budget costs per bootstrap. */
+    [[nodiscard]] uint64_t BootstrapCacheLoadedBytes() const {
+        return bootstrap_cache_loaded_bytes;
+    }
+
+    /** Account a group that has just been built, resident, in `pts`. Under a finite budget
+     * `raws` (the host data it was built from) becomes its snapshot and the group is
+     * offloaded right away, so building a precomputation never needs more than one group of
+     * VRAM; otherwise `raws` is dropped. */
+    void AdmitBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts, std::vector<RawPlainText>&& raws);
+    /** Make a group resident (evicting others to fit the budget) right before a linear
+     * transform consumes it. Returns `pts`. */
+    std::vector<Plaintext>& AcquireBootBlock(BootCacheBlock& block, std::vector<Plaintext>& pts);
+    /** }@ */
+
+    /** @cond */
+    size_t bootstrap_cache_bytes = SIZE_MAX;
+    uint64_t bootstrap_cache_clock = 0;
+    uint64_t bootstrap_cache_loaded_bytes = 0;
+    size_t rotation_key_cache_bytes = SIZE_MAX;
+    /** Depth of active RotationKeyEvictionHold scopes. */
+    int rotation_key_eviction_hold = 0;
+    /** @endcond */
+
+    friend Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& devs);
+    friend void DeregisterCryptoContextGPU(const Parameters& param);
+    friend void DeregisterCryptoContextGPU(Context cc);
+    friend Context GetCurrentContext();
+    friend void SetCurrentContext(Context&);
 };
 
 Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& devs);
@@ -300,11 +323,18 @@ void SetCurrentContext(Context& cc);
  * still loaded on demand, just never evicted; the cache re-shrinks on the next load
  * outside the hold. */
 struct RotationKeyEvictionHold {
-	ContextData& cc;
-	explicit RotationKeyEvictionHold(ContextData& cc_) : cc(cc_) { ++cc.rotation_key_eviction_hold; }
-	~RotationKeyEvictionHold() { --cc.rotation_key_eviction_hold; }
-	RotationKeyEvictionHold(const RotationKeyEvictionHold&) = delete;
-	RotationKeyEvictionHold& operator=(const RotationKeyEvictionHold&) = delete;
+    ContextData& cc;
+
+    explicit RotationKeyEvictionHold(ContextData& cc_) : cc(cc_) {
+        ++cc.rotation_key_eviction_hold;
+    }
+
+    ~RotationKeyEvictionHold() {
+        --cc.rotation_key_eviction_hold;
+    }
+
+    RotationKeyEvictionHold(const RotationKeyEvictionHold&) = delete;
+    RotationKeyEvictionHold& operator=(const RotationKeyEvictionHold&) = delete;
 };
 
 /// @brief Give back to the CUDA driver every buffer sitting idle in the GPU allocator's
@@ -321,6 +351,5 @@ bool HasSecretSwitchingKey(const Context& a, const Context& b, const KeyHash& ke
 KeySwitchingKey& GetSecretSwitchingKey(const Context& a, const Context& b, const KeyHash& key_b);
 
 int32_t normalyzeIndex(int32_t index, int32_t slots, int32_t N);
-
 } // namespace FIDESlib::CKKS
 #endif // FIDESLIB_CKKS_CONTEXT_CUH

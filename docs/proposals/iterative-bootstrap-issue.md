@@ -1,3 +1,7 @@
+> Historical proposal, superseded by the upstream FIDESlib 2.2.0 integration.
+> The fork now uses upstream `Bootstrap(..., prescaled, numIterations, precision)`
+> and its bit-exact tests. `IterativeBootstrap` below describes the retired implementation.
+
 # Add iterative (Meta-BTS) bootstrapping to the GPU path
 
 ## Summary

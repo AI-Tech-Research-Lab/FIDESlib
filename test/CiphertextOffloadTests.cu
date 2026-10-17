@@ -14,125 +14,125 @@
 namespace FIDESlib::Testing {
 class CiphertextOffloadTest : public GeneralParametrizedTest {
   protected:
-	FIDESlib::CKKS::Context& SetupGPUContext() {
-		cc->Enable(lbcrypto::PKE);
-		cc->Enable(lbcrypto::KEYSWITCH);
-		cc->Enable(lbcrypto::LEVELEDSHE);
+    FIDESlib::CKKS::Context& SetupGPUContext() {
+        cc->Enable(lbcrypto::PKE);
+        cc->Enable(lbcrypto::KEYSWITCH);
+        cc->Enable(lbcrypto::LEVELEDSHE);
 
-		FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-		FIDESlib::CKKS::Context& cc_		= GPUcc;
-		cc_									= CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
-		return cc_;
-	}
+        FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+        FIDESlib::CKKS::Context& cc_ = GPUcc;
+        cc_ = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+        return cc_;
+    }
 };
 
 // 1. Bit-exact identity round trip: offload()+reload() must reproduce the exact same
 // RNS limbs and metadata as a plain store(), since only raw device<->host copies and
 // dealloc/realloc are involved (no decrypt/rescale/level-switch/NTT).
 TEST_P(CiphertextOffloadTest, BitExactRoundTrip) {
-	FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
+    FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
 
-	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
-	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
-	auto c1									= cc->Encrypt(keys.publicKey, ptxt1);
-	FIDESlib::CKKS::RawCipherText raw1		= FIDESlib::CKKS::GetRawCipherText(cc, c1);
+    std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+    auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+    FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
 
-	FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
+    FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
 
-	FIDESlib::CKKS::RawCipherText before;
-	GPUct.store(before);
+    FIDESlib::CKKS::RawCipherText before;
+    GPUct.store(before);
 
-	ASSERT_FALSE(GPUct.isOffloaded());
-	GPUct.offload();
-	ASSERT_TRUE(GPUct.isOffloaded());
-	GPUct.reload();
-	ASSERT_FALSE(GPUct.isOffloaded());
+    ASSERT_FALSE(GPUct.isOffloaded());
+    GPUct.offload();
+    ASSERT_TRUE(GPUct.isOffloaded());
+    GPUct.reload();
+    ASSERT_FALSE(GPUct.isOffloaded());
 
-	FIDESlib::CKKS::RawCipherText after;
-	GPUct.store(after);
+    FIDESlib::CKKS::RawCipherText after;
+    GPUct.store(after);
 
-	ASSERT_EQ(before.sub_0, after.sub_0);
-	ASSERT_EQ(before.sub_1, after.sub_1);
-	ASSERT_EQ(before.NoiseLevel, after.NoiseLevel);
-	ASSERT_EQ(before.Noise, after.Noise);
-	ASSERT_EQ(before.slots, after.slots);
-	ASSERT_EQ(before.keyid, after.keyid);
-	ASSERT_EQ(before.numRes, after.numRes);
+    ASSERT_EQ(before.sub_0, after.sub_0);
+    ASSERT_EQ(before.sub_1, after.sub_1);
+    ASSERT_EQ(before.NoiseLevel, after.NoiseLevel);
+    ASSERT_EQ(before.Noise, after.Noise);
+    ASSERT_EQ(before.slots, after.slots);
+    ASSERT_EQ(before.keyid, after.keyid);
+    ASSERT_EQ(before.numRes, after.numRes);
 }
 
 // 2. Correctness after reload: decrypting a reloaded ciphertext must match the original
 // plaintext, using the same tolerance-based comparison the rest of the suite uses.
 TEST_P(CiphertextOffloadTest, DecryptAfterReload) {
-	FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
+    FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
 
-	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
-	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
-	auto c1									= cc->Encrypt(keys.publicKey, ptxt1);
-	FIDESlib::CKKS::RawCipherText raw1		= FIDESlib::CKKS::GetRawCipherText(cc, c1);
+    std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+    auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+    FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
 
-	FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
+    FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
 
-	GPUct.offload();
-	GPUct.reload();
+    GPUct.offload();
+    GPUct.reload();
 
-	FIDESlib::CKKS::RawCipherText raw_res;
-	GPUct.store(raw_res);
-	auto cResGPU = c1->Clone();
-	GetOpenFHECipherText(cResGPU, raw_res);
+    FIDESlib::CKKS::RawCipherText raw_res;
+    GPUct.store(raw_res);
+    auto cResGPU = c1->Clone();
+    GetOpenFHECipherText(cResGPU, raw_res);
 
-	lbcrypto::Plaintext resultGPU;
-	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
-	resultGPU->SetLength(generalTestParams.batchSize);
+    lbcrypto::Plaintext resultGPU;
+    cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
+    resultGPU->SetLength(generalTestParams.batchSize);
 
-	lbcrypto::Plaintext result;
-	cc->Decrypt(keys.secretKey, c1, &result);
-	result->SetLength(generalTestParams.batchSize);
+    lbcrypto::Plaintext result;
+    cc->Decrypt(keys.secretKey, c1, &result);
+    result->SetLength(generalTestParams.batchSize);
 
-	ASSERT_ERROR_OK(result, resultGPU);
+    ASSERT_ERROR_OK(result, resultGPU);
 }
 
 // 3. Compute-after-reload: prove the reloaded ciphertext is fully functional by running a
 // GPU add and comparing against the CPU (OpenFHE) result.
 TEST_P(CiphertextOffloadTest, ComputeAfterReload) {
-	FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
+    FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
 
-	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
-	std::vector<double> x2 = { 5.0, 4.0, 3.0, 2.0, 1.0, 0.75, 0.5, 0.25 };
-	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
-	lbcrypto::Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x2);
-	auto c1									= cc->Encrypt(keys.publicKey, ptxt1);
-	auto c2									= cc->Encrypt(keys.publicKey, ptxt2);
-	FIDESlib::CKKS::RawCipherText raw1		= FIDESlib::CKKS::GetRawCipherText(cc, c1);
-	FIDESlib::CKKS::RawCipherText raw2		= FIDESlib::CKKS::GetRawCipherText(cc, c2);
+    std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    std::vector<double> x2 = { 5.0, 4.0, 3.0, 2.0, 1.0, 0.75, 0.5, 0.25 };
+    lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+    lbcrypto::Plaintext ptxt2 = cc->MakeCKKSPackedPlaintext(x2);
+    auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+    auto c2 = cc->Encrypt(keys.publicKey, ptxt2);
+    FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
+    FIDESlib::CKKS::RawCipherText raw2 = FIDESlib::CKKS::GetRawCipherText(cc, c2);
 
-	FIDESlib::CKKS::Ciphertext GPUct1(cc_, raw1);
-	FIDESlib::CKKS::Ciphertext GPUct2(cc_, raw2);
+    FIDESlib::CKKS::Ciphertext GPUct1(cc_, raw1);
+    FIDESlib::CKKS::Ciphertext GPUct2(cc_, raw2);
 
-	GPUct1.offload();
-	GPUct2.offload();
-	GPUct2.reload(); // an offloaded ciphertext used as a read-only operand is the caller's
-					  // responsibility to reload; only the receiver auto-reloads (see
-					  // ensureResident()'s doc comment).
+    GPUct1.offload();
+    GPUct2.offload();
+    GPUct2.reload(); // an offloaded ciphertext used as a read-only operand is the caller's
+                     // responsibility to reload; only the receiver auto-reloads (see
+                     // ensureResident()'s doc comment).
 
-	// add() must transparently reload `this` (GPUct1) rather than crash on freed pointers.
-	GPUct1.add(GPUct2);
-	ASSERT_FALSE(GPUct1.isOffloaded());
+    // add() must transparently reload `this` (GPUct1) rather than crash on freed pointers.
+    GPUct1.add(GPUct2);
+    ASSERT_FALSE(GPUct1.isOffloaded());
 
-	FIDESlib::CKKS::RawCipherText raw_res;
-	GPUct1.store(raw_res);
-	auto cResGPU = c1->Clone();
-	GetOpenFHECipherText(cResGPU, raw_res);
+    FIDESlib::CKKS::RawCipherText raw_res;
+    GPUct1.store(raw_res);
+    auto cResGPU = c1->Clone();
+    GetOpenFHECipherText(cResGPU, raw_res);
 
-	lbcrypto::Plaintext resultGPU;
-	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
-	resultGPU->SetLength(generalTestParams.batchSize);
+    lbcrypto::Plaintext resultGPU;
+    cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
+    resultGPU->SetLength(generalTestParams.batchSize);
 
-	auto cAdd = cc->EvalAdd(c1, c2);
-	lbcrypto::Plaintext result;
-	cc->Decrypt(keys.secretKey, cAdd, &result);
-	result->SetLength(generalTestParams.batchSize);
+    auto cAdd = cc->EvalAdd(c1, c2);
+    lbcrypto::Plaintext result;
+    cc->Decrypt(keys.secretKey, cAdd, &result);
+    result->SetLength(generalTestParams.batchSize);
 
-	ASSERT_ERROR_OK(result, resultGPU);
+    ASSERT_ERROR_OK(result, resultGPU);
 }
 
 // 4. VRAM is actually released. FIDESlib's GPU allocator (GPUmalloc/GPUfree in
@@ -145,112 +145,112 @@ TEST_P(CiphertextOffloadTest, ComputeAfterReload) {
 // shrinking. Absence of that continued shrinkage after a brief warm-up is the
 // equivalent, allocator-aware way to prove the memory is actually being released.
 TEST_P(CiphertextOffloadTest, VRAMReleasedNoLeakAcrossCycles) {
-	FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
+    FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
 
-	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
-	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
-	auto c1									= cc->Encrypt(keys.publicKey, ptxt1);
-	FIDESlib::CKKS::RawCipherText raw1		= FIDESlib::CKKS::GetRawCipherText(cc, c1);
+    std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+    auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+    FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
 
-	constexpr int kWarmupCycles = 4;
-	constexpr int kMeasuredCycles = 40;
+    constexpr int kWarmupCycles = 4;
+    constexpr int kMeasuredCycles = 40;
 
-	auto cycle = [&]() {
-		FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
-		GPUct.offload();
-		cudaDeviceSynchronize();
-		GPUct.reload();
-		cudaDeviceSynchronize();
-	};
+    auto cycle = [&]() {
+        FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
+        GPUct.offload();
+        cudaDeviceSynchronize();
+        GPUct.reload();
+        cudaDeviceSynchronize();
+    };
 
-	// Warm up: first-touch of each distinct limb byte-size pulls a fresh slab from the
-	// driver; subsequent cycles of the same size should just recycle pool entries.
-	for (int i = 0; i < kWarmupCycles; ++i) {
-		cycle();
-	}
+    // Warm up: first-touch of each distinct limb byte-size pulls a fresh slab from the
+    // driver; subsequent cycles of the same size should just recycle pool entries.
+    for (int i = 0; i < kWarmupCycles; ++i) {
+        cycle();
+    }
 
-	size_t free_before = 0, total = 0;
-	cudaMemGetInfo(&free_before, &total);
+    size_t free_before = 0, total = 0;
+    cudaMemGetInfo(&free_before, &total);
 
-	for (int i = 0; i < kMeasuredCycles; ++i) {
-		cycle();
-	}
+    for (int i = 0; i < kMeasuredCycles; ++i) {
+        cycle();
+    }
 
-	size_t free_after = 0;
-	cudaMemGetInfo(&free_after, &total);
+    size_t free_after = 0;
+    cudaMemGetInfo(&free_after, &total);
 
-	// Allow a small amount of slack for unrelated allocator bookkeeping, but a real leak
-	// across dozens of same-shaped alloc/free cycles would dwarf this tolerance.
-	constexpr long long kToleranceBytes = 16ll * 1024 * 1024;
-	ASSERT_GE(static_cast<long long>(free_after) + kToleranceBytes, static_cast<long long>(free_before));
+    // Allow a small amount of slack for unrelated allocator bookkeeping, but a real leak
+    // across dozens of same-shaped alloc/free cycles would dwarf this tolerance.
+    constexpr long long kToleranceBytes = 16ll * 1024 * 1024;
+    ASSERT_GE(static_cast<long long>(free_after) + kToleranceBytes, static_cast<long long>(free_before));
 }
 
 // 5. Idempotence / boundaries: double offload, double reload, offloading a level-0
 // ciphertext, and offloading one that has already been dropped to a low level.
 TEST_P(CiphertextOffloadTest, IdempotentAndBoundaryLevels) {
-	FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
+    FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
 
-	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
-	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
-	auto c1									= cc->Encrypt(keys.publicKey, ptxt1);
-	FIDESlib::CKKS::RawCipherText raw1		= FIDESlib::CKKS::GetRawCipherText(cc, c1);
+    std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+    auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+    FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
 
-	// Double offload / double reload are no-ops.
-	{
-		FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
-		FIDESlib::CKKS::RawCipherText before;
-		GPUct.store(before);
+    // Double offload / double reload are no-ops.
+    {
+        FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
+        FIDESlib::CKKS::RawCipherText before;
+        GPUct.store(before);
 
-		GPUct.offload();
-		GPUct.offload();
-		ASSERT_TRUE(GPUct.isOffloaded());
-		GPUct.reload();
-		GPUct.reload();
-		ASSERT_FALSE(GPUct.isOffloaded());
+        GPUct.offload();
+        GPUct.offload();
+        ASSERT_TRUE(GPUct.isOffloaded());
+        GPUct.reload();
+        GPUct.reload();
+        ASSERT_FALSE(GPUct.isOffloaded());
 
-		FIDESlib::CKKS::RawCipherText after;
-		GPUct.store(after);
-		ASSERT_EQ(before.sub_0, after.sub_0);
-		ASSERT_EQ(before.sub_1, after.sub_1);
-	}
+        FIDESlib::CKKS::RawCipherText after;
+        GPUct.store(after);
+        ASSERT_EQ(before.sub_0, after.sub_0);
+        ASSERT_EQ(before.sub_1, after.sub_1);
+    }
 
-	// Level-0 (single-limb) ciphertext round trip.
-	{
-		FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
-		GPUct.dropToLevel(0, true);
-		ASSERT_EQ(GPUct.getLevel(), 0);
+    // Level-0 (single-limb) ciphertext round trip.
+    {
+        FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
+        GPUct.dropToLevel(0, true);
+        ASSERT_EQ(GPUct.getLevel(), 0);
 
-		FIDESlib::CKKS::RawCipherText before;
-		GPUct.store(before);
+        FIDESlib::CKKS::RawCipherText before;
+        GPUct.store(before);
 
-		GPUct.offload();
-		GPUct.reload();
-		ASSERT_EQ(GPUct.getLevel(), 0);
+        GPUct.offload();
+        GPUct.reload();
+        ASSERT_EQ(GPUct.getLevel(), 0);
 
-		FIDESlib::CKKS::RawCipherText after;
-		GPUct.store(after);
-		ASSERT_EQ(before.sub_0, after.sub_0);
-		ASSERT_EQ(before.sub_1, after.sub_1);
-	}
+        FIDESlib::CKKS::RawCipherText after;
+        GPUct.store(after);
+        ASSERT_EQ(before.sub_0, after.sub_0);
+        ASSERT_EQ(before.sub_1, after.sub_1);
+    }
 
-	// A ciphertext already dropped to a low (but not 0) level.
-	if (GPUcc->L >= 2) {
-		FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
-		GPUct.dropToLevel(1, true);
-		ASSERT_EQ(GPUct.getLevel(), 1);
+    // A ciphertext already dropped to a low (but not 0) level.
+    if (GPUcc->L >= 2) {
+        FIDESlib::CKKS::Ciphertext GPUct(cc_, raw1);
+        GPUct.dropToLevel(1, true);
+        ASSERT_EQ(GPUct.getLevel(), 1);
 
-		FIDESlib::CKKS::RawCipherText before;
-		GPUct.store(before);
+        FIDESlib::CKKS::RawCipherText before;
+        GPUct.store(before);
 
-		GPUct.offload();
-		GPUct.reload();
-		ASSERT_EQ(GPUct.getLevel(), 1);
+        GPUct.offload();
+        GPUct.reload();
+        ASSERT_EQ(GPUct.getLevel(), 1);
 
-		FIDESlib::CKKS::RawCipherText after;
-		GPUct.store(after);
-		ASSERT_EQ(before.sub_0, after.sub_0);
-		ASSERT_EQ(before.sub_1, after.sub_1);
-	}
+        FIDESlib::CKKS::RawCipherText after;
+        GPUct.store(after);
+        ASSERT_EQ(before.sub_0, after.sub_0);
+        ASSERT_EQ(before.sub_1, after.sub_1);
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(CiphertextOffloadTests, CiphertextOffloadTest, testing::Values(TTALL64));
@@ -267,78 +267,78 @@ INSTANTIATE_TEST_SUITE_P(CiphertextOffloadTests, CiphertextOffloadTest, testing:
 // slabs exclusively with these ciphertexts' limbs, which trim can then release.
 class CiphertextBulkOffloadTest : public GeneralParametrizedTest {
   protected:
-	FIDESlib::CKKS::Context& SetupGPUContext() {
-		cc->Enable(lbcrypto::PKE);
-		cc->Enable(lbcrypto::KEYSWITCH);
-		cc->Enable(lbcrypto::LEVELEDSHE);
+    FIDESlib::CKKS::Context& SetupGPUContext() {
+        cc->Enable(lbcrypto::PKE);
+        cc->Enable(lbcrypto::KEYSWITCH);
+        cc->Enable(lbcrypto::LEVELEDSHE);
 
-		FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-		FIDESlib::CKKS::Context& cc_		= GPUcc;
-		cc_									= CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
-		return cc_;
-	}
+        FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+        FIDESlib::CKKS::Context& cc_ = GPUcc;
+        cc_ = CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+        return cc_;
+    }
 };
 
 TEST_P(CiphertextBulkOffloadTest, TrimReclaimsOffloadedVRAM) {
-	FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
+    FIDESlib::CKKS::Context& cc_ = SetupGPUContext();
 
-	std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
-	lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
+    std::vector<double> x1 = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
 
-	constexpr int kNumCiphertexts = 16;
-	std::vector<std::unique_ptr<FIDESlib::CKKS::Ciphertext>> cts;
-	cts.reserve(kNumCiphertexts);
-	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> first_cpu; // kept to check correctness later
+    constexpr int kNumCiphertexts = 16;
+    std::vector<std::unique_ptr<FIDESlib::CKKS::Ciphertext>> cts;
+    cts.reserve(kNumCiphertexts);
+    lbcrypto::Ciphertext<lbcrypto::DCRTPoly> first_cpu; // kept to check correctness later
 
-	size_t total = 0, free_resident = 0;
-	for (int i = 0; i < kNumCiphertexts; ++i) {
-		auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
-		if (i == 0)
-			first_cpu = c1;
-		FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
-		cts.push_back(std::make_unique<FIDESlib::CKKS::Ciphertext>(cc_, raw1));
-	}
-	cudaDeviceSynchronize();
-	cudaMemGetInfo(&free_resident, &total); // VRAM free with the batch resident on the GPU
+    size_t total = 0, free_resident = 0;
+    for (int i = 0; i < kNumCiphertexts; ++i) {
+        auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+        if (i == 0)
+            first_cpu = c1;
+        FIDESlib::CKKS::RawCipherText raw1 = FIDESlib::CKKS::GetRawCipherText(cc, c1);
+        cts.push_back(std::make_unique<FIDESlib::CKKS::Ciphertext>(cc_, raw1));
+    }
+    cudaDeviceSynchronize();
+    cudaMemGetInfo(&free_resident, &total); // VRAM free with the batch resident on the GPU
 
-	for (auto& ct : cts)
-		ct->offload();
-	cudaDeviceSynchronize();
-	size_t free_after_offload = 0;
-	cudaMemGetInfo(&free_after_offload, &total);
+    for (auto& ct : cts)
+        ct->offload();
+    cudaDeviceSynchronize();
+    size_t free_after_offload = 0;
+    cudaMemGetInfo(&free_after_offload, &total);
 
-	FIDESlib::CKKS::TrimGPUMemoryPool(cc_);
-	cudaDeviceSynchronize();
-	size_t free_after_trim = 0;
-	cudaMemGetInfo(&free_after_trim, &total);
+    FIDESlib::CKKS::TrimGPUMemoryPool(cc_);
+    cudaDeviceSynchronize();
+    size_t free_after_trim = 0;
+    cudaMemGetInfo(&free_after_trim, &total);
 
-	long long reclaimed_by_offload = (long long)free_after_offload - (long long)free_resident;
-	long long reclaimed_by_trim	   = (long long)free_after_trim - (long long)free_resident;
-	std::cout << "reclaimed by offload() alone: " << (reclaimed_by_offload >> 20) << " MiB, "
-			  << "reclaimed after TrimGPUMemoryPool(): " << (reclaimed_by_trim >> 20) << " MiB" << std::endl;
+    long long reclaimed_by_offload = (long long)free_after_offload - (long long)free_resident;
+    long long reclaimed_by_trim = (long long)free_after_trim - (long long)free_resident;
+    std::cout << "reclaimed by offload() alone: " << (reclaimed_by_offload >> 20) << " MiB, "
+              << "reclaimed after TrimGPUMemoryPool(): " << (reclaimed_by_trim >> 20) << " MiB" << std::endl;
 
-	constexpr long long kHalfGiB = 512ll * 1024 * 1024;
-	// offload() pools the limbs; on its own it must not hand VRAM back to the OS.
-	ASSERT_LT(reclaimed_by_offload, kHalfGiB);
-	// trim must return at least a full slab's worth of VRAM to the OS.
-	ASSERT_GT(reclaimed_by_trim, kHalfGiB);
+    constexpr long long kHalfGiB = 512ll * 1024 * 1024;
+    // offload() pools the limbs; on its own it must not hand VRAM back to the OS.
+    ASSERT_LT(reclaimed_by_offload, kHalfGiB);
+    // trim must return at least a full slab's worth of VRAM to the OS.
+    ASSERT_GT(reclaimed_by_trim, kHalfGiB);
 
-	// After its VRAM was reclaimed, a ciphertext must still reload and decrypt correctly.
-	cts.front()->reload();
-	FIDESlib::CKKS::RawCipherText raw_res;
-	cts.front()->store(raw_res);
-	auto cResGPU = first_cpu->Clone();
-	GetOpenFHECipherText(cResGPU, raw_res);
+    // After its VRAM was reclaimed, a ciphertext must still reload and decrypt correctly.
+    cts.front()->reload();
+    FIDESlib::CKKS::RawCipherText raw_res;
+    cts.front()->store(raw_res);
+    auto cResGPU = first_cpu->Clone();
+    GetOpenFHECipherText(cResGPU, raw_res);
 
-	lbcrypto::Plaintext resultGPU;
-	cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
-	resultGPU->SetLength(generalTestParams.batchSize);
+    lbcrypto::Plaintext resultGPU;
+    cc->Decrypt(keys.secretKey, cResGPU, &resultGPU);
+    resultGPU->SetLength(generalTestParams.batchSize);
 
-	lbcrypto::Plaintext expected;
-	cc->Decrypt(keys.secretKey, first_cpu, &expected);
-	expected->SetLength(generalTestParams.batchSize);
+    lbcrypto::Plaintext expected;
+    cc->Decrypt(keys.secretKey, first_cpu, &expected);
+    expected->SetLength(generalTestParams.batchSize);
 
-	ASSERT_ERROR_OK(expected, resultGPU);
+    ASSERT_ERROR_OK(expected, resultGPU);
 }
 
 INSTANTIATE_TEST_SUITE_P(CiphertextBulkOffloadTests, CiphertextBulkOffloadTest, testing::Values(tparams64_17_flex));

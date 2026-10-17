@@ -57,82 +57,82 @@ using namespace fideslib;
 
 int main() {
 
-	// Step 1: Setup CryptoContext.
+    // Step 1: Setup CryptoContext.
 
-	uint32_t multDepth	  = 5;
-	uint32_t scaleModSize = 50;
-	uint32_t batchSize	  = 8;
+    uint32_t multDepth = 5;
+    uint32_t scaleModSize = 50;
+    uint32_t batchSize = 8;
 
-	CCParams<CryptoContextCKKSRNS> parameters;
-	parameters.SetMultiplicativeDepth(multDepth);
-	parameters.SetScalingModSize(scaleModSize);
-	parameters.SetBatchSize(batchSize);
-	parameters.SetDevices({ 0 });
-	parameters.SetPlaintextAutoload(false);
-	// Autoload an offloaded ciphertext back to the GPU automatically on first use, so you
-	// do not have to call Reload() explicitly before operating on it.
-	parameters.SetCiphertextAutoload(true);
+    CCParams<CryptoContextCKKSRNS> parameters;
+    parameters.SetMultiplicativeDepth(multDepth);
+    parameters.SetScalingModSize(scaleModSize);
+    parameters.SetBatchSize(batchSize);
+    parameters.SetDevices({ 0 });
+    parameters.SetPlaintextAutoload(false);
+    // Autoload an offloaded ciphertext back to the GPU automatically on first use, so you
+    // do not have to call Reload() explicitly before operating on it.
+    parameters.SetCiphertextAutoload(true);
 
-	CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
-	cc->Enable(PKE);
-	cc->Enable(KEYSWITCH);
-	cc->Enable(LEVELEDSHE);
+    cc->Enable(PKE);
+    cc->Enable(KEYSWITCH);
+    cc->Enable(LEVELEDSHE);
 
-	std::cout << "CKKS scheme is using ring dimension " << cc->GetRingDimension() << std::endl;
+    std::cout << "CKKS scheme is using ring dimension " << cc->GetRingDimension() << std::endl;
 
-	// Step 2: Key Generation and context load onto the GPU.
+    // Step 2: Key Generation and context load onto the GPU.
 
-	auto keys = cc->KeyGen();
-	cc->EvalMultKeyGen(keys.secretKey);
-	cc->LoadContext(keys.publicKey);
+    auto keys = cc->KeyGen();
+    cc->EvalMultKeyGen(keys.secretKey);
+    cc->LoadContext(keys.publicKey);
 
-	// Step 3: Encrypt a batch of ciphertexts we want to keep around for later, but which we
-	// do not need on the GPU right now.
+    // Step 3: Encrypt a batch of ciphertexts we want to keep around for later, but which we
+    // do not need on the GPU right now.
 
-	std::vector<double> x = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
-	Plaintext ptxt		  = cc->MakeCKKSPackedPlaintext(x);
+    std::vector<double> x = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
+    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(x);
 
-	constexpr int kCached = 8;
-	std::vector<Ciphertext<DCRTPoly>> cached;
-	cached.reserve(kCached);
-	for (int i = 0; i < kCached; ++i) {
-		cached.push_back(cc->Encrypt(keys.publicKey, ptxt));
-	}
-	std::cout << "Encrypted " << kCached << " ciphertexts, all resident on the GPU." << std::endl;
+    constexpr int kCached = 8;
+    std::vector<Ciphertext<DCRTPoly>> cached;
+    cached.reserve(kCached);
+    for (int i = 0; i < kCached; ++i) {
+        cached.push_back(cc->Encrypt(keys.publicKey, ptxt));
+    }
+    std::cout << "Encrypted " << kCached << " ciphertexts, all resident on the GPU." << std::endl;
 
-	// Step 4: Offload them to host RAM to free VRAM for other work.
+    // Step 4: Offload them to host RAM to free VRAM for other work.
 
-	for (auto& ct : cached) {
-		ct->Offload();
-	}
-	std::cout << "Offloaded all " << kCached << " ciphertexts (IsOffloaded[0] = " << std::boolalpha << cached[0]->IsOffloaded() << ")." << std::endl;
+    for (auto& ct : cached) {
+        ct->Offload();
+    }
+    std::cout << "Offloaded all " << kCached << " ciphertexts (IsOffloaded[0] = " << std::boolalpha << cached[0]->IsOffloaded() << ")." << std::endl;
 
-	// Return the freed memory to the OS. Skip this if you only intend to reuse the memory
-	// for more FIDESlib operations - the internal pool already recycles it for free.
-	cc->TrimGPUMemoryPool();
-	std::cout << "Trimmed the GPU memory pool: VRAM handed back to the system." << std::endl;
+    // Return the freed memory to the OS. Skip this if you only intend to reuse the memory
+    // for more FIDESlib operations - the internal pool already recycles it for free.
+    cc->TrimGPUMemoryPool();
+    std::cout << "Trimmed the GPU memory pool: VRAM handed back to the system." << std::endl;
 
-	// Step 5: Do other GPU work while the batch sits in host RAM. This fresh ciphertext uses
-	// the VRAM the offloaded batch is no longer occupying.
+    // Step 5: Do other GPU work while the batch sits in host RAM. This fresh ciphertext uses
+    // the VRAM the offloaded batch is no longer occupying.
 
-	auto other	= cc->Encrypt(keys.publicKey, ptxt);
-	auto doubled = cc->EvalAdd(other, other);
-	Plaintext otherResult;
-	cc->Decrypt(keys.secretKey, doubled, &otherResult);
-	otherResult->SetLength(batchSize);
-	std::cout.precision(8);
-	std::cout << "Meanwhile, 2 * x on a fresh ciphertext = " << otherResult;
+    auto other = cc->Encrypt(keys.publicKey, ptxt);
+    auto doubled = cc->EvalAdd(other, other);
+    Plaintext otherResult;
+    cc->Decrypt(keys.secretKey, doubled, &otherResult);
+    otherResult->SetLength(batchSize);
+    std::cout.precision(8);
+    std::cout << "Meanwhile, 2 * x on a fresh ciphertext = " << otherResult;
 
-	// Step 6: Bring a cached ciphertext back and use it. With CiphertextAutoload enabled the
-	// reload happens automatically on first use; Reload() would do it explicitly.
-	auto sum = cc->EvalAdd(cached[0], cached[1]); // cached[0], cached[1] auto-reload here
+    // Step 6: Bring a cached ciphertext back and use it. With CiphertextAutoload enabled the
+    // reload happens automatically on first use; Reload() would do it explicitly.
+    auto sum = cc->EvalAdd(cached[0], cached[1]); // cached[0], cached[1] auto-reload here
 
-	Plaintext result;
-	cc->Decrypt(keys.secretKey, sum, &result);
-	result->SetLength(batchSize);
-	std::cout << "After reload, cached[0] + cached[1] = " << result;
-	std::cout << "(each was x, so the result is 2 * x, recovered bit-exactly after offload)" << std::endl;
+    Plaintext result;
+    cc->Decrypt(keys.secretKey, sum, &result);
+    result->SetLength(batchSize);
+    std::cout << "After reload, cached[0] + cached[1] = " << result;
+    std::cout << "(each was x, so the result is 2 * x, recovered bit-exactly after offload)" << std::endl;
 
-	return 0;
+    return 0;
 }

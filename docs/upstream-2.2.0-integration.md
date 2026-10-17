@@ -129,3 +129,14 @@ I log/XML sono in `build/upstream-2.2.0/python-integration-*.{log,xml}`;
 `python-integration-fixes-single.xml` contiene il primo giro con 84 pass e i due nuovi test
 ancora da correggere nel setup, mentre `python-integration-final-{single,multi}.xml`
 contiene il risultato definitivo 2/2 di entrambe le regressioni.
+
+La verifica Python ha inoltre rilevato un crash a fine processo con
+`SPARSE_ENCAPSULATED`: il contesto GPU ausiliario, referenziato debolmente dalla
+precomputazione, rimaneva proprieta' del registro globale dopo la distruzione del
+contesto API. Ora la deregistrazione rilascia anche gli ausiliari che non sono usati da
+altri contesti registrati, e il registro delle chiavi viene distrutto dopo i contesti.
+Il nuovo test verifica tramite `weak_ptr` il rilascio effettivo e la ricreazione di due
+contesti consecutivi. La suite finale `ForkCacheIntegration.*:Upstream220/*` passa
+**12/12 su una GPU e 12/12 su due GPU**, inclusi i tre casi emersi durante l'integrazione
+Python. Risultati in `sparse-context-release-{single,multi}.{log,xml}` nella stessa
+cartella di build.

@@ -6,6 +6,7 @@
 #include "fideslib.hpp"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Plaintext.cuh"
+#include "CKKS/BootstrapPrecomputation.cuh"
 
 using namespace fideslib;
 

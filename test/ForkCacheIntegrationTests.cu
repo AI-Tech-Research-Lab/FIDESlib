@@ -228,3 +228,35 @@ TEST(ForkCacheIntegration, DotProductWithCompressedPlaintextsAndAliasedOutput) {
         ASSERT_EQ_CIPHERTEXT(expected, inputs[0]);
     }
 }
+
+TEST(ForkCacheIntegration, SparseAuxiliaryContextReleasedWithApiOwner) {
+    std::weak_ptr<FIDESlib::CKKS::ContextData> mainContext, sparseContext;
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        {
+            CCParams<CryptoContextCKKSRNS> params;
+            params.SetSecurityLevel(HEStd_NotSet);
+            params.SetRingDim(4096);
+            params.SetBatchSize(8);
+            params.SetMultiplicativeDepth(25);
+            params.SetScalingModSize(59);
+            params.SetFirstModSize(60);
+            params.SetScalingTechnique(FLEXIBLEAUTO);
+            params.SetSecretKeyDist(SPARSE_ENCAPSULATED);
+            auto cc = GenCryptoContext(params);
+            for (auto feature : { PKE, KEYSWITCH, LEVELEDSHE, ADVANCEDSHE, FHE })
+                cc->Enable(feature);
+            auto keys = cc->KeyGen();
+            cc->EvalMultKeyGen(keys.secretKey);
+            cc->EvalBootstrapSetup({ 3, 3 }, { 0, 0 }, 8);
+            cc->EvalBootstrapKeyGen(keys.secretKey, 8);
+            cc->SetDevices(devices);
+            cc->LoadContext(keys.publicKey);
+            auto& gpu = std::any_cast<FIDESlib::CKKS::Context&>(cc->gpu);
+            mainContext = gpu;
+            sparseContext = gpu->GetBootPrecomputation(8).sparse_context;
+            ASSERT_FALSE(sparseContext.expired());
+        }
+        EXPECT_TRUE(mainContext.expired());
+        EXPECT_TRUE(sparseContext.expired());
+    }
+}

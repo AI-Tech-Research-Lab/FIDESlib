@@ -34,11 +34,11 @@ namespace FIDESlib::CKKS {
 std::atomic_uint64_t next_uid = 0;
 constexpr bool SPLIT_SPECIAL = true;
 
+// Context destructors purge their switching keys, so the store must outlive both
+// context owners (globals are destroyed in reverse declaration order).
+std::vector<std::pair<std::pair<Parameters, Parameters>, std::unique_ptr<std::map<KeyHash, KeySwitchingKey>>>> map_param_switch;
 std::map<Parameters, std::shared_ptr<ContextData>> map_param_context;
 Context currentContext;
-
-// std::map<std::pair<Parameters, Parameters>, std::shared_ptr<std::map<KeyHash, KeySwitchingKey>>> map_param_switch;
-std::vector<std::pair<std::pair<Parameters, Parameters>, std::unique_ptr<std::map<KeyHash, KeySwitchingKey>>>> map_param_switch;
 
 /* Communicate internally if ContextData created succesfully, on unsuccessful creation,
  * its param field contains a "normalized" version for caching */
@@ -1489,6 +1489,16 @@ Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& dev
 }
 
 void DeregisterCryptoContextGPU(const Parameters& param) {
+    // Keep the retiring context alive until its switching keys and auxiliary registry
+    // entries are removed. Sparse auxiliaries have no API owner of their own.
+    auto registered = map_param_context.find(param);
+    Context retiring = registered == map_param_context.end() ? nullptr : registered->second;
+    std::vector<Context> auxiliaries;
+    if (retiring) {
+        for (const auto& [slots, precomp] : retiring->precom.boot)
+            if (auto auxiliary = precomp.sparse_context.lock(); auxiliary && auxiliary != retiring)
+                auxiliaries.push_back(std::move(auxiliary));
+    }
     // Purge the secret-switching keys that touch this context BEFORE its last shared_ptr can be
     // released. KeySwitchingKey / RNSPoly / LimbPartition hold a raw ContextData& (not a
     // shared_ptr), so a firing key would dereference a dead context: observed as a use-after-free
@@ -1505,6 +1515,15 @@ void DeregisterCryptoContextGPU(const Parameters& param) {
     map_param_context.erase(param);
     if (currentContext && currentContext->param == param) {
         currentContext.reset();
+    }
+    for (const auto& auxiliary : auxiliaries) {
+        bool shared = false;
+        for (const auto& [otherParam, other] : map_param_context) {
+            for (const auto& [slots, precomp] : other->precom.boot)
+                shared |= precomp.sparse_context.lock() == auxiliary;
+        }
+        if (!shared)
+            DeregisterCryptoContextGPU(auxiliary->param);
     }
 }
 

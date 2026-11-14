@@ -458,14 +458,14 @@ static void BootstrapIterativeImpl(Ciphertext& ctxt,
 // down to the level where the decode-first SlotsToCoeffs precomputation lives
 // (OpenFHE expectedLevel = L0 - (lvlbDec + 2 + (FLEXIBLEAUTOEXT ? 1 : 0)), which
 // is lvlbDec + 1 + ext in FIDESlib level space), or throw when the input is
-// already deeper than that.
-static void DepleteForStCFirst(Ciphertext& ctxt, const int slots) {
+// already deeper than that. `who` names the operation in that error.
+static void DepleteForStCFirst(Ciphertext& ctxt, const int slots, const char* who) {
     ContextData& cc = ctxt.cc;
     const int expectedLevel = cc.GetBootPrecomputation(slots).lvlbDec + 1 +
         (cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT ? 1 : 0);
 
     if (ctxt.getLevel() < expectedLevel + ctxt.NoiseLevel - 1) {
-        throw std::runtime_error("Not enough levels to perform Bootstrapping.");
+        throw std::runtime_error(std::string("Not enough levels to perform ") + who + ".");
     }
 
     // ModReduceInternalInPlace(ct, noiseDeg - 1).
@@ -515,37 +515,28 @@ static void DepleteForStCFirst(Ciphertext& ctxt, const int slots) {
     }
 }
 
-// The decode-first single-iteration pipeline: bit-compat transcription of
-// FHECKKSRNS::EvalBootstrapStCFirst (numIterations == 1, lines 1434-1688).
-// Unlike the mod-raise-first flavor, the SlotsToCoeffs decode runs on the
-// *depleted* input before the modulus raise, and there is no trailing decode
-// nor sparse doubling; the pipeline ends in the slots domain.
-static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool prescaled) {
-    CudaNvtxRange r(std::string{ sc::current().function_name() });
-
-    assert(slots >= ctxt.slots);
-    const int old_slots = ctxt.slots;
-
+// The shared prefix of the two decode-first pipelines (EvalBootstrapStCFirst and
+// EvalFEFuncBootstrapExp): deplete -> SlotsToCoeffs -> sparse fold -> ModRaise ->
+// normalize -> PartialSum -> CoeffsToSlots -> conj+add -> pre-Chebyshev rescale.
+// `correction` is the exponent of the 2^-correction folded into the pre-raise
+// adjustment (AdjustCiphertext), `normalization` the scalar applied right after
+// the raise. On return `ctxt.slots` is the effective CoeffsToSlots slot count
+// (2 * slots when sparsely packed); the caller restores it.
+static void DecodeRaiseEncode(Ciphertext& ctxt,
+    const int slots,
+    const uint32_t correction,
+    const double normalization,
+    const bool prescaled,
+    const char* who) {
     Context& cc_ = ctxt.cc_;
     ContextData& cc = ctxt.cc;
     Ciphertext aux(cc_);
     const bool isLT = cc.GetBootPrecomputation(slots).LT.slots == slots;
-
-    // Same prologue as the mod-raise-first flavor (q/p/deg/correction/pre/scalar).
-    uint64_t q = cc.prime[0].p;
-    double qDouble = (double)q; // q.ConvertToDouble();
-    const auto p = cc.param.raw->p; // cryptoParams->GetPlaintextModulus();
-    double powP = pow(2, p);
-    int32_t deg = std::round(std::log2(qDouble / powP));
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
-    double post = std::pow(2, static_cast<double>(deg));
-    double pre = 1. / post;
-    uint64_t scalar = std::llround(post);
-    bool sparse_encaps = cc.GetBootPrecomputation(slots).sparse_encaps;
+    const bool sparse_encaps = cc.GetBootPrecomputation(slots).sparse_encaps;
 
     // Deplete the input to the decode level, then run the decode (SlotsToCoeffs)
     // FIRST, before the modulus raise.
-    DepleteForStCFirst(ctxt, slots);
+    DepleteForStCFirst(ctxt, slots, who);
     if (isLT) {
         EvalLinearTransform(ctxt, slots, true);
     } else {
@@ -568,12 +559,10 @@ static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool pre
     }
 
     // The remainder coincides with the mod-raise-first pipeline
-    // (ModRaise -> normalize -> PartialSum -> CtS encode -> sine).
+    // (ModRaise -> normalize -> PartialSum -> CtS encode).
     ModRaise(ctxt, slots, correction, prescaled, sparse_encaps);
 
-    double k = cc.GetBootK();
-    double constantEvalMult = pre * (1.0 / (k * cc.N));
-    ctxt.multScalar(constantEvalMult, false);
+    ctxt.multScalar(normalization, false);
     if (MODRAISE_WITH_P0) {
         ctxt.rescaleInternal();
     }
@@ -593,15 +582,46 @@ static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool pre
         EvalCoeffsToSlots(ctxt, slots, false);
     }
 
-    // conj + add, then the single-part approximate mod-reduction: EvalBootstrapStCFirst
-    // evaluates the Chebyshev series over one ciphertext for REAL data (the OpenFHE
-    // default), with no ctxtEncI component.
+    // conj + add: both decode-first pipelines evaluate their Chebyshev series over one
+    // ciphertext (the real channel), with no ctxtEncI component.
     aux.conjugate(ctxt);
     ctxt.add(aux);
     if (cc.rescaleTechnique == CKKS::FIXEDMANUAL)
         ctxt.rescaleInternal();
     else if (ctxt.NoiseLevel == 2)
         ctxt.rescaleInternal(); // OpenFHE ModReduceInternalInPlace before the Chebyshev series
+}
+
+// The decode-first single-iteration pipeline: bit-compat transcription of
+// FHECKKSRNS::EvalBootstrapStCFirst (numIterations == 1, lines 1434-1688).
+// Unlike the mod-raise-first flavor, the SlotsToCoeffs decode runs on the
+// *depleted* input before the modulus raise, and there is no trailing decode
+// nor sparse doubling; the pipeline ends in the slots domain.
+static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool prescaled) {
+    CudaNvtxRange r(std::string{ sc::current().function_name() });
+
+    assert(slots >= ctxt.slots);
+    const int old_slots = ctxt.slots;
+
+    ContextData& cc = ctxt.cc;
+
+    // Same prologue as the mod-raise-first flavor (q/p/deg/correction/pre/scalar).
+    uint64_t q = cc.prime[0].p;
+    double qDouble = (double)q; // q.ConvertToDouble();
+    const auto p = cc.param.raw->p; // cryptoParams->GetPlaintextModulus();
+    double powP = pow(2, p);
+    int32_t deg = std::round(std::log2(qDouble / powP));
+    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    double post = std::pow(2, static_cast<double>(deg));
+    double pre = 1. / post;
+    uint64_t scalar = std::llround(post);
+
+    double k = cc.GetBootK();
+    double constantEvalMult = pre * (1.0 / (k * cc.N));
+    DecodeRaiseEncode(ctxt, slots, correction, constantEvalMult, prescaled, "Bootstrapping");
+
+    // Single-part approximate mod-reduction: EvalBootstrapStCFirst evaluates the
+    // Chebyshev series over one ciphertext for REAL data (the OpenFHE default).
     approxModReductionSparse(ctxt, scalar);
 
     // Decode-first flavor: no trailing SlotsToCoeffs nor sparse doubling; scale

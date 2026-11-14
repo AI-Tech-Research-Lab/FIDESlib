@@ -100,17 +100,18 @@ enum SecurityLevel {
 /// @brief The bootstrapping mode a slot's precomputation was set up for.
 ///
 /// OpenFHE keeps a single bootstrapping precomputation entry per slot count
-/// (`m_bootPrecomMap[slots]`), shared by the standard (ModRaise-first) bootstrap and the
-/// SlotsToCoeffs-first bootstrap. A slot can therefore be configured for exactly one of these
-/// modes at a time, and evaluating the other mode against it would silently misroute (e.g. a
-/// decode-first setup read back as the standard bootstrap). This enum lets the api guard against
-/// that.
+/// (`m_bootPrecomMap[slots]`), shared by the standard (ModRaise-first) bootstrap, the
+/// SlotsToCoeffs-first bootstrap and the FE functional bootstrap. A slot can therefore be
+/// configured for exactly one of these modes at a time, and evaluating another mode against it
+/// would silently misroute (e.g. a decode-first setup read back as the standard bootstrap, or an
+/// FE setup, whose CoeffsToSlots matrix folds a different overflow bound K, used for a standard
+/// bootstrap). This enum lets the api guard against that.
 enum class BootstrapMode {
     UNCONFIGURED = 0, ///< no setup ran for this slot
     STANDARD,         ///< EvalBootstrapSetup (ModRaise-first, btsfirstboot=false)
     STC_FIRST,        ///< EvalBootstrapSetup(btsfirstboot=true) / EvalBootstrapStCFirst
-    FBT,              ///< reserved (not configured in this branch)
-    FEFBT,            ///< reserved (not configured in this branch)
+    FBT,              ///< reserved (look-up-table functional bootstrapping is not supported)
+    FEFBT,            ///< EvalFEFuncBootstrapSetup / EvalFEFuncBootstrap* (Fourier-extension functional bootstrapping)
 };
 
 /// @brief Human-readable name of a bootstrapping mode (for diagnostics).
@@ -119,7 +120,7 @@ inline const char* BootstrapModeName(BootstrapMode mode) {
     case BootstrapMode::STANDARD: return "the standard bootstrap (EvalBootstrapSetup)";
     case BootstrapMode::STC_FIRST: return "the SlotsToCoeffs-first bootstrap (EvalBootstrapStCFirst)";
     case BootstrapMode::FBT: return "a reserved bootstrap mode";
-    case BootstrapMode::FEFBT: return "a reserved bootstrap mode";
+    case BootstrapMode::FEFBT: return "FE functional bootstrapping (EvalFEFuncBootstrapSetup)";
     case BootstrapMode::UNCONFIGURED:
     default: return "no bootstrapping setup";
     }

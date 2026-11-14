@@ -1109,6 +1109,27 @@ void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcryp
         auto precom = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_bootPrecomMap.find(slots)->second;
         result.btsfirstboot = precom->BTSlotsEncoding;
         result.lvlbDec = static_cast<int>(precom->m_paramsDec.lvlb);
+        result.lvlbEnc = static_cast<int>(precom->m_paramsEnc.lvlb);
+
+        // FE functional bootstrapping (EvalFEFuncBootstrapSetup): record the variant and the
+        // complex-exponential table + double-angle count FHECKKSRNS::EvalFEFuncBootstrapExp
+        // selects, so the evaluation does not have to reach back into OpenFHE.
+        result.isFEFunc = (precom->m_variant == lbcrypto::CKKSBootstrapPrecom::FEFBT);
+        if (result.isFEFunc) {
+            const auto feParams = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(cc->GetCryptoParameters());
+            const auto skd = feParams->GetSecretKeyDist();
+            const bool smallSparseKey = (skd == lbcrypto::SPARSE_ENCAPSULATED) && (feParams->GetSparseKSHammingWeight() == 32);
+            if (skd == lbcrypto::UNIFORM_TERNARY) {
+                result.feExpCoefficients = lbcrypto::FHECKKSRNS::coeff_exp_696_double_27;
+                result.feDoubleAngleIts = lbcrypto::FHECKKSRNS::R_func_696_double_27;
+            } else if (smallSparseKey) {
+                result.feExpCoefficients = lbcrypto::FHECKKSRNS::coeff_exp_16_double_23;
+                result.feDoubleAngleIts = lbcrypto::FHECKKSRNS::R_func_16_double_23;
+            } else {
+                result.feExpCoefficients = lbcrypto::FHECKKSRNS::coeff_exp_28_double_48;
+                result.feDoubleAngleIts = lbcrypto::FHECKKSRNS::R_func_28_double_48;
+            }
+        }
 
         GPUcc.AddBootPrecomputation(slots, std::move(result));
     }

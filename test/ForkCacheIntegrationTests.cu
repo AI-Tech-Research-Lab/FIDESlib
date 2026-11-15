@@ -7,6 +7,7 @@
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Plaintext.cuh"
 #include "CKKS/BootstrapPrecomputation.cuh"
+#include "FeFuncCoefficients.hpp"
 
 using namespace fideslib;
 
@@ -257,6 +258,135 @@ TEST(ForkCacheIntegration, SparseAuxiliaryContextReleasedWithApiOwner) {
             sparseContext = gpu->GetBootPrecomputation(8).sparse_context;
             ASSERT_FALSE(sparseContext.expired());
         }
+        EXPECT_TRUE(mainContext.expired());
+        EXPECT_TRUE(sparseContext.expired());
+    }
+}
+
+namespace {
+
+// A FE functional-bootstrapping context (N = 2^12, 59/60-bit moduli, {3, 2}) with an input at the
+// depletion level, sized for the GELU series of the OpenFHE example.
+struct FeFuncFixture {
+    CryptoContext<DCRTPoly> cc;
+    KeyPair<DCRTPoly> keys;
+    Ciphertext<DCRTPoly> input;
+    static constexpr uint32_t slots = 8;
+
+    explicit FeFuncFixture(SecretKeyDist skd) {
+        const std::vector<uint32_t> levelBudget{ 3, 2 };
+        const uint32_t depth = fideslib::FHECKKSRNS::GetFEFBTDepth(levelBudget, fe_func_coefficients::coeff_gelu_8_double_44, skd) + 2;
+        CCParams<CryptoContextCKKSRNS> params;
+        params.SetSecretKeyDist(skd);
+        params.SetScalingTechnique(FLEXIBLEAUTO);
+        params.SetMultiplicativeDepth(depth);
+        params.SetScalingModSize(59);
+        params.SetFirstModSize(60);
+        params.SetNumLargeDigits(3);
+        params.SetBatchSize(slots);
+        params.SetSecurityLevel(HEStd_NotSet);
+        params.SetRingDim(1 << 12);
+        params.SetPlaintextAutoload(true);
+        params.SetCiphertextAutoload(true);
+        cc = GenCryptoContext(params);
+        for (const auto feature : { PKE, KEYSWITCH, LEVELEDSHE, ADVANCEDSHE, FHE })
+            cc->Enable(feature);
+        keys = cc->KeyGen();
+        cc->EvalMultKeyGen(keys.secretKey);
+        cc->EvalFEFuncBootstrapSetup(levelBudget, { 0, 0 }, slots);
+        cc->EvalBootstrapKeyGen(keys.secretKey, slots);
+        std::vector<double> values(slots);
+        for (uint32_t i = 0; i < slots; ++i)
+            values[i] = -0.5 + static_cast<double>(i) / slots;
+        auto pt = cc->MakeCKKSPackedPlaintext(values, 1, depth - (levelBudget[1] + 1), nullptr, slots);
+        input = cc->Encrypt(keys.publicKey, pt);
+    }
+};
+
+} // namespace
+
+// FE functional bootstrapping under zero bootstrap, rotation-key and ciphertext budgets: every
+// CoeffsToSlots/SlotsToCoeffs stage and rotation key is reloaded on demand, the offloaded input
+// stays offloaded during series evaluation, and the results stay
+// bit-identical to the CPU reference (which the unlimited GPU run matches, see FeFuncBootstrap).
+TEST(ForkCacheIntegration, FeFuncBootstrapUnderZeroBudgets) {
+    FeFuncFixture fx(SPARSE_TERNARY);
+    const auto& sigmoid = fe_func_coefficients::coeff_sigmoid_8_double_34;
+    const auto& gelu = fe_func_coefficients::coeff_gelu_8_double_44;
+    const std::vector<const std::vector<std::complex<double>>*> family{ &fe_func_coefficients::coeff_exp_2_double_29, &sigmoid, &gelu };
+
+    auto expected = fx.cc->EvalFEFuncBootstrap(fx.input, sigmoid);
+    auto cpuPowers = fx.cc->EvalFEFuncBootstrapPrecompute(fx.input, gelu);
+    std::vector<Ciphertext<DCRTPoly>> expectedFamily;
+    for (const auto* coeffs : family)
+        expectedFamily.push_back(fx.cc->EvalFEFuncBootstrapWithPrecomp(cpuPowers, *coeffs));
+
+    fx.cc->SetBootstrapCache(0);
+    fx.cc->SetRotationKeyCache(0);
+    fx.cc->SetCiphertextCache(0);
+    fx.cc->SetDevices(devices);
+    fx.cc->LoadContext(fx.keys.publicKey);
+    EXPECT_EQ(fx.cc->GetBootstrapCacheResidentBytes(), 0u);
+    EXPECT_EQ(fx.cc->GetRotationKeyCacheResidentBytes(), 0u);
+
+    std::vector<Ciphertext<DCRTPoly>> retainedResults;
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        SCOPED_TRACE(repeat);
+        auto loaded = fx.cc->GetBootstrapCacheLoadedBytes();
+        fx.input->Offload();
+        auto actual = fx.cc->EvalFEFuncBootstrap(fx.input, sigmoid);
+        ASSERT_EQ_CIPHERTEXT(expected, actual);
+        EXPECT_GT(fx.cc->GetBootstrapCacheLoadedBytes(), loaded);
+
+        fx.input->Offload();
+        auto powers = fx.cc->EvalFEFuncBootstrapPrecompute(fx.input, gelu);
+        for (size_t f = 0; f < family.size(); ++f) {
+            // Between two evaluations: evict the matrices and park the exponential in host RAM.
+            fx.cc->OffloadBootstrapPrecomputation();
+            EXPECT_EQ(fx.cc->GetBootstrapCacheResidentBytes(), 0u);
+            powers->exponential->Offload();
+            auto result = fx.cc->EvalFEFuncBootstrapWithPrecomp(powers, *family[f]);
+            EXPECT_TRUE(powers->exponential->IsOffloaded());
+            if (!retainedResults.empty())
+                EXPECT_TRUE(retainedResults.back()->IsOffloaded());
+            ASSERT_EQ_CIPHERTEXT(expectedFamily[f], result);
+            retainedResults.push_back(result);
+        }
+        fx.cc->OffloadBootstrapPrecomputation();
+        EXPECT_EQ(fx.cc->GetBootstrapCacheResidentBytes(), 0u);
+    }
+}
+
+// Power sets keep their context alive: two consecutive SPARSE_ENCAPSULATED contexts (each with
+// its auxiliary sparse GPU context), whose power handles outlive the scope that created them, are
+// still usable there and release every GPU context once the handle goes.
+TEST(ForkCacheIntegration, FeFuncPowersOutliveTheirContextScope) {
+    const auto& sigmoid = fe_func_coefficients::coeff_sigmoid_8_double_34;
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        SCOPED_TRACE(repeat);
+        std::weak_ptr<FIDESlib::CKKS::ContextData> mainContext, sparseContext;
+        SeriesPowers powers;
+        Ciphertext<DCRTPoly> expected;
+        {
+            FeFuncFixture fx(SPARSE_ENCAPSULATED);
+            auto cpuPowers = fx.cc->EvalFEFuncBootstrapPrecompute(fx.input, fe_func_coefficients::coeff_gelu_8_double_44);
+            expected = fx.cc->EvalFEFuncBootstrapWithPrecomp(cpuPowers, sigmoid);
+            fx.cc->SetDevices(devices);
+            fx.cc->LoadContext(fx.keys.publicKey);
+            auto& gpu = std::any_cast<FIDESlib::CKKS::Context&>(fx.cc->gpu);
+            mainContext = gpu;
+            sparseContext = gpu->GetBootPrecomputation(FeFuncFixture::slots).sparse_context;
+            ASSERT_FALSE(sparseContext.expired());
+            powers = fx.cc->EvalFEFuncBootstrapPrecompute(fx.input, fe_func_coefficients::coeff_gelu_8_double_44);
+        }
+        ASSERT_FALSE(mainContext.expired());
+        auto cc = powers->exponential->parent_context;
+        auto result = cc->EvalFEFuncBootstrapWithPrecomp(powers, sigmoid);
+        ASSERT_EQ_CIPHERTEXT(expected, result);
+        result.reset();
+        expected.reset();
+        cc.reset();
+        powers.reset();
         EXPECT_TRUE(mainContext.expired());
         EXPECT_TRUE(sparseContext.expired());
     }

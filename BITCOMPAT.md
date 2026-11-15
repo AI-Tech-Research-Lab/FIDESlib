@@ -75,6 +75,9 @@ countermeasure), so decrypted values are compared within precision (`ASSERT_ERRO
 | `EvalBootstrapStCFirstFixedAuto` | PASS | decode-first FIXEDAUTO (FIXEDAUTO-only depletion tower drop) |
 | `EvalBootstrapStCFirstIterativeFixedManual` | PASS | iterative decode-first FIXEDMANUAL: single-iteration output has noiseDeg 1, so the noise-aware post-bootstrap ModReduce is a no-op |
 | `OpenFHEBootstrapStCFirst` | PASS | parameterized decode-first (BTSlotsEncoding): FLEXIBLEAUTOEXT + FIXEDMANUAL × dnum 1-4 (TTALL64BOOT) |
+| `FeFuncPrimitives.*` (`test/FeFuncBootstrapTests.cu`) | PASS | FE functional bootstrapping primitives in isolation, × the four techniques: complex Chebyshev series on the three exponential tables; non-fused `evalPowers` + `evalPolyWithPrecomp` on the exp/sigmoid/GELU Fourier series, on one shared power set (twice each, powers unmodified), and on linear (degree < 5) series with gaps |
+| `FeFuncBootstrap.*` (`test/FeFuncBootstrapTests.cu`) | PASS | `EvalFEFuncBootstrap*` end to end, CPU vs GPU: sparse/full packing, `{3,2}`/`{1,1}`, UNIFORM_TERNARY / SPARSE_TERNARY / SPARSE_ENCAPSULATED, the four techniques, exp/sigmoid/GELU, input above the depletion level, COMPLEX data, shared powers, short and padded series, level boundary, guards and errors; every result also decrypted and checked against `f` |
+| `ForkCacheIntegration.FeFunc*` | PASS | FE functional bootstrapping under zero bootstrap / rotation-key / ciphertext budgets with offloaded inputs; power handles outliving their context's scope (SPARSE_ENCAPSULATED) |
 
 ## Resolved issues
 

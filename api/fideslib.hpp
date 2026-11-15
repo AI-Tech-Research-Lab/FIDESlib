@@ -5,10 +5,12 @@
 #include "Ciphertext.hpp"
 #include "CryptoContext.hpp"
 #include "Definitions.hpp"
+#include "FHECKKSRNS.hpp"
 #include "GenCryptoContext.hpp"
 #include "KeyPair.hpp"
 #include "Plaintext.hpp"
 #include "PrivateKey.hpp"
 #include "PublicKey.hpp"
+#include "SeriesPowers.hpp"
 
 #endif // API_FIDESLIB_HPP

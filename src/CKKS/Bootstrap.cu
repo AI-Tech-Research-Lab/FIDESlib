@@ -9,8 +9,12 @@
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/CoeffsToSlots.cuh"
 #include "CKKS/Context.cuh"
+#include <cmath>
+#include <complex>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #if defined(__clang__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
@@ -458,14 +462,14 @@ static void BootstrapIterativeImpl(Ciphertext& ctxt,
 // down to the level where the decode-first SlotsToCoeffs precomputation lives
 // (OpenFHE expectedLevel = L0 - (lvlbDec + 2 + (FLEXIBLEAUTOEXT ? 1 : 0)), which
 // is lvlbDec + 1 + ext in FIDESlib level space), or throw when the input is
-// already deeper than that.
-static void DepleteForStCFirst(Ciphertext& ctxt, const int slots) {
+// already deeper than that. `who` names the operation in that error.
+static void DepleteForStCFirst(Ciphertext& ctxt, const int slots, const char* who) {
     ContextData& cc = ctxt.cc;
     const int expectedLevel = cc.GetBootPrecomputation(slots).lvlbDec + 1 +
         (cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT ? 1 : 0);
 
     if (ctxt.getLevel() < expectedLevel + ctxt.NoiseLevel - 1) {
-        throw std::runtime_error("Not enough levels to perform Bootstrapping.");
+        throw std::runtime_error(std::string("Not enough levels to perform ") + who + ".");
     }
 
     // ModReduceInternalInPlace(ct, noiseDeg - 1).
@@ -515,37 +519,28 @@ static void DepleteForStCFirst(Ciphertext& ctxt, const int slots) {
     }
 }
 
-// The decode-first single-iteration pipeline: bit-compat transcription of
-// FHECKKSRNS::EvalBootstrapStCFirst (numIterations == 1, lines 1434-1688).
-// Unlike the mod-raise-first flavor, the SlotsToCoeffs decode runs on the
-// *depleted* input before the modulus raise, and there is no trailing decode
-// nor sparse doubling; the pipeline ends in the slots domain.
-static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool prescaled) {
-    CudaNvtxRange r(std::string{ sc::current().function_name() });
-
-    assert(slots >= ctxt.slots);
-    const int old_slots = ctxt.slots;
-
+// The shared prefix of the two decode-first pipelines (EvalBootstrapStCFirst and
+// EvalFEFuncBootstrapExp): deplete -> SlotsToCoeffs -> sparse fold -> ModRaise ->
+// normalize -> PartialSum -> CoeffsToSlots -> conj+add -> pre-Chebyshev rescale.
+// `correction` is the exponent of the 2^-correction folded into the pre-raise
+// adjustment (AdjustCiphertext), `normalization` the scalar applied right after
+// the raise. On return `ctxt.slots` is the effective CoeffsToSlots slot count
+// (2 * slots when sparsely packed); the caller restores it.
+static void DecodeRaiseEncode(Ciphertext& ctxt,
+    const int slots,
+    const uint32_t correction,
+    const double normalization,
+    const bool prescaled,
+    const char* who) {
     Context& cc_ = ctxt.cc_;
     ContextData& cc = ctxt.cc;
     Ciphertext aux(cc_);
     const bool isLT = cc.GetBootPrecomputation(slots).LT.slots == slots;
-
-    // Same prologue as the mod-raise-first flavor (q/p/deg/correction/pre/scalar).
-    uint64_t q = cc.prime[0].p;
-    double qDouble = (double)q; // q.ConvertToDouble();
-    const auto p = cc.param.raw->p; // cryptoParams->GetPlaintextModulus();
-    double powP = pow(2, p);
-    int32_t deg = std::round(std::log2(qDouble / powP));
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
-    double post = std::pow(2, static_cast<double>(deg));
-    double pre = 1. / post;
-    uint64_t scalar = std::llround(post);
-    bool sparse_encaps = cc.GetBootPrecomputation(slots).sparse_encaps;
+    const bool sparse_encaps = cc.GetBootPrecomputation(slots).sparse_encaps;
 
     // Deplete the input to the decode level, then run the decode (SlotsToCoeffs)
     // FIRST, before the modulus raise.
-    DepleteForStCFirst(ctxt, slots);
+    DepleteForStCFirst(ctxt, slots, who);
     if (isLT) {
         EvalLinearTransform(ctxt, slots, true);
     } else {
@@ -568,12 +563,10 @@ static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool pre
     }
 
     // The remainder coincides with the mod-raise-first pipeline
-    // (ModRaise -> normalize -> PartialSum -> CtS encode -> sine).
+    // (ModRaise -> normalize -> PartialSum -> CtS encode).
     ModRaise(ctxt, slots, correction, prescaled, sparse_encaps);
 
-    double k = cc.GetBootK();
-    double constantEvalMult = pre * (1.0 / (k * cc.N));
-    ctxt.multScalar(constantEvalMult, false);
+    ctxt.multScalar(normalization, false);
     if (MODRAISE_WITH_P0) {
         ctxt.rescaleInternal();
     }
@@ -593,15 +586,49 @@ static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool pre
         EvalCoeffsToSlots(ctxt, slots, false);
     }
 
-    // conj + add, then the single-part approximate mod-reduction: EvalBootstrapStCFirst
-    // evaluates the Chebyshev series over one ciphertext for REAL data (the OpenFHE
-    // default), with no ctxtEncI component.
+    // conj + add: both decode-first pipelines evaluate their Chebyshev series over one
+    // ciphertext (the real channel), with no ctxtEncI component.
     aux.conjugate(ctxt);
     ctxt.add(aux);
     if (cc.rescaleTechnique == CKKS::FIXEDMANUAL)
         ctxt.rescaleInternal();
     else if (ctxt.NoiseLevel == 2)
         ctxt.rescaleInternal(); // OpenFHE ModReduceInternalInPlace before the Chebyshev series
+}
+
+// log2(q0 / 2^p) rounded, as FHECKKSRNS::EvalFEFuncBootstrapExp computes it.
+static int32_t FirstModulusShrinkDegree(const ContextData& cc) {
+    const double qDouble = static_cast<double>(cc.prime[0].p);
+    const double powP = std::pow(2, cc.param.raw->p);
+    return static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
+}
+
+// The decode-first single-iteration pipeline: bit-compat transcription of
+// FHECKKSRNS::EvalBootstrapStCFirst (numIterations == 1, lines 1434-1688).
+// Unlike the mod-raise-first flavor, the SlotsToCoeffs decode runs on the
+// *depleted* input before the modulus raise, and there is no trailing decode
+// nor sparse doubling; the pipeline ends in the slots domain.
+static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool prescaled) {
+    CudaNvtxRange r(std::string{ sc::current().function_name() });
+
+    assert(slots >= ctxt.slots);
+    const int old_slots = ctxt.slots;
+
+    ContextData& cc = ctxt.cc;
+
+    // Same prologue as the mod-raise-first flavor (q/p/deg/correction/pre/scalar).
+    int32_t deg = FirstModulusShrinkDegree(cc);
+    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    double post = std::pow(2, static_cast<double>(deg));
+    double pre = 1. / post;
+    uint64_t scalar = std::llround(post);
+
+    double k = cc.GetBootK();
+    double constantEvalMult = pre * (1.0 / (k * cc.N));
+    DecodeRaiseEncode(ctxt, slots, correction, constantEvalMult, prescaled, "Bootstrapping");
+
+    // Single-part approximate mod-reduction: EvalBootstrapStCFirst evaluates the
+    // Chebyshev series over one ciphertext for REAL data (the OpenFHE default).
     approxModReductionSparse(ctxt, scalar);
 
     // Decode-first flavor: no trailing SlotsToCoeffs nor sparse doubling; scale
@@ -612,7 +639,172 @@ static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool pre
     ctxt.slots = old_slots;
 }
 
+//------------------------------------------------------------------------------
+// FE (Fourier-extension) functional bootstrapping
+//------------------------------------------------------------------------------
+
+constexpr const char* FE_FUNC_NAME = "FE functional bootstrapping";
+
+std::string FEFuncFirstModulusError(const int32_t degree) {
+    return "CKKS FE functional bootstrapping requires the first level modulus to be twice the scaling "
+           "factor (FirstModSize = ScalingModSize + 1); log2(q0/SF) = " + std::to_string(degree) + ".";
+}
+
+const char* FEFuncPrecomputeDegreeError() {
+    return "CKKS FE functional bootstrapping needs a series of degree 5 or more to precompute shareable "
+           "complex-exponential powers; use EvalFEFuncBootstrap for a shorter series.";
+}
+
+std::vector<std::complex<double>> NormalizeFEFuncCoefficients(const std::vector<std::complex<double>>& coefficients, const char* who) {
+    if (coefficients.size() < 2)
+        throw std::invalid_argument(std::string(who) + ": the coefficients vector should contain at least 2 elements.");
+    for (const auto& c : coefficients) {
+        if (!std::isfinite(c.real()) || !std::isfinite(c.imag()))
+            throw std::invalid_argument(std::string(who) + ": the Fourier coefficients must be finite.");
+    }
+    auto last = coefficients.end();
+    while (last != coefficients.begin() && *(last - 1) == std::complex<double>{ 0.0, 0.0 })
+        --last;
+    if (last - coefficients.begin() < 2)
+        throw std::invalid_argument(std::string(who) + ": the Fourier series has no nonzero coefficient above the constant term.");
+    std::vector<std::complex<double>> normalized(coefficients.begin(), last);
+    // The linear evaluator regards coefficients below 2^-44 as zero. Passing such a top
+    // coefficient would leave the highest power uninitialized, even though Degree sees it.
+    if (normalized.size() <= 5 && !lbcrypto::IsNotEqualZero(normalized.back()))
+        throw std::invalid_argument(std::string(who) + ": the highest-order coefficient of a series of degree below 5 must exceed the linear evaluator's zero tolerance (2^-44).");
+    return normalized;
+}
+
+// Everything FEFuncBootstrap / FEFuncBootstrapPrecompute check before touching the ciphertext:
+// the precomputation, the first modulus, the series and the level budget. OpenFHE discovers most
+// of these mid-pipeline (or not at all: a ciphertext run out of towers is undefined behavior on
+// the GPU), so they are all front-loaded here.
+static void ValidateFEFunc(const Ciphertext& ctxt, const int slots, const std::vector<std::complex<double>>& coefficients, const char* who) {
+    ContextData& cc = ctxt.cc;
+    if (!cc.HasBootPrecomputation(slots))
+        throw std::invalid_argument(std::string(who) + ": no bootstrapping precomputation for slots=" + std::to_string(slots) +
+            " (run EvalFEFuncBootstrapSetup and EvalBootstrapKeyGen before LoadContext).");
+    const auto& pre = cc.GetBootPrecomputation(slots);
+    if (!pre.isFEFunc)
+        throw std::invalid_argument(std::string(who) + ": slots=" + std::to_string(slots) +
+            " was not set up with EvalFEFuncBootstrapSetup; FE functional bootstrapping needs its own precomputation.");
+    if (!pre.btsfirstboot)
+        throw std::invalid_argument(std::string(who) + ": FE functional bootstrapping requires a SlotsToCoeffs-first precomputation.");
+    if (pre.lvlbEnc < 1 || pre.lvlbDec < 1 || pre.feExpCoefficients.empty())
+        throw std::logic_error(std::string(who) + ": incomplete FE functional bootstrapping precomputation for slots=" + std::to_string(slots) + ".");
+
+    const int32_t deg = FirstModulusShrinkDegree(cc);
+    if (deg != 1)
+        throw std::invalid_argument(FEFuncFirstModulusError(deg));
+
+    // Levels left after the modulus raise (FIDESlib level cc.L - ext) must cover CoeffsToSlots,
+    // the complex exponential, its double-angle squarings and the series: the sum below is
+    // exactly what the pipeline consumes, so at equality the result keeps one tower per pending
+    // rescale plus one (the last level at which it can still be decrypted).
+    // The series is evaluated trimmed to its degree. The "normalized" table depth is exact for
+    // the Paterson-Stockmeyer path (degree >= 5); the linear path (degree < 5) takes one level
+    // more (GetFEFBTDepth undercounts it, which its lvlbDec margin hides).
+    const uint32_t degree = static_cast<uint32_t>(coefficients.size() - 1);
+    const int64_t required = static_cast<int64_t>(pre.lvlbEnc) +
+        lbcrypto::GetMultiplicativeDepthByCoeffVector(pre.feExpCoefficients, false) + pre.feDoubleAngleIts +
+        lbcrypto::GetMultiplicativeDepthByCoeffVector(coefficients, /*isNormalized=*/degree >= 5);
+    const int64_t available = cc.L - (cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT ? 1 : 0);
+    if (required > available)
+        throw std::invalid_argument(std::string(who) + ": not enough levels: the refresh and this series need " + std::to_string(required) +
+            " levels after the modulus raise, the context has " + std::to_string(available) +
+            " (size the depth with FHECKKSRNS::GetFEFBTDepth).");
+}
+
+// FHECKKSRNS::EvalFEFuncBootstrapExp: everything that does not depend on the target function.
+// Leaves `ctxt` holding exp(2 * pi * i * t), t = m / 2.
+static void FEFuncBootstrapExp(Ciphertext& ctxt, const int slots) {
+    CudaNvtxRange r(std::string{ sc::current().function_name() });
+
+    assert(slots >= ctxt.slots);
+    const int old_slots = ctxt.slots;
+    ContextData& cc = ctxt.cc;
+    const auto& pre = cc.GetBootPrecomputation(slots);
+
+    // AdjustCiphertext(raised, 1.0, lvl): no correction factor (2^-0), the argument of the complex
+    // exponential must stay at the exact message scale; the runtime normalization is 2^-deg / N
+    // (K is folded into the CoeffsToSlots matrix, deg == 1 checked by ValidateFEFunc).
+    const double shrink = std::pow(2, -FirstModulusShrinkDegree(cc));
+    DecodeRaiseEncode(ctxt, slots, /*correction=*/0, shrink / cc.N, /*prescaled=*/false, FE_FUNC_NAME);
+
+    auto table = pre.feExpCoefficients; // evalChebyshevSeries takes a non-const vector
+    evalChebyshevSeries(ctxt, table, -1.0, 1.0);
+    // Double-angle iterations: each squaring doubles the argument of the exponential.
+    for (uint32_t i = 0; i < pre.feDoubleAngleIts; ++i) {
+        ctxt.square();  // EvalSquareInPlace
+        ctxt.rescale(); // ModReduceInPlace (FIXEDMANUAL only)
+    }
+
+    ctxt.slots = old_slots;
+}
+
+// FHECKKSRNS::TwiceRealPart: series + conj(series).
+static void TwiceRealPart(Ciphertext& series) {
+    Ciphertext conj(series.cc_);
+    conj.conjugate(series);
+    series.add(conj);
+}
+
 } // namespace FIDESlib::CKKS
+
+void FIDESlib::CKKS::FEFuncBootstrap(Ciphertext& ctxt, const int slots, const std::vector<std::complex<double>>& coefficients) {
+    CudaNvtxRange r(std::string{ sc::current().function_name() });
+    const auto normalized = NormalizeFEFuncCoefficients(coefficients, "FEFuncBootstrap");
+    ValidateFEFunc(ctxt, slots, normalized, "FEFuncBootstrap");
+
+    FEFuncBootstrapExp(ctxt, slots);
+    // EvalPoly == EvalPowers + EvalPolyWithPrecomp, dispatched on the series degree alike.
+    auto powers = evalPowers(ctxt, normalized, /*fused=*/false);
+    Ciphertext result = evalPolyWithPrecomp(powers, normalized, /*fused=*/false);
+    TwiceRealPart(result);
+    ctxt.copy(result);
+}
+
+FIDESlib::CKKS::SeriesPowers FIDESlib::CKKS::FEFuncBootstrapPrecompute(Ciphertext& ctxt, const int slots, const std::vector<std::complex<double>>& coefficients) {
+    CudaNvtxRange r(std::string{ sc::current().function_name() });
+    const auto normalized = NormalizeFEFuncCoefficients(coefficients, "FEFuncBootstrapPrecompute");
+    ValidateFEFunc(ctxt, slots, normalized, "FEFuncBootstrapPrecompute");
+    // Below degree 5 EvalPowers builds only the powers this series needs, so they cannot be shared.
+    if (normalized.size() <= 5)
+        throw std::invalid_argument(FEFuncPrecomputeDegreeError());
+
+    FEFuncBootstrapExp(ctxt, slots);
+    return evalPowers(ctxt, normalized, /*fused=*/false);
+}
+
+FIDESlib::CKKS::Ciphertext FIDESlib::CKKS::FEFuncBootstrapWithPrecomp(SeriesPowers& powers, const std::vector<std::complex<double>>& coefficients) {
+    CudaNvtxRange r(std::string{ sc::current().function_name() });
+    constexpr const char* who = "FEFuncBootstrapWithPrecomp";
+    if (powers.powers.empty() || powers.powers2.empty() || powers.k == 0 || powers.m == 0 || powers.m >= 32)
+        throw std::invalid_argument("The series powers were not produced by EvalFEFuncBootstrapPrecompute.");
+    const auto normalized = NormalizeFEFuncCoefficients(coefficients, who);
+
+    const uint32_t degree = static_cast<uint32_t>(normalized.size() - 1);
+    if (degree < 5) {
+        // The linear evaluator reads powers[0 .. degree-1] straight from the power basis.
+        if (degree > powers.powers.size())
+            throw std::invalid_argument("The Fourier series has degree " + std::to_string(degree) + ", above the maximum of " +
+                std::to_string(powers.powers.size()) + " spanned by the precomputed complex-exponential powers.");
+        for (uint32_t i = 0; i < degree; ++i) {
+            if (powers.powers[i].getLevel() < 0)
+                throw std::invalid_argument("The series powers were not produced by EvalFEFuncBootstrapPrecompute.");
+        }
+    } else {
+        // The Paterson-Stockmeyer shape (k, m) spans degrees up to k*(2^m - 1) - 1.
+        const uint64_t capacity = static_cast<uint64_t>(powers.k) * ((uint64_t{ 1 } << powers.m) - 1);
+        if (degree >= capacity)
+            throw std::invalid_argument("The Fourier series has degree " + std::to_string(degree) + ", above the maximum of " +
+                std::to_string(capacity - 1) + " spanned by the precomputed complex-exponential powers.");
+    }
+
+    Ciphertext result = evalPolyWithPrecomp(powers, normalized, /*fused=*/false);
+    TwiceRealPart(result);
+    return result;
+}
 
 void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
     Bootstrap(ctxt, slots, prescaled, /*numIterations=*/1, /*precision=*/0);
@@ -626,7 +818,12 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt,
     CudaNvtxRange r(std::string{ sc::current().function_name() });
 
     const auto& pre = ctxt.cc.GetBootPrecomputation(slots);
-    if (pre.isFBT || pre.isFEFunc) {
+    if (pre.isFEFunc) {
+        throw std::invalid_argument(std::string("CKKS Bootstrap: slots=") + std::to_string(slots) +
+                                    " is configured for FE functional bootstrapping (EvalFEFuncBootstrapSetup), not the "
+                                    "standard bootstrap; use EvalFEFuncBootstrap.");
+    }
+    if (pre.isFBT) {
         throw std::invalid_argument(std::string("CKKS Bootstrap: slots=") + std::to_string(slots) +
                                     " is configured for a reserved mode, not the standard bootstrap.");
     }
@@ -661,7 +858,13 @@ void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt,
     CudaNvtxRange r(std::string{ sc::current().function_name() });
 
     const auto& pre = ctxt.cc.GetBootPrecomputation(slots);
-    if (pre.isFBT || pre.isFEFunc) {
+    if (pre.isFEFunc) {
+        throw std::invalid_argument(
+            "CKKS BootstrapStCFirst: slots=" + std::to_string(slots) +
+            " is configured for FE functional bootstrapping (EvalFEFuncBootstrapSetup), not the standard "
+            "bootstrap; use EvalFEFuncBootstrap.");
+    }
+    if (pre.isFBT) {
         throw std::invalid_argument(
             "CKKS BootstrapStCFirst: slots=" + std::to_string(slots) +
             " is configured for a reserved mode, not the standard bootstrap.");

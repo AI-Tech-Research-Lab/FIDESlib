@@ -8,6 +8,8 @@
 #define AFFINE_LT true
 
 #include "Plaintext.cuh"
+#include <complex>
+#include <cstdint>
 #include <vector>
 
 namespace FIDESlib::CKKS {
@@ -108,11 +110,17 @@ class BootstrapPrecomputation {
     /// fold is applied only for REAL. COMPLEX sparse/LT precomputations carry this so the GPU skips it.
     bool isComplex{ false };
     int lvlbDec{ -1 };
+    int lvlbEnc{ -1 };
 
-    // Bookkeeping flags for the shared per-slot bootstrap precomputation. They are never set here
-    // (this branch has no functional setup path) and only feed the inert mode guards in Bootstrap.cu.
+    // Variant of the shared per-slot bootstrap precomputation, which feeds the mode guards in
+    // Bootstrap.cu. isFEFunc is set for a precomputation built by EvalFEFuncBootstrapSetup;
+    // isFBT is never set (functional bootstrapping of look-up tables has no GPU path).
     bool isFBT{ false };
     bool isFEFunc{ false };
+    /// FE functional bootstrapping only (isFEFunc): Chebyshev table of the complex exponential
+    /// and its number of double-angle squarings, selected like FHECKKSRNS::EvalFEFuncBootstrapExp.
+    std::vector<std::complex<double>> feExpCoefficients;
+    uint32_t feDoubleAngleIts{ 0 };
 
     std::weak_ptr<ContextData> sparse_context;
 

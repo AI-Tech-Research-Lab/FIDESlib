@@ -29,6 +29,9 @@ superseded pull requests).
 - Full CKKS implementation: Add, AddPt, AddScalar, Mult, MultPt, MultScalar, Square, Rotate, RotateHoisted, Bootstrap.
 - OpenFHE interoperability for FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO and FLEXIBLEAUTOEXT, with bit-exact CPU/GPU results.
 - Dense, sparse and SlotsToCoeffs-first bootstrapping, optionally iterative.
+- Fourier-extension functional bootstrapping (`EvalFEFuncBootstrap*`): refresh a ciphertext and
+  evaluate a smooth function (sigmoid, exp, GELU, ...) on it in one pass, optionally sharing one
+  refresh across several functions. See [docs/fe-functional-bootstrapping.md](docs/fe-functional-bootstrapping.md).
 - Real and complex CKKS slot encoding.
 - Sparse plaintext compression for low-slot-count plaintexts (bootstrap precomputation, large constants).
 - Hardware acceleration with NVIDIA CUDA.
@@ -48,6 +51,12 @@ with `SetRotationKeyCache`, `SetPlaintextCache`, `SetCiphertextCache` and
 `SetBootstrapCache`; the default `SIZE_MAX` keeps them unlimited. Set rotation-key and
 bootstrap budgets before `LoadContext()` to create reloadable host snapshots.
 Bootstrap snapshots use the same sparse plaintext compression as upstream 2.2.0.
+
+FE functional bootstrapping uses the same bootstrap matrices and rotation keys, so both budgets
+apply to it unchanged. The `SeriesPowers` handle returned by `EvalFEFuncBootstrapPrecompute`
+holds its powers in VRAM until it is destroyed: they bypass the ciphertext registry, so
+`SetCiphertextCache` does not count them and they cannot be offloaded. The handle keeps its
+context alive and frees its GPU memory before the context is torn down.
 
 See [the 2.2.0 fork integration report](docs/upstream-2.2.0-integration.md) for the
 new upstream features, overlap decisions, retained extensions and verification.
@@ -101,6 +110,10 @@ OpenFHE 1.6.1 for the following choices:
 - **Bootstrapping**: ModRaise-first (standard), SlotsToCoeffs-first (`EvalBootstrapStCFirst`) and
   iterative (`numIterations`); dense and sparse packing; level budgets such as `{5,4}`, `{3,3}` or
   `{1,1}`; FLEXIBLEAUTO, FLEXIBLEAUTOEXT, FIXEDAUTO and FIXEDMANUAL.
+- **FE functional bootstrapping** (`EvalFEFuncBootstrap`, `EvalFEFuncBootstrapPrecompute` +
+  `EvalFEFuncBootstrapWithPrecomp`, `FHECKKSRNS::GetFEFBTDepth`): the three secret distributions,
+  the four scaling techniques, REAL and COMPLEX data types, dense and sparse packing; requires
+  `FirstModSize = ScalingModSize + 1`.
 - **Operations** (immutable, in-place and `*Mutable` forms where applicable): Add, Sub, Negate,
   AddScalar / AddPt, Mult, MultScalar / MultPt, Square, Rotate, RotateHoisted, FastRotation and its
   extended-basis variant, Chebyshev series, AddMany, Accumulate / Broadcast, Rescale, SetLevel,

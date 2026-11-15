@@ -793,7 +793,7 @@ void CryptoContextImpl<DCRTPoly>::CheckBootstrapModeConflict(uint32_t slot, fide
     if (it != bootstrap_mode.end() && it->second != fideslib::BootstrapMode::UNCONFIGURED && it->second != mode) {
         OPENFHE_THROW("Bootstrap setup conflict for slots=" + std::to_string(slot) + ": already configured for " +
             std::string(fideslib::BootstrapModeName(it->second)) + "; cannot reconfigure it for " + std::string(fideslib::BootstrapModeName(mode)) +
-            ". The standard and SlotsToCoeffs-first bootstraps share one precomputation "
+            ". The standard, SlotsToCoeffs-first and FE functional bootstraps share one precomputation "
             "entry per slot count.");
     }
 }
@@ -870,11 +870,11 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>
     if (this->loaded) {
         OPENFHE_THROW("Context is already loaded");
     }
+    slots = ResolveBootstrapSlots(slots);
+    RequireBootstrapPrecomputation(slots, "EvalBootstrapKeyGen");
 
     auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
     auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(secretKey->pimpl);
-
-    this->slots_bootstrap.push_back(slots);
 
     // Generate both key sets so the CPU fallback and the GPU pipeline each work:
     //  1. OpenFHE's own bootstrap keys (rotation keys, conjugation key and, for
@@ -887,6 +887,151 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>
     // The two key sets never collide.
     context->EvalBootstrapKeyGen(skImpl, slots);
     FIDESlib::CKKS::GenBootstrapKeys(skImpl, slots, this->keyDist == fideslib::SPARSE_ENCAPSULATED);
+    this->slots_bootstrap.push_back(slots);
+}
+
+// ---- FE functional bootstrapping ----
+
+void CryptoContextImpl<DCRTPoly>::EvalFEFuncBootstrapSetup(const std::vector<uint32_t>& levelBudget, const std::vector<uint32_t>& dim1, uint32_t slots) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    if (this->loaded) {
+        OPENFHE_THROW("Context is already loaded");
+    }
+    // OpenFHE indexes levelBudget[0..1] and dim1[0..1] without checking their size.
+    if (levelBudget.size() != 2 || dim1.size() != 2) {
+        OPENFHE_THROW("EvalFEFuncBootstrapSetup: levelBudget and dim1 must have exactly 2 entries (CoeffsToSlots, SlotsToCoeffs).");
+    }
+    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+    const uint32_t maxSlots = context->GetRingDimension() / 2;
+    if (slots != 0 && (slots > maxSlots || (slots & (slots - 1)) != 0)) {
+        OPENFHE_THROW("EvalFEFuncBootstrapSetup: slots=" + std::to_string(slots) + " must be 0 (full packing) or a power of two up to N/2 = " +
+            std::to_string(maxSlots) + ".");
+    }
+    const auto cryptoParams = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(context->GetCryptoParameters());
+    if (cryptoParams->GetKeySwitchTechnique() != lbcrypto::HYBRID) {
+        OPENFHE_THROW("CKKS FE functional bootstrapping is only supported for the Hybrid key switching method.");
+    }
+    // OpenFHE only discovers this at the first evaluation (EvalFEFuncBootstrapExp); fail now.
+    const double q0 = cryptoParams->GetElementParams()->GetParams()[0]->GetModulus().ConvertToDouble();
+    const int32_t deg = static_cast<int32_t>(std::round(std::log2(q0 / std::pow(2, cryptoParams->GetPlaintextModulus()))));
+    if (deg != 1)
+        OPENFHE_THROW(FIDESlib::CKKS::FEFuncFirstModulusError(deg));
+    // Guardrail: reject a conflicting mode before the reference setup overwrites the shared entry.
+    CheckBootstrapModeConflict(ResolveBootstrapSlots(slots), fideslib::BootstrapMode::FEFBT);
+
+    context->EvalFEFuncBootstrapSetup(levelBudget, dim1, slots);
+
+    RecordBootstrapMode(ResolveBootstrapSlots(slots), fideslib::BootstrapMode::FEFBT);
+}
+
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalFEFuncBootstrap(const Ciphertext<DCRTPoly>& ciphertext, const std::vector<std::complex<double>>& coefficients) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    // Same checks, and so the same outcome, on both backends.
+    const auto normalized = FIDESlib::CKKS::NormalizeFEFuncCoefficients(coefficients, "EvalFEFuncBootstrap");
+    CheckBootstrapMode(static_cast<uint32_t>(ciphertext->GetSlots()), { fideslib::BootstrapMode::FEFBT }, "EvalFEFuncBootstrap");
+
+    // Fall back to CPU.
+    if (this->devices.empty()) {
+        auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+        auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
+        auto ct = context->EvalFEFuncBootstrap(ctImpl, normalized);
+        Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+        result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(ct);
+        return result;
+    }
+
+    // GPU path: the pipeline runs on a clone, so the input stays valid if it throws.
+    this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
+
+    Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+    auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+    FIDESlib::CKKS::FEFuncBootstrap(*res_gpu, res_gpu->slots, normalized);
+
+    return result;
+}
+
+SeriesPowers CryptoContextImpl<DCRTPoly>::EvalFEFuncBootstrapPrecompute(const Ciphertext<DCRTPoly>& ciphertext, const std::vector<std::complex<double>>& coefficients) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    const auto normalized = FIDESlib::CKKS::NormalizeFEFuncCoefficients(coefficients, "EvalFEFuncBootstrapPrecompute");
+    if (normalized.size() <= 5)
+        OPENFHE_THROW(FIDESlib::CKKS::FEFuncPrecomputeDegreeError());
+    CheckBootstrapMode(static_cast<uint32_t>(ciphertext->GetSlots()), { fideslib::BootstrapMode::FEFBT }, "EvalFEFuncBootstrapPrecompute");
+
+    auto powers = std::make_shared<SeriesPowersImpl>();
+
+    // Fall back to CPU.
+    if (this->devices.empty()) {
+        auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+        auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
+        auto cpuPowers = context->EvalFEFuncBootstrapPrecompute(ctImpl, normalized);
+        powers->exponential = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+        powers->exponential->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(cpuPowers->powersRe.front());
+        powers->exponential->need_lazy_copy = true;
+        powers->cpu = std::make_any<std::shared_ptr<lbcrypto::seriesPowers<lbcrypto::DCRTPoly>>>(std::move(cpuPowers));
+        return powers;
+    }
+
+    // GPU path: the clone ends up holding the complex exponential.
+    this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
+
+    Ciphertext<DCRTPoly> exponential = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+    auto exp_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(exponential->gpu));
+    auto gpuPowers = std::make_shared<FIDESlib::CKKS::SeriesPowers>(FIDESlib::CKKS::FEFuncBootstrapPrecompute(*exp_gpu, exp_gpu->slots, normalized));
+
+    powers->exponential = std::move(exponential);
+    powers->gpu = std::move(gpuPowers);
+    return powers;
+}
+
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalFEFuncBootstrapWithPrecomp(const SeriesPowers& powers, const std::vector<std::complex<double>>& coefficients) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    if (!powers || !powers->exponential || (!powers->gpu && !powers->cpu.has_value())) {
+        OPENFHE_THROW("EvalFEFuncBootstrapWithPrecomp: the series powers were not produced by EvalFEFuncBootstrapPrecompute.");
+    }
+    if (powers->exponential->parent_context.get() != this) {
+        OPENFHE_THROW("EvalFEFuncBootstrapWithPrecomp: the series powers belong to a different CryptoContext.");
+    }
+    const auto normalized = FIDESlib::CKKS::NormalizeFEFuncCoefficients(coefficients, "EvalFEFuncBootstrapWithPrecomp");
+
+    // Fall back to CPU.
+    if (this->devices.empty()) {
+        if (powers->gpu) {
+            OPENFHE_THROW("EvalFEFuncBootstrapWithPrecomp: the series powers were built on the GPU; this context evaluates on the CPU.");
+        }
+        auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+        const auto& cpuPowers = std::any_cast<const std::shared_ptr<lbcrypto::seriesPowers<lbcrypto::DCRTPoly>>&>(powers->cpu);
+        auto ct = context->EvalFEFuncBootstrapWithPrecomp(cpuPowers, normalized);
+        Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+        result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(ct);
+        return result;
+    }
+
+    if (!powers->gpu) {
+        OPENFHE_THROW("EvalFEFuncBootstrapWithPrecomp: the series powers were built on the CPU, before LoadContext(); "
+                      "recompute them with EvalFEFuncBootstrapPrecompute on the loaded context.");
+    }
+
+    // WithPrecomp has no registry ciphertext operand to load, so enforce the cache budget here,
+    // before taking any device pointers. The new result may overshoot by one operation as usual.
+    this->EnforceCiphertextBudget();
+    auto& gpuPowers = *std::static_pointer_cast<FIDESlib::CKKS::SeriesPowers>(powers->gpu);
+    auto series = FIDESlib::CKKS::FEFuncBootstrapWithPrecomp(gpuPowers, normalized);
+
+    // Keep a CPU template for GetEncodingType, Clone and eventual downloads without cloning or
+    // reloading the exponential's device limbs. Detach it on first CPU mutation.
+    Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+    result->cpu = powers->exponential->cpu;
+    result->need_lazy_copy = true;
+    result->original_level = powers->exponential->original_level;
+    std::shared_ptr<void> deviceSeries = std::make_shared<FIDESlib::CKKS::Ciphertext>(std::move(series));
+    result->gpu = this->RegisterDeviceCiphertext(std::move(deviceSeries));
+    result->loaded = true;
+
+    return result;
 }
 
 // ---- Serialization ----

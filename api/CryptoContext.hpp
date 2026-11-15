@@ -21,6 +21,7 @@
 #include "Plaintext.hpp"
 #include "PublicKey.hpp"
 #include "Serialize.hpp"
+#include "SeriesPowers.hpp"
 
 namespace fideslib {
 /// @brief Specialization of CryptoContext for the DCRTPoly representation.
@@ -242,6 +243,36 @@ template <> class CryptoContextImpl<DCRTPoly> {
     /// @brief Generate the evaluation bootstrap keys.
     void EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>& secretKey, uint32_t slots);
 
+    // ---- FE functional bootstrapping ----
+
+    /// @brief Set up Fourier-extension functional bootstrapping for @p slots: precompute the
+    /// SlotsToCoeffs and CoeffsToSlots matrices (OpenFHE EvalFEFuncBootstrapSetup). Call it before
+    /// LoadContext() and follow it with EvalBootstrapKeyGen(sk, slots). Requires HYBRID key
+    /// switching and FirstModSize == ScalingModSize + 1. The slot count is then reserved for FE
+    /// functional bootstrapping: EvalBootstrap on it throws, as does a second, different setup.
+    /// @param levelBudget Levels spent on CoeffsToSlots and SlotsToCoeffs (exactly two entries).
+    /// @param dim1 Baby-step dimensions of the two linear transforms (two entries, 0 = automatic).
+    /// @param slots Number of slots (0 = full packing, otherwise a power of two up to N/2).
+    void EvalFEFuncBootstrapSetup(const std::vector<uint32_t>& levelBudget = { 5, 4 },
+        const std::vector<uint32_t>& dim1 = { 0, 0 },
+        uint32_t slots = 0);
+    /// @brief Refresh @p ciphertext and evaluate a real function on its slots in one pass (OpenFHE
+    /// EvalFEFuncBootstrap). The slot values must lie in [-1/2, 1/2) (not checked: outside it the
+    /// result is silently wrong), and @p coefficients must be the Fourier extension of the target
+    /// function over that domain, c_0 first. The result is always real-valued. The input is never
+    /// modified.
+    Ciphertext<DCRTPoly> EvalFEFuncBootstrap(const Ciphertext<DCRTPoly>& ciphertext, const std::vector<std::complex<double>>& coefficients);
+    /// @brief Run the function-independent part of EvalFEFuncBootstrap once and return the powers
+    /// of the complex exponential, to evaluate several functions on one refresh with
+    /// EvalFEFuncBootstrapWithPrecomp (OpenFHE EvalFEFuncBootstrapPrecompute). @p coefficients
+    /// (degree 5 or more) fixes the Paterson-Stockmeyer shape: pass the longest series of the
+    /// family. The input is never modified.
+    SeriesPowers EvalFEFuncBootstrapPrecompute(const Ciphertext<DCRTPoly>& ciphertext, const std::vector<std::complex<double>>& coefficients);
+    /// @brief Evaluate one function's Fourier series on powers from EvalFEFuncBootstrapPrecompute
+    /// of this same context (OpenFHE EvalFEFuncBootstrapWithPrecomp). The powers are never
+    /// modified. Powers built before LoadContext() cannot be used after it, nor the other way round.
+    Ciphertext<DCRTPoly> EvalFEFuncBootstrapWithPrecomp(const SeriesPowers& powers, const std::vector<std::complex<double>>& coefficients);
+
     // ---- Serialization ----
     static bool SerializeEvalMultKey(std::ostream& ser, const SerType& sertype, const std::string& keyTag = "");
     static bool SerializeEvalAutomorphismKey(std::ostream& ser, const SerType& sertype, const std::string& keyTag = "");
@@ -387,7 +418,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
     /// @brief Bootstrap-precomputation VRAM budget in bytes, applied to the GPU context in
     /// LoadContext(); SIZE_MAX means unlimited. See SetBootstrapCache().
     size_t bootstrap_cache_bytes = SIZE_MAX;
-    /// @brief Bootstrapping mode each slot was set up for (standard / SlotsToCoeffs-first). All
+    /// @brief Bootstrapping mode each slot was set up for (standard / SlotsToCoeffs-first / FE). All
     /// modes share one OpenFHE precomputation entry per slot count, so this is used to reject
     /// conflicting setups and mismatched evaluations.
     std::map<uint32_t, fideslib::BootstrapMode> bootstrap_mode;

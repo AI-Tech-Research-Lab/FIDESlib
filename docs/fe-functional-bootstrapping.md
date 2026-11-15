@@ -166,6 +166,34 @@ These are not verifiable under encryption; they are the caller's responsibility.
   of 59 bits) do **not** reach 128-bit security. In production, set a security level and let
   OpenFHE choose the ring dimension (N = 2^17 at these depths).
 
+## Measurements
+
+`examples/fe-functional-bootstrap 16 15` with the parameters of the OpenFHE example: N = 2^16,
+2^15 slots, SPARSE_ENCAPSULATED, level budget `{3,2}`, FLEXIBLEAUTO, 59/60-bit moduli, depth
+`GetFEFBTDepth + 6` = 27, COMPLEX data type. One NVIDIA H100 NVL (CUDA 13), Release build,
+`FIDESLIB_ARCH=90-real`; the CPU reference is the same program before `LoadContext()` (patched
+OpenFHE 1.6.1, OpenMP, on a shared 512-thread host). Times are wall clock with a device
+synchronization; GPU figures are the warm repetitions (the first precomputation took 76 ms).
+
+| | GPU | CPU (OpenFHE) | Speed-up |
+|---|---|---|---|
+| Shared precomputation (`EvalFEFuncBootstrapPrecompute`, GELU shape) | 52.5 ms | 22 425 ms | ~430x |
+| exp series (`WithPrecomp`) | 7.6 ms | 1 212 ms | ~160x |
+| sigmoid series | 8.5-9.0 ms | 1 373 ms | ~155x |
+| GELU series | 10.2-10.8 ms | 1 619 ms | ~155x |
+| Setup + key generation (+ context load on GPU) | 16.8 s | 4.7 s | |
+| Peak device memory (whole process, `nvidia-smi`) | 22.4 GiB | | |
+
+Mean precision (bits, the OpenFHE example's metric): exp 34.92, sigmoid 32.94, GELU 34.74 on the
+GPU; 34.92, 32.95, 34.75 on the CPU (separate runs, so different keys and encryptions). Every
+output keeps 8 levels (6 + `levelBudget[1]`).
+
+The series is not faster at N = 2^16 than at N = 2^12 (7-10 ms in both cases): the serial
+non-fused Paterson-Stockmeyer transcription is bound by launch latency, not by the ring size, so
+a batched or fused series evaluator would be where further speed-up lies. The device memory is
+dominated by the rotation keys (13.3 GB) and the CoeffsToSlots/SlotsToCoeffs matrices (2.9 GB);
+`SetRotationKeyCache` and `SetBootstrapCache` bound both.
+
 ## Verification
 
 `test/FeFuncBootstrapTests.cu` compares every GPU result with the OpenFHE CPU reference with

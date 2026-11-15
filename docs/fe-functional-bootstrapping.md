@@ -119,9 +119,11 @@ one is rejected with "Not enough levels to perform FE functional bootstrapping".
 - A slot count holds one bootstrapping precomputation: one set up for FE functional
   bootstrapping cannot be used by `EvalBootstrap` and vice versa (the two fold a different
   overflow bound into the CoeffsToSlots matrix), and a conflicting second setup throws.
-- Coefficients must be finite, with a nonzero coefficient above the constant term. A series below
-  degree 5 must not end in zeros (OpenFHE crashes on it; FIDESlib rejects it on both backends);
-  longer series are evaluated trimmed.
+- Coefficients must be finite, with a nonzero coefficient above the constant term. Exact trailing
+  zeros are removed before either backend evaluates the series, including for degree below 5.
+  For degree below 5, at least one component of the highest remaining coefficient (real or
+  imaginary) must exceed the linear evaluator's `2^-44` zero tolerance in absolute value;
+  FIDESlib rejects smaller values before touching the ciphertext.
 - `EvalFEFuncBootstrapPrecompute` needs a series of degree 5 or more; the powers then serve any
   series of degree below `k * (2^m - 1)` for its Paterson-Stockmeyer shape `(k, m)`, and any
   shorter series of degree up to `k`.
@@ -194,6 +196,30 @@ a batched or fused series evaluator would be where further speed-up lies. The de
 dominated by the rotation keys (13.3 GB) and the CoeffsToSlots/SlotsToCoeffs matrices (2.9 GB);
 `SetRotationKeyCache` and `SetBootstrapCache` bound both.
 
+### Review follow-up: direct series result registration (2026-11-15)
+
+`WithPrecomp` now registers the evaluated series as its result ciphertext directly. It no longer
+reloads or clones the exponential ciphertext for every function; an explicitly offloaded
+exponential remains offloaded. The direct, single-function `EvalFEFuncBootstrap` still copies the
+series into its in-place GPU argument; changing that core interface is outside this review.
+
+The same N = 2^16 GPU example was run for three repetitions immediately before and after this
+change on physical GPU 2 (`CUDA_VISIBLE_DEVICES=2`). Each range below includes all three
+repetitions and a device synchronization. Logs:
+`build/upstream-2.2.0/fe-functional-b1-before.log` and
+`build/upstream-2.2.0/fe-functional-b1-after.log`.
+
+| Series | Before | After |
+|---|---:|---:|
+| exp | 7.0-7.1 ms | 7.3-7.5 ms |
+| sigmoid | 8.0-8.3 ms | 8.4-8.9 ms |
+| GELU | 9.5-10.0 ms | 10.0-10.4 ms |
+
+These wall-clock measurements do not show a speed-up; the machine and GPU are shared, and the
+series evaluator remains dominated by its arithmetic and launches. The change removes the
+extra ciphertext copies and works with an offloaded exponential, while tests check the result
+on all four scaling techniques, including clone, offload, reload and decryption.
+
 ## Verification
 
 `test/FeFuncBootstrapTests.cu` compares every GPU result with the OpenFHE CPU reference with
@@ -211,3 +237,10 @@ against `f` in the clear (error below 1e-7; about 3e-10 in practice at N = 2^12)
   (SPARSE_ENCAPSULATED, auxiliary sparse context released).
 
 All of them also pass on two GPUs (`--devices=0,1`).
+
+The review follow-up was verified in the Release build on 2026-11-15: `FeFunc*` 25/25 on one
+GPU, `FeFunc*:ForkCacheIntegration*:*ForkBootstrapCache*` 39/39 on one GPU and 39/39 on two,
+and the full `OpenFHECompatTests.*:FeFunc*:ForkCacheIntegration*:*ForkBootstrapCache*:OpenFHEBootstrapTests/*`
+regression 203/203 on one GPU (the prior baseline was 198/198). Logs and Google Test XML are
+saved under `build/upstream-2.2.0/` with the `fe-functional-review-` prefix. The rebuilt
+N = 2^16 example completed all three GPU repetitions for the before/after measurements above.

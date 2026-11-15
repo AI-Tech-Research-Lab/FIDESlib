@@ -13,7 +13,9 @@
 #include "ParametrizedTest.cuh"
 
 #include <CKKS/ApproxModEval.cuh>
+#include <CKKS/BootstrapPrecomputation.cuh>
 #include <CKKS/Ciphertext.cuh>
+#include <CKKS/Context.cuh>
 
 #include <algorithm>
 #include <any>
@@ -382,8 +384,8 @@ FeFixture MakeFeFixture(const FeCase& c, const Coeffs& longest) {
 
     fx.keys = fx.cc->KeyGen();
     fx.cc->EvalMultKeyGen(fx.keys.secretKey);
-    fx.cc->EvalFEFuncBootstrapSetup(c.levelBudget, { 0, 0 }, fx.slots);
-    fx.cc->EvalBootstrapKeyGen(fx.keys.secretKey, fx.slots);
+    fx.cc->EvalFEFuncBootstrapSetup(c.levelBudget, { 0, 0 }, c.slots);
+    fx.cc->EvalBootstrapKeyGen(fx.keys.secretKey, c.slots);
 
     fx.input.resize(fx.slots);
     for (uint32_t i = 0; i < fx.slots; ++i)
@@ -475,6 +477,12 @@ TEST(FeFuncBootstrap, SparseTernaryLinearTransform) {
 TEST(FeFuncBootstrap, SparseTernaryFullPacking) {
     FeCase c;
     c.slots = 0;
+    RunFeFuncCase(c, kSigmoid);
+}
+
+TEST(FeFuncBootstrap, SparseTernaryFullPackingExplicit) {
+    FeCase c;
+    c.slots = kRingDim / 2;
     RunFeFuncCase(c, kSigmoid);
 }
 
@@ -622,9 +630,55 @@ TEST(FeFuncBootstrap, SharedPrecomputation) {
     ASSERT_EQ_CIPHERTEXT(cpuDirect, gpuDirect);
 }
 
+TEST(FeFuncBootstrap, CpuPowersDoNotAliasExponential) {
+    auto fx = MakeFeFixture(FeCase{}, *kGelu.coeffs);
+    auto powers = fx.cc->EvalFEFuncBootstrapPrecompute(fx.ctxt, *kGelu.coeffs);
+    auto before = fx.cc->EvalFEFuncBootstrapWithPrecomp(powers, *kSigmoid.coeffs);
+    fx.cc->EvalAddInPlace(powers->exponential, 0.125);
+    auto after = fx.cc->EvalFEFuncBootstrapWithPrecomp(powers, *kSigmoid.coeffs);
+    ASSERT_EQ_CIPHERTEXT(before, after);
+}
+
+TEST(FeFuncBootstrap, RegisteredSeriesResultSurvivesCloneAndOffload) {
+    for (auto tech : kTechniques) {
+        SCOPED_TRACE(static_cast<int>(tech));
+        FeCase c;
+        c.tech = tech;
+        auto fx = MakeFeFixture(c, *kGelu.coeffs);
+        auto cpuPowers = fx.cc->EvalFEFuncBootstrapPrecompute(fx.ctxt, *kGelu.coeffs);
+        auto expected = fx.cc->EvalFEFuncBootstrapWithPrecomp(cpuPowers, *kSigmoid.coeffs);
+        LoadFixture(fx);
+        auto gpuPowers = fx.cc->EvalFEFuncBootstrapPrecompute(fx.ctxt, *kGelu.coeffs);
+        gpuPowers->exponential->Offload();
+        ASSERT_TRUE(gpuPowers->exponential->IsOffloaded());
+        auto result = fx.cc->EvalFEFuncBootstrapWithPrecomp(gpuPowers, *kSigmoid.coeffs);
+        EXPECT_TRUE(gpuPowers->exponential->IsOffloaded());
+        ASSERT_EQ_CIPHERTEXT(expected, result);
+        auto clone = result->Clone();
+        ASSERT_EQ_CIPHERTEXT(expected, clone);
+        result->Offload();
+        EXPECT_TRUE(result->IsOffloaded());
+        result->Reload();
+        EXPECT_FALSE(result->IsOffloaded());
+        ASSERT_EQ_CIPHERTEXT(expected, result);
+        ExpectDecryptsTo(fx, expected, result, Expected(fx, kSigmoid), REAL);
+    }
+}
+
+TEST(FeFuncBootstrap, RejectsModRaiseFirstPrecomputation) {
+    auto fx = MakeFeFixture(FeCase{}, *kSigmoid.coeffs);
+    LoadFixture(fx);
+    auto& gpu = std::any_cast<FIDESlib::CKKS::Context&>(fx.cc->gpu);
+    auto& pre = gpu->GetBootPrecomputation(fx.slots);
+    ASSERT_TRUE(pre.btsfirstboot);
+    pre.btsfirstboot = false;
+    EXPECT_THROW(fx.cc->EvalFEFuncBootstrap(fx.ctxt, *kSigmoid.coeffs), std::invalid_argument);
+    pre.btsfirstboot = true;
+}
+
 // Case 11: series below degree 5 (the linear power path) and series with trailing zeros, through
 // EvalFEFuncBootstrap: the same outcome on both backends. A padded Paterson-Stockmeyer series is
-// evaluated trimmed (same ciphertext as the unpadded one); a padded linear series is rejected.
+// evaluated trimmed (same ciphertext as the unpadded one), including a padded linear series.
 TEST(FeFuncBootstrap, ShortAndPaddedSeries) {
     const std::vector<const Coeffs*> shortSeries = { &kDeg1, &kDeg2, &kDeg3Gap, &kDeg4Gap };
     Coeffs paddedSigmoid = *kSigmoid.coeffs;
@@ -641,9 +695,9 @@ TEST(FeFuncBootstrap, ShortAndPaddedSeries) {
     auto cpuPadded = fx.cc->EvalFEFuncBootstrap(fx.ctxt, paddedSigmoid);
     std::cout << "CPU padded sigmoid == sigmoid: ";
     ASSERT_EQ_CIPHERTEXT(cpuSigmoid, cpuPadded);
-    // Rejected up front on both backends. (The reference alone does not reject it: the linear
-    // EvalPowers leaves the top power empty and then dereferences it, a segmentation fault.)
-    EXPECT_THROW(fx.cc->EvalFEFuncBootstrap(fx.ctxt, paddedShort), std::invalid_argument);
+    auto cpuPaddedShort = fx.cc->EvalFEFuncBootstrap(fx.ctxt, paddedShort);
+    std::cout << "CPU padded short == short: ";
+    ASSERT_EQ_CIPHERTEXT(cpu[1], cpuPaddedShort);
 
     LoadFixture(fx);
 
@@ -657,7 +711,9 @@ TEST(FeFuncBootstrap, ShortAndPaddedSeries) {
     std::cout << "GPU padded sigmoid: ";
     auto gpuPadded = fx.cc->EvalFEFuncBootstrap(fx.ctxt, paddedSigmoid);
     ASSERT_EQ_CIPHERTEXT(cpuSigmoid, gpuPadded);
-    EXPECT_THROW(fx.cc->EvalFEFuncBootstrap(fx.ctxt, paddedShort), std::invalid_argument);
+    auto gpuPaddedShort = fx.cc->EvalFEFuncBootstrap(fx.ctxt, paddedShort);
+    std::cout << "GPU padded short == short: ";
+    ASSERT_EQ_CIPHERTEXT(cpu[1], gpuPaddedShort);
 }
 
 namespace {
@@ -797,6 +853,8 @@ TEST(FeFuncBootstrap, SetupValidation) {
     EXPECT_THROW(wrongFirstMod->EvalFEFuncBootstrapSetup({ 3, 2 }, { 0, 0 }, 8), std::exception);
 
     auto cc = make(59, 60);
+    auto keys = cc->KeyGen();
+    EXPECT_THROW(cc->EvalBootstrapKeyGen(keys.secretKey, 0), std::exception);
     EXPECT_THROW(cc->EvalFEFuncBootstrapSetup({ 3 }, { 0, 0 }, 8), std::exception);
     EXPECT_THROW(cc->EvalFEFuncBootstrapSetup({ 3, 2, 1 }, { 0, 0 }, 8), std::exception);
     EXPECT_THROW(cc->EvalFEFuncBootstrapSetup({ 3, 2 }, { 0 }, 8), std::exception);
@@ -807,7 +865,8 @@ TEST(FeFuncBootstrap, SetupValidation) {
     // The rejected setups left the slot unconfigured.
     EXPECT_NO_THROW(cc->EvalBootstrapSetup({ 3, 2 }, { 0, 0 }, 8));
 
-    // GetFEFBTDepth forwards to OpenFHE with the matching distribution (table 2.2 of the plan).
+    // GetFEFBTDepth uses the three FE exponential tables: uniform has 9 double-angle
+    // iterations and needs 26 levels; sparse and sparse-encapsulated need 21 each.
     EXPECT_EQ(fideslib::FHECKKSRNS::GetFEFBTDepth({ 3, 2 }, *kSigmoid.coeffs, UNIFORM_TERNARY), 26u);
     EXPECT_EQ(fideslib::FHECKKSRNS::GetFEFBTDepth({ 3, 2 }, *kSigmoid.coeffs, SPARSE_TERNARY), 21u);
     EXPECT_EQ(fideslib::FHECKKSRNS::GetFEFBTDepth({ 3, 2 }, *kSigmoid.coeffs, SPARSE_ENCAPSULATED), 21u);
@@ -822,7 +881,11 @@ TEST(FeFuncBootstrap, EvaluationErrors) {
     withNan[7] = { 0.0, nan };
     Coeffs withInf = *kSigmoid.coeffs;
     withInf[3] = { inf, 0.0 };
-    const std::vector<Coeffs> invalid = { {}, { { 0.5, 0.0 } }, { { 0.5, 0.0 }, { 0.0, 0.0 } }, withNan, withInf };
+    const std::vector<Coeffs> invalid = {
+        {}, { { 0.5, 0.0 } }, { { 0.5, 0.0 }, { 0.0, 0.0 } }, withNan, withInf,
+        { { 0.1, 0.0 }, { 0.2, 0.0 }, { 0.3, 0.0 }, { 1e-17, 0.0 } },
+        { { 0.1, 0.0 }, { 1e-17, 0.0 } },
+    };
 
     auto fx = MakeFeFixture(FeCase{}, *kGelu.coeffs);
     const auto shape = lbcrypto::ComputeDegreesPS(lbcrypto::Degree(*kGelu.coeffs));
@@ -858,7 +921,6 @@ TEST(FeFuncBootstrap, EvaluationErrors) {
         foreign->exponential = other.ctxt;
         foreign->cpu = powers->cpu;
         foreign->gpu = powers->gpu;
-        foreign->loaded = powers->loaded;
         EXPECT_THROW(fx.cc->EvalFEFuncBootstrapWithPrecomp(foreign, *kSigmoid.coeffs), std::exception);
     };
 
@@ -866,6 +928,8 @@ TEST(FeFuncBootstrap, EvaluationErrors) {
     auto cpuBelow = fx.cc->EvalFEFuncBootstrapWithPrecomp(cpuPowers, belowCapacity);
     auto cpuSigmoid = fx.cc->EvalFEFuncBootstrap(fx.ctxt, *kSigmoid.coeffs);
     checkBackend(cpuPowers, "CPU");
+    auto cpuAfterRejection = fx.cc->EvalFEFuncBootstrap(fx.ctxt, *kSigmoid.coeffs);
+    ASSERT_EQ_CIPHERTEXT(cpuSigmoid, cpuAfterRejection);
 
     LoadFixture(fx);
     auto gpuPowers = fx.cc->EvalFEFuncBootstrapPrecompute(fx.ctxt, *kGelu.coeffs);

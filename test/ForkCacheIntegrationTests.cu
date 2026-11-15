@@ -307,7 +307,7 @@ struct FeFuncFixture {
 
 // FE functional bootstrapping under zero bootstrap, rotation-key and ciphertext budgets: every
 // CoeffsToSlots/SlotsToCoeffs stage and rotation key is reloaded on demand, the offloaded input
-// and the offloaded exponential of a power set are reloaded transparently, and the results stay
+// stays offloaded during series evaluation, and the results stay
 // bit-identical to the CPU reference (which the unlimited GPU run matches, see FeFuncBootstrap).
 TEST(ForkCacheIntegration, FeFuncBootstrapUnderZeroBudgets) {
     FeFuncFixture fx(SPARSE_TERNARY);
@@ -329,6 +329,7 @@ TEST(ForkCacheIntegration, FeFuncBootstrapUnderZeroBudgets) {
     EXPECT_EQ(fx.cc->GetBootstrapCacheResidentBytes(), 0u);
     EXPECT_EQ(fx.cc->GetRotationKeyCacheResidentBytes(), 0u);
 
+    std::vector<Ciphertext<DCRTPoly>> retainedResults;
     for (int repeat = 0; repeat < 2; ++repeat) {
         SCOPED_TRACE(repeat);
         auto loaded = fx.cc->GetBootstrapCacheLoadedBytes();
@@ -345,7 +346,11 @@ TEST(ForkCacheIntegration, FeFuncBootstrapUnderZeroBudgets) {
             EXPECT_EQ(fx.cc->GetBootstrapCacheResidentBytes(), 0u);
             powers->exponential->Offload();
             auto result = fx.cc->EvalFEFuncBootstrapWithPrecomp(powers, *family[f]);
+            EXPECT_TRUE(powers->exponential->IsOffloaded());
+            if (!retainedResults.empty())
+                EXPECT_TRUE(retainedResults.back()->IsOffloaded());
             ASSERT_EQ_CIPHERTEXT(expectedFamily[f], result);
+            retainedResults.push_back(result);
         }
         fx.cc->OffloadBootstrapPrecomputation();
         EXPECT_EQ(fx.cc->GetBootstrapCacheResidentBytes(), 0u);

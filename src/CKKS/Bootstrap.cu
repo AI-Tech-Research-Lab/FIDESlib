@@ -596,6 +596,13 @@ static void DecodeRaiseEncode(Ciphertext& ctxt,
         ctxt.rescaleInternal(); // OpenFHE ModReduceInternalInPlace before the Chebyshev series
 }
 
+// log2(q0 / 2^p) rounded, as FHECKKSRNS::EvalFEFuncBootstrapExp computes it.
+static int32_t FirstModulusShrinkDegree(const ContextData& cc) {
+    const double qDouble = static_cast<double>(cc.prime[0].p);
+    const double powP = std::pow(2, cc.param.raw->p);
+    return static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
+}
+
 // The decode-first single-iteration pipeline: bit-compat transcription of
 // FHECKKSRNS::EvalBootstrapStCFirst (numIterations == 1, lines 1434-1688).
 // Unlike the mod-raise-first flavor, the SlotsToCoeffs decode runs on the
@@ -610,11 +617,7 @@ static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool pre
     ContextData& cc = ctxt.cc;
 
     // Same prologue as the mod-raise-first flavor (q/p/deg/correction/pre/scalar).
-    uint64_t q = cc.prime[0].p;
-    double qDouble = (double)q; // q.ConvertToDouble();
-    const auto p = cc.param.raw->p; // cryptoParams->GetPlaintextModulus();
-    double powP = pow(2, p);
-    int32_t deg = std::round(std::log2(qDouble / powP));
+    int32_t deg = FirstModulusShrinkDegree(cc);
     uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
     double post = std::pow(2, static_cast<double>(deg));
     double pre = 1. / post;
@@ -642,28 +645,34 @@ static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool pre
 
 constexpr const char* FE_FUNC_NAME = "FE functional bootstrapping";
 
-// log2(q0 / 2^p) rounded, as FHECKKSRNS::EvalFEFuncBootstrapExp computes it.
-static int32_t FirstModulusShrinkDegree(const ContextData& cc) {
-    const double qDouble = static_cast<double>(cc.prime[0].p);
-    const double powP = std::pow(2, cc.param.raw->p);
-    return static_cast<int32_t>(std::round(std::log2(qDouble / powP)));
+std::string FEFuncFirstModulusError(const int32_t degree) {
+    return "CKKS FE functional bootstrapping requires the first level modulus to be twice the scaling "
+           "factor (FirstModSize = ScalingModSize + 1); log2(q0/SF) = " + std::to_string(degree) + ".";
 }
 
-void ValidateFEFuncCoefficients(const std::vector<std::complex<double>>& coefficients, const char* who, const bool trimmed) {
+const char* FEFuncPrecomputeDegreeError() {
+    return "CKKS FE functional bootstrapping needs a series of degree 5 or more to precompute shareable "
+           "complex-exponential powers; use EvalFEFuncBootstrap for a shorter series.";
+}
+
+std::vector<std::complex<double>> NormalizeFEFuncCoefficients(const std::vector<std::complex<double>>& coefficients, const char* who) {
     if (coefficients.size() < 2)
         throw std::invalid_argument(std::string(who) + ": the coefficients vector should contain at least 2 elements.");
     for (const auto& c : coefficients) {
         if (!std::isfinite(c.real()) || !std::isfinite(c.imag()))
             throw std::invalid_argument(std::string(who) + ": the Fourier coefficients must be finite.");
     }
-    const uint32_t degree = lbcrypto::Degree(coefficients);
-    if (degree == 0)
+    auto last = coefficients.end();
+    while (last != coefficients.begin() && *(last - 1) == std::complex<double>{ 0.0, 0.0 })
+        --last;
+    if (last - coefficients.begin() < 2)
         throw std::invalid_argument(std::string(who) + ": the Fourier series has no nonzero coefficient above the constant term.");
-    // Below degree 5 an untrimmed series is evaluated from a linear power basis sized by the vector
-    // length, whose top entry must be nonzero: the linear EvalPowers does not compute the top power
-    // for a zero top coefficient and then reads it (the OpenFHE reference crashes on it).
-    if (!trimmed && degree < 5 && degree + 1 != coefficients.size())
-        throw std::invalid_argument(std::string(who) + ": the highest-order coefficient of a series of degree below 5 cannot be set to 0.");
+    std::vector<std::complex<double>> normalized(coefficients.begin(), last);
+    // The linear evaluator regards coefficients below 2^-44 as zero. Passing such a top
+    // coefficient would leave the highest power uninitialized, even though Degree sees it.
+    if (normalized.size() <= 5 && !lbcrypto::IsNotEqualZero(normalized.back()))
+        throw std::invalid_argument(std::string(who) + ": the highest-order coefficient of a series of degree below 5 must exceed the linear evaluator's zero tolerance (2^-44).");
+    return normalized;
 }
 
 // Everything FEFuncBootstrap / FEFuncBootstrapPrecompute check before touching the ciphertext:
@@ -679,17 +688,14 @@ static void ValidateFEFunc(const Ciphertext& ctxt, const int slots, const std::v
     if (!pre.isFEFunc)
         throw std::invalid_argument(std::string(who) + ": slots=" + std::to_string(slots) +
             " was not set up with EvalFEFuncBootstrapSetup; FE functional bootstrapping needs its own precomputation.");
+    if (!pre.btsfirstboot)
+        throw std::invalid_argument(std::string(who) + ": FE functional bootstrapping requires a SlotsToCoeffs-first precomputation.");
     if (pre.lvlbEnc < 1 || pre.lvlbDec < 1 || pre.feExpCoefficients.empty())
         throw std::logic_error(std::string(who) + ": incomplete FE functional bootstrapping precomputation for slots=" + std::to_string(slots) + ".");
 
     const int32_t deg = FirstModulusShrinkDegree(cc);
     if (deg != 1)
-        throw std::invalid_argument(
-            "CKKS FE functional bootstrapping requires the first level modulus to be twice the scaling "
-            "factor (FirstModSize = ScalingModSize + 1); log2(q0/SF) = " +
-            std::to_string(deg) + ".");
-
-    ValidateFEFuncCoefficients(coefficients, who, /*trimmed=*/false);
+        throw std::invalid_argument(FEFuncFirstModulusError(deg));
 
     // Levels left after the modulus raise (FIDESlib level cc.L - ext) must cover CoeffsToSlots,
     // the complex exponential, its double-angle squarings and the series: the sum below is
@@ -698,11 +704,10 @@ static void ValidateFEFunc(const Ciphertext& ctxt, const int slots, const std::v
     // The series is evaluated trimmed to its degree. The "normalized" table depth is exact for
     // the Paterson-Stockmeyer path (degree >= 5); the linear path (degree < 5) takes one level
     // more (GetFEFBTDepth undercounts it, which its lvlbDec margin hides).
-    const uint32_t degree = lbcrypto::Degree(coefficients);
-    const std::vector<std::complex<double>> trimmed(coefficients.cbegin(), coefficients.cbegin() + degree + 1);
+    const uint32_t degree = static_cast<uint32_t>(coefficients.size() - 1);
     const int64_t required = static_cast<int64_t>(pre.lvlbEnc) +
         lbcrypto::GetMultiplicativeDepthByCoeffVector(pre.feExpCoefficients, false) + pre.feDoubleAngleIts +
-        lbcrypto::GetMultiplicativeDepthByCoeffVector(trimmed, /*isNormalized=*/degree >= 5);
+        lbcrypto::GetMultiplicativeDepthByCoeffVector(coefficients, /*isNormalized=*/degree >= 5);
     const int64_t available = cc.L - (cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT ? 1 : 0);
     if (required > available)
         throw std::invalid_argument(std::string(who) + ": not enough levels: the refresh and this series need " + std::to_string(required) +
@@ -748,27 +753,27 @@ static void TwiceRealPart(Ciphertext& series) {
 
 void FIDESlib::CKKS::FEFuncBootstrap(Ciphertext& ctxt, const int slots, const std::vector<std::complex<double>>& coefficients) {
     CudaNvtxRange r(std::string{ sc::current().function_name() });
-    ValidateFEFunc(ctxt, slots, coefficients, "FEFuncBootstrap");
+    const auto normalized = NormalizeFEFuncCoefficients(coefficients, "FEFuncBootstrap");
+    ValidateFEFunc(ctxt, slots, normalized, "FEFuncBootstrap");
 
     FEFuncBootstrapExp(ctxt, slots);
     // EvalPoly == EvalPowers + EvalPolyWithPrecomp, dispatched on the series degree alike.
-    auto powers = evalPowers(ctxt, coefficients, /*fused=*/false);
-    Ciphertext result = evalPolyWithPrecomp(powers, coefficients, /*fused=*/false);
+    auto powers = evalPowers(ctxt, normalized, /*fused=*/false);
+    Ciphertext result = evalPolyWithPrecomp(powers, normalized, /*fused=*/false);
     TwiceRealPart(result);
     ctxt.copy(result);
 }
 
 FIDESlib::CKKS::SeriesPowers FIDESlib::CKKS::FEFuncBootstrapPrecompute(Ciphertext& ctxt, const int slots, const std::vector<std::complex<double>>& coefficients) {
     CudaNvtxRange r(std::string{ sc::current().function_name() });
-    ValidateFEFunc(ctxt, slots, coefficients, "FEFuncBootstrapPrecompute");
+    const auto normalized = NormalizeFEFuncCoefficients(coefficients, "FEFuncBootstrapPrecompute");
+    ValidateFEFunc(ctxt, slots, normalized, "FEFuncBootstrapPrecompute");
     // Below degree 5 EvalPowers builds only the powers this series needs, so they cannot be shared.
-    if (lbcrypto::Degree(coefficients) < 5)
-        throw std::invalid_argument(
-            "CKKS FE functional bootstrapping needs a series of degree 5 or more to precompute shareable "
-            "complex-exponential powers; use EvalFEFuncBootstrap for a shorter series.");
+    if (normalized.size() <= 5)
+        throw std::invalid_argument(FEFuncPrecomputeDegreeError());
 
     FEFuncBootstrapExp(ctxt, slots);
-    return evalPowers(ctxt, coefficients, /*fused=*/false);
+    return evalPowers(ctxt, normalized, /*fused=*/false);
 }
 
 FIDESlib::CKKS::Ciphertext FIDESlib::CKKS::FEFuncBootstrapWithPrecomp(SeriesPowers& powers, const std::vector<std::complex<double>>& coefficients) {
@@ -776,10 +781,9 @@ FIDESlib::CKKS::Ciphertext FIDESlib::CKKS::FEFuncBootstrapWithPrecomp(SeriesPowe
     constexpr const char* who = "FEFuncBootstrapWithPrecomp";
     if (powers.powers.empty() || powers.powers2.empty() || powers.k == 0 || powers.m == 0 || powers.m >= 32)
         throw std::invalid_argument("The series powers were not produced by EvalFEFuncBootstrapPrecompute.");
-    ValidateFEFuncCoefficients(coefficients, who, /*trimmed=*/true);
+    const auto normalized = NormalizeFEFuncCoefficients(coefficients, who);
 
-    const uint32_t degree = lbcrypto::Degree(coefficients);
-    const std::vector<std::complex<double>> trimmed(coefficients.cbegin(), coefficients.cbegin() + degree + 1);
+    const uint32_t degree = static_cast<uint32_t>(normalized.size() - 1);
     if (degree < 5) {
         // The linear evaluator reads powers[0 .. degree-1] straight from the power basis.
         if (degree > powers.powers.size())
@@ -797,7 +801,7 @@ FIDESlib::CKKS::Ciphertext FIDESlib::CKKS::FEFuncBootstrapWithPrecomp(SeriesPowe
                 std::to_string(capacity - 1) + " spanned by the precomputed complex-exponential powers.");
     }
 
-    Ciphertext result = evalPolyWithPrecomp(powers, trimmed, /*fused=*/false);
+    Ciphertext result = evalPolyWithPrecomp(powers, normalized, /*fused=*/false);
     TwiceRealPart(result);
     return result;
 }

@@ -785,7 +785,7 @@ TEST(OpenFHECompatTests, EvalBootstrapStCFirstIterativeFixedManual) {
     ASSERT_ERROR_OK(r1, r2);
 }
 
-TEST(OpenFHECompatTests, EvalBootstrapDense) {
+void RunEvalBootstrapDense(uint32_t setupSlots) {
     uint32_t multDepth = 25;
     uint32_t scaleModSize = 50;
     uint32_t ringDim = 1 << 12;
@@ -814,8 +814,8 @@ TEST(OpenFHECompatTests, EvalBootstrapDense) {
     cc->EvalMultKeyGen(keys.secretKey);
 
     std::vector<uint32_t> levelBudget = { 3, 3 };
-    cc->EvalBootstrapSetup(levelBudget, { 0, 0 }, numSlots, 0);
-    cc->EvalBootstrapKeyGen(keys.secretKey, numSlots);
+    cc->EvalBootstrapSetup(levelBudget, { 0, 0 }, setupSlots, 0);
+    cc->EvalBootstrapKeyGen(keys.secretKey, setupSlots);
 
     std::vector<double> x = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
 
@@ -844,6 +844,14 @@ TEST(OpenFHECompatTests, EvalBootstrapDense) {
     r2->SetLength(numSlots);
 
     ASSERT_ERROR_OK(r1, r2);
+}
+
+TEST(OpenFHECompatTests, EvalBootstrapDense) {
+    RunEvalBootstrapDense(1 << 11);
+}
+
+TEST(OpenFHECompatTests, EvalBootstrapDenseZeroSlots) {
+    RunEvalBootstrapDense(0);
 }
 
 // level budget {1,1} takes the isLT/EvalLinearTransform branch

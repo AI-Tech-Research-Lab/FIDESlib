@@ -9,6 +9,7 @@
 #include "pke/openfhe.h"
 
 #include <complex>
+#include <string>
 #include <vector>
 
 namespace FIDESlib::CKKS {
@@ -47,13 +48,14 @@ SeriesPowers FEFuncBootstrapPrecompute(Ciphertext& ctxt, int slots, const std::v
 /// FHECKKSRNS::EvalFEFuncBootstrapWithPrecomp: evaluates one Fourier series on powers from
 /// FEFuncBootstrapPrecompute. Never mutates `powers`.
 Ciphertext FEFuncBootstrapWithPrecomp(SeriesPowers& powers, const std::vector<std::complex<double>>& coefficients);
-/// Throws std::invalid_argument unless `coefficients` is a Fourier series the FE functional
-/// bootstrap can evaluate: at least two entries, all finite, and a nonzero coefficient above the
-/// constant term. Unless `trimmed` (FEFuncBootstrapWithPrecomp, which drops trailing zeros first),
-/// a series below degree 5 must also have a nonzero last entry (the OpenFHE reference
-/// dereferences a missing power on it, after the whole refresh). `who` prefixes the message. Exposed so that callers can reject a
-/// series before choosing a backend.
-void ValidateFEFuncCoefficients(const std::vector<std::complex<double>>& coefficients, const char* who, bool trimmed);
+/// Validates a Fourier series and removes exact trailing zeros. A short series whose highest
+/// coefficient is zero at OpenFHE's linear-evaluator tolerance is rejected before evaluation.
+/// `who` prefixes the error message; API callers use this before selecting a backend.
+std::vector<std::complex<double>> NormalizeFEFuncCoefficients(const std::vector<std::complex<double>>& coefficients, const char* who);
+/// Error text shared by setup and GPU validation when q0/SF has the wrong rounded degree.
+std::string FEFuncFirstModulusError(int32_t degree);
+/// Error text shared by API and core when the precompute series has degree below five.
+const char* FEFuncPrecomputeDegreeError();
 
 double GetPreScaleFactor(Context& cc, int slots);
 void ModRaise(Ciphertext& ctxt, const int slots, const uint32_t correction, const bool prescaled = false, bool sparse_encaps = false);

@@ -17,21 +17,13 @@ namespace fideslib {
 /// budget and cannot be offloaded to host RAM. The handle keeps its context alive, so the GPU
 /// memory is always released before the context is torn down.
 struct SeriesPowersImpl {
-    /// @brief API ciphertext holding exp(2*pi*i*t): the template every result is cloned from, and
-    /// the reference that keeps the parent context alive. Declared first so it is destroyed last.
+    /// @brief API ciphertext holding exp(2*pi*i*t) and keeping the parent context alive.
+    /// Declared first so it is destroyed last.
     Ciphertext<DCRTPoly> exponential;
     /// @brief std::shared_ptr<lbcrypto::seriesPowers<lbcrypto::DCRTPoly>> when built on the CPU.
     std::any cpu;
     /// @brief FIDESlib::CKKS::SeriesPowers when built on the GPU.
     std::shared_ptr<void> gpu;
-    /// @brief Whether the powers were built on the GPU.
-    bool loaded = false;
-
-    ~SeriesPowersImpl() {
-        // Free the powers before `exponential` can release the last reference to the context.
-        gpu.reset();
-        cpu.reset();
-    }
 };
 
 /// @brief Shared pointer alias for SeriesPowersImpl.

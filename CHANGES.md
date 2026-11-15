@@ -6,6 +6,28 @@ work it accumulated since the previous release, **FIDESlib 2.1.3**. It closes
 issues #11, #15, #29, #32, #33 and #42, and supersedes pull requests #18, #45
 and #46.
 
+## Fork: FE functional bootstrapping (unreleased)
+
+- **Fourier-extension functional bootstrapping on the GPU** — OpenFHE 1.6.1's
+  `EvalFEFuncBootstrapSetup`, `EvalFEFuncBootstrap`, `EvalFEFuncBootstrapPrecompute` and
+  `EvalFEFuncBootstrapWithPrecomp`, plus `FHECKKSRNS::GetFEFBTDepth`, with the CPU fallback before
+  `LoadContext()`. Bit-identical to the CPU reference for the three secret distributions, the four
+  scaling techniques, REAL and COMPLEX data, dense and sparse packing and level budgets `{3,2}` /
+  `{1,1}`. `BootstrapMode::FEFBT` is no longer reserved: a slot set up for it cannot be bootstrapped
+  normally and vice versa.
+- **`SeriesPowers`** — an opaque handle to the shared powers of the complex exponential; it keeps
+  its context alive, frees its VRAM first, and is not managed by the ciphertext cache.
+- **Up-front validation** — setup arguments OpenFHE indexes unchecked or rejects only at the first
+  evaluation, non-finite or degenerate coefficients, and an exact level-sufficiency check (the
+  minimum workable depth runs; one level below throws instead of running the GPU out of towers).
+  A series below degree 5 ending in zeros is rejected on both backends; the OpenFHE reference
+  crashes on it.
+- The decode-first bootstrap prefix (deplete, SlotsToCoeffs, ModRaise, CoeffsToSlots) is shared by
+  `EvalBootstrapStCFirst` and the FE pipeline (no behavior change).
+- Example `examples/fe-functional-bootstrap`, documentation
+  [docs/fe-functional-bootstrapping.md](docs/fe-functional-bootstrapping.md) (usage, depth sizing,
+  limits and security notes).
+
 ## FIDESlib 2.2.0
 
 FIDESlib 2.2.0 is the **CPU/GPU bit-compatibility** release. Every GPU operation

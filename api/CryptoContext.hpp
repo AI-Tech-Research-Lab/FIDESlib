@@ -230,6 +230,16 @@ template <> class CryptoContextImpl<DCRTPoly> {
     void EvalMultKeyGen(const PrivateKey<DCRTPoly>& sk);
     /// @brief Generate the evaluation rotation keys for the given steps.
     void EvalRotateKeyGen(const PrivateKey<DCRTPoly>& sk, const std::vector<int32_t>& steps);
+    /// @brief Generate the rotation keys used by EvalSum (OpenFHE's EvalSumKeyGen): the radix
+    /// fold over the encoding batch size.
+    void EvalSumKeyGen(const PrivateKey<DCRTPoly>& sk);
+    /// @brief Generate the rotation keys used by EvalSumRows(ct, rowSize) (OpenFHE's
+    /// EvalSumRowsKeyGen). The keys stay in the context, so unlike OpenFHE no key map is returned.
+    /// Only subringDim == 0 or the cyclotomic order is supported.
+    void EvalSumRowsKeyGen(const PrivateKey<DCRTPoly>& sk, uint32_t rowSize, uint32_t subringDim = 0);
+    /// @brief Generate the rotation keys used by EvalSumCols (OpenFHE's EvalSumColsKeyGen): the
+    /// EvalSum keys plus the right-rotation keys, both over the encoding batch size.
+    void EvalSumColsKeyGen(const PrivateKey<DCRTPoly>& sk);
 
     // ---- Bootstrapping ----
 
@@ -377,6 +387,21 @@ template <> class CryptoContextImpl<DCRTPoly> {
     void AccumulateSumInPlace(Ciphertext<DCRTPoly>& ct, int slots, int stride = 1);
     void AccumulateSumInPlace(Ciphertext<DCRTPoly>& ct, int slots, int stride, int start);
 
+    /// @brief OpenFHE's EvalSum: slot i receives sum_{k < batchSize} x[i + k] (cyclic).
+    /// batchSize must be a power of two: as in OpenFHE, the radix fold otherwise sums the next power
+    /// of two terms (the same holds for EvalSumCols' numCols). Needs the keys from EvalSumKeyGen (or
+    /// EvalSumColsKeyGen).
+    Ciphertext<DCRTPoly> EvalSum(const Ciphertext<DCRTPoly>& ct, uint32_t batchSize);
+    /// @brief OpenFHE's EvalSumRows on a row-major matrix with rowSize columns: slot i receives
+    /// sum_{k < (N/2)/rowSize} x[i + k*rowSize], i.e. each column sum over the whole ring. OpenFHE
+    /// names the second argument numRows but uses it as the row size. Needs EvalSumRowsKeyGen with
+    /// the same rowSize; the key map argument of OpenFHE is implicit.
+    Ciphertext<DCRTPoly> EvalSumRows(const Ciphertext<DCRTPoly>& ct, uint32_t rowSize, uint32_t subringDim = 0);
+    /// @brief OpenFHE's EvalSumCols: every slot of each block of numCols slots receives the sum of
+    /// that block. Consumes one level (mask multiplication) and needs EvalSumColsKeyGen; the key map
+    /// argument of OpenFHE is implicit.
+    Ciphertext<DCRTPoly> EvalSumCols(const Ciphertext<DCRTPoly>& ct, uint32_t numCols);
+
     void ConvolutionTransformInPlace(Ciphertext<DCRTPoly>& ct, int gStep, int bStep, const std::vector<Plaintext>& pts, const std::vector<int>& indexes, int stride = 1, int rowSize = 0);
 
     void SpecialConvolutionTransformInPlace(Ciphertext<DCRTPoly>& ct,
@@ -438,6 +463,10 @@ template <> class CryptoContextImpl<DCRTPoly> {
     void RequireBootstrapPrecomputation(uint32_t slot, const char* who) const;
     /// @brief Resolve the slot count a setup call will register (0 => full packing M/4).
     uint32_t ResolveBootstrapSlots(uint32_t slots) const;
+
+    /// @brief Append to rotation_indexes the steps not already listed, so LoadContext uploads
+    /// each rotation key once.
+    void AddRotationIndexes(const std::vector<int32_t>& steps);
 
   public:
     // ---- Copy helpers ----

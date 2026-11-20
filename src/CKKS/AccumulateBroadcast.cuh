@@ -52,9 +52,16 @@ std::vector<int> GetbroadcastRotationIndices(const int bStep, const int initsize
  *  sparse re-interpretation of a full fold (e.g. the bootstrap PartialSum) set `ctxt.slots`
  *  themselves.
  *
- *  bStep, stride, size and startFactor - should be powers of two
+ *  A negative `stride` folds rightwards (rotations by -|stride|*s, ...) with the same schedule;
+ *  `stride == 0` is a no-op.
+ *
+ *  `normalizeIndexes == false` applies each rotation's raw automorphism 5^index instead of the
+ *  slot-normalised one (see Ciphertext::rotate_hoisted), as OpenFHE's EvalSumRadixFold does.
+ *
+ *  bStep, |stride|, size and startFactor - should be powers of two
  */
-void Accumulate(Ciphertext& ctxt, const int bStep, const int stride, const int size, const int startFactor = 1);
+void Accumulate(Ciphertext& ctxt, const int bStep, const int stride, const int size, const int startFactor = 1,
+    const bool normalizeIndexes = true);
 
 /**
  *  Compute a rotate and broadcast where:

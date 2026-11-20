@@ -3953,6 +3953,159 @@ TEST(OpenFHECompatTests, AccumulateSumInPlaceStartOffset) {
     ASSERT_ERROR_OK(rc, rg);
 }
 
+// ---- OpenFHE EvalSum / EvalSumRows / EvalSumCols ----
+//
+// The CPU fallback is OpenFHE's own EvalSum family; the GPU path must reproduce it bit for bit
+// (left radix fold, EvalSumCols' level-0 mask multiplication, right radix fold) and decrypt to the
+// plain reference, including OpenFHE's EvalSumRows quirk of summing over the whole ring (N/2 slots).
+namespace {
+const char* ScalingTechniqueName(ScalingTechnique st) {
+    switch (st) {
+    case FLEXIBLEAUTO: return "FLEXIBLEAUTO";
+    case FLEXIBLEAUTOEXT: return "FLEXIBLEAUTOEXT";
+    case FIXEDAUTO: return "FIXEDAUTO";
+    case FIXEDMANUAL: return "FIXEDMANUAL";
+    default: return "other";
+    }
+}
+
+void ExpectEvalSumValues(CryptoContext<DCRTPoly>& cc, const PrivateKey<DCRTPoly>& sk, Ciphertext<DCRTPoly>& ct,
+    const std::vector<double>& expected, const char* what) {
+    Plaintext pt;
+    cc->Decrypt(sk, ct, &pt);
+    pt->SetLength(expected.size());
+    const auto values = pt->GetRealPackedValue();
+    for (size_t i = 0; i < expected.size(); ++i)
+        ASSERT_NEAR(values.at(i), expected[i], 1e-4) << what << " slot " << i;
+}
+
+void CheckEvalSumFamily(ScalingTechnique st, uint32_t batchSize, uint32_t rowSize, uint32_t numCols, bool squareFirst) {
+    SCOPED_TRACE(std::string(ScalingTechniqueName(st)) + " batchSize=" + std::to_string(batchSize) +
+        " rowSize=" + std::to_string(rowSize) + " numCols=" + std::to_string(numCols) + (squareFirst ? " squared" : ""));
+    constexpr uint32_t ringDim = 128;
+
+    CCParams<CryptoContextCKKSRNS> parameters;
+    parameters.SetMultiplicativeDepth(3);
+    parameters.SetScalingModSize(50);
+    parameters.SetBatchSize(batchSize);
+    parameters.SetSecurityLevel(HEStd_NotSet);
+    parameters.SetRingDim(ringDim);
+    parameters.SetScalingTechnique(st);
+    parameters.SetPlaintextAutoload(false);
+    parameters.SetCiphertextAutoload(true);
+
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
+    cc->Enable(PKE);
+    cc->Enable(KEYSWITCH);
+    cc->Enable(LEVELEDSHE);
+    cc->Enable(ADVANCEDSHE);
+
+    auto keys = cc->KeyGen();
+    cc->EvalMultKeyGen(keys.secretKey);
+    cc->EvalSumKeyGen(keys.secretKey);
+    cc->EvalSumRowsKeyGen(keys.secretKey, rowSize);
+    cc->EvalSumColsKeyGen(keys.secretKey);
+
+    std::vector<double> x(batchSize);
+    for (uint32_t i = 0; i < batchSize; ++i)
+        x[i] = static_cast<double>((i * 37) % 17) / 17.0 - 0.5;
+
+    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(x);
+    auto ctxt = cc->Encrypt(keys.publicKey, ptxt);
+    std::vector<double> in = x;
+    if (squareFirst) {
+        // A degree-2 / one-level-down input exercises the mask multiplication's adjustment.
+        ctxt = cc->EvalMult(ctxt, ctxt);
+        if (st == FIXEDMANUAL)
+            ctxt = cc->Rescale(ctxt);
+        for (auto& v : in)
+            v *= v;
+    }
+
+    auto cSum = cc->EvalSum(ctxt, batchSize);
+    auto cRows = cc->EvalSumRows(ctxt, rowSize);
+    auto cCols = cc->EvalSumCols(ctxt, numCols);
+
+    //====================================================================
+
+    cc->SetDevices({ 0 });
+    cc->LoadContext(keys.publicKey);
+
+    auto gSum = cc->EvalSum(ctxt, batchSize);
+    auto gRows = cc->EvalSumRows(ctxt, rowSize);
+    auto gCols = cc->EvalSumCols(ctxt, numCols);
+
+    ASSERT_EQ_CIPHERTEXT(cSum, gSum);
+    ASSERT_EQ_CIPHERTEXT(cRows, gRows);
+    ASSERT_EQ_CIPHERTEXT(cCols, gCols);
+
+    // Plain references (cyclic over the batch, which sparse packing replicates over N/2).
+    std::vector<double> eSum(batchSize, 0.0), eRows(batchSize, 0.0), eCols(batchSize, 0.0);
+    for (uint32_t i = 0; i < batchSize; ++i) {
+        for (uint32_t k = 0; k < batchSize; ++k)
+            eSum[i] += in[(i + k) % batchSize];
+        for (uint32_t k = 0; k < ringDim / 2 / rowSize; ++k)
+            eRows[i] += in[(i + k * rowSize) % batchSize];
+        const uint32_t block = i - i % numCols;
+        for (uint32_t k = 0; k < numCols; ++k)
+            eCols[i] += in[(block + k) % batchSize];
+    }
+    ExpectEvalSumValues(cc, keys.secretKey, gSum, eSum, "EvalSum");
+    ExpectEvalSumValues(cc, keys.secretKey, gRows, eRows, "EvalSumRows");
+    ExpectEvalSumValues(cc, keys.secretKey, gCols, eCols, "EvalSumCols");
+}
+
+constexpr ScalingTechnique kEvalSumTechniques[] = { FLEXIBLEAUTO, FLEXIBLEAUTOEXT, FIXEDAUTO, FIXEDMANUAL };
+} // namespace
+
+TEST(OpenFHECompatTests, EvalSumFamilyDense) {
+    for (auto st : kEvalSumTechniques)
+        CheckEvalSumFamily(st, 64, 8, 8, false);
+}
+
+TEST(OpenFHECompatTests, EvalSumFamilySparse) {
+    for (auto st : kEvalSumTechniques)
+        CheckEvalSumFamily(st, 16, 4, 4, false);
+}
+
+TEST(OpenFHECompatTests, EvalSumFamilyAfterMult) {
+    for (auto st : kEvalSumTechniques)
+        CheckEvalSumFamily(st, 16, 2, 8, true);
+}
+
+TEST(OpenFHECompatTests, EvalSumArgumentErrors) {
+    CCParams<CryptoContextCKKSRNS> parameters;
+    parameters.SetMultiplicativeDepth(2);
+    parameters.SetScalingModSize(50);
+    parameters.SetBatchSize(16);
+    parameters.SetSecurityLevel(HEStd_NotSet);
+    parameters.SetRingDim(128);
+
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
+    cc->Enable(PKE);
+    cc->Enable(KEYSWITCH);
+    cc->Enable(LEVELEDSHE);
+    cc->Enable(ADVANCEDSHE);
+    auto keys = cc->KeyGen();
+
+    EXPECT_THROW(cc->EvalSumRowsKeyGen(keys.secretKey, 0), lbcrypto::OpenFHEException);
+    EXPECT_THROW(cc->EvalSumRowsKeyGen(keys.secretKey, 4, 64), lbcrypto::OpenFHEException);
+    cc->EvalSumRowsKeyGen(keys.secretKey, 4, 256); // the cyclotomic order is accepted
+    cc->EvalSumColsKeyGen(keys.secretKey);
+
+    Plaintext ones = cc->MakeCKKSPackedPlaintext(std::vector<double>(16, 1.0));
+    auto ctxt = cc->Encrypt(keys.publicKey, ones);
+    EXPECT_THROW(cc->EvalSumCols(ctxt, 0), lbcrypto::OpenFHEException);
+    EXPECT_THROW(cc->EvalSumCols(ctxt, 32), lbcrypto::OpenFHEException);
+    EXPECT_THROW(cc->EvalSumRows(ctxt, 4, 64), lbcrypto::OpenFHEException);
+
+    cc->SetDevices({ 0 });
+    cc->LoadContext(keys.publicKey);
+    EXPECT_THROW(cc->EvalSumKeyGen(keys.secretKey), lbcrypto::OpenFHEException);
+    EXPECT_THROW(cc->EvalSumRowsKeyGen(keys.secretKey, 4), lbcrypto::OpenFHEException);
+    EXPECT_THROW(cc->EvalSumColsKeyGen(keys.secretKey), lbcrypto::OpenFHEException);
+}
+
 TEST(OpenFHECompatTests, ApiNullContextThrows) {
     // The rvalue-context constructors reject a null parent context — the only
     // uncovered lines of the CiphertextImpl/PlaintextImpl constructors.

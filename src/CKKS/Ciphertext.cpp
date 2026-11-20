@@ -1120,10 +1120,10 @@ void Ciphertext::conjugate(const Ciphertext& c) {
     this->copyMetadata(c);
 }
 
-void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ciphertext*> results, const bool ext) {
+void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ciphertext*> results, const bool ext, const bool normalize) {
     std::vector<int> indexes;
     for (auto i : indexes_) {
-        indexes.push_back(normalyzeIndex(i));
+        indexes.push_back(normalize ? normalyzeIndex(i) : i);
     }
 
     CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());

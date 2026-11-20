@@ -58,6 +58,9 @@ countermeasure), so decrypted values are compared within precision (`ASSERT_ERRO
 | `SetLevel` | PASS | tower-drop metadata op; GPU `dropToLevel` fix (skip_adjust) below |
 | `EvalBootstrapInPlace` | PASS | mutating form of the standard FLEXIBLEAUTO sparse bootstrap |
 | `AccumulateSumInPlace` | PASS | mutating form of the radix-fold AccumulateSum |
+| `EvalSumFamilyDense` | PASS | OpenFHE `EvalSum` / `EvalSumRows` / `EvalSumCols` vs GPU `Accumulate` (+ `EvalSumCols`' level-0 mask multiplication and right fold), fully packed, all four scaling techniques |
+| `EvalSumFamilySparse` | PASS | same, sparse packing (EvalSumRows sums over the whole ring, as OpenFHE does) |
+| `EvalSumFamilyAfterMult` | PASS | same on a degree-2 / one-level-down input (mask multiplication adjustment) |
 | `EvalFastRotationExt` | PASS | extended-basis (no mod-down) rotations, single- and multi-index: GPU `rotate(.., moddown=false)` / `rotate_hoisted(.., ext=true)` produce the same 5-tower QL·P (extended) result as `EvalFastRotationExt` — fixed via the store/download extended-basis round-trip (R15) |
 | `UnloadCiphertext` | PASS | GPU→host export: `UnloadCiphertext` materializes the host copy (R15 basis-grow included) and evicts the GPU ciphertext; the host-only result serializes/deserializes and decrypts like the CPU reference (server→client return path) |
 | `SerializeCiphertextExtended` | PASS | extended-basis export: multi-index `EvalFastRotationExt` on GPU → unload → serialize → deserialize → decrypt equals direct decrypt and the CPU reference (R15 extended download) |

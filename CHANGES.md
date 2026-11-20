@@ -6,6 +6,28 @@ work it accumulated since the previous release, **FIDESlib 2.1.3**. It closes
 issues #11, #15, #29, #32, #33 and #42, and supersedes pull requests #18, #45
 and #46.
 
+## Fork: OpenFHE EvalSum family (unreleased)
+
+- **`EvalSum`, `EvalSumRows`, `EvalSumCols` on the GPU** — with `EvalSumKeyGen`,
+  `EvalSumRowsKeyGen` and `EvalSumColsKeyGen`, and the CPU fallback before `LoadContext()`
+  forwarding to OpenFHE. Bit-identical to OpenFHE 1.6.1 for FLEXIBLEAUTO, FLEXIBLEAUTOEXT,
+  FIXEDAUTO and FIXEDMANUAL, dense and sparse packing. OpenFHE already folds all three with the
+  lazy radix-`PARTIAL_SUM_RADIX` `EvalSumRadixFold`, so the GPU runs `Accumulate` with the same
+  schedule; `EvalSumCols` adds OpenFHE's level-0 mask multiplication and its right fold.
+- Differences from the OpenFHE signatures: the keygens return nothing and the evaluations take
+  no key map (the keys stay in the context, like `EvalRotate`); `EvalSumRows`' second argument is
+  named `rowSize`, which is how OpenFHE uses its `numRows`; only `subringDim` 0 or the cyclotomic
+  order is accepted. Zero or out-of-range `rowSize`/`numCols` throw instead of dividing by zero.
+- `Accumulate` accepts a negative stride (a rightward fold with the same schedule); `stride == 0`
+  stays a no-op.
+- `Ciphertext::rotate_hoisted` and `Accumulate` take an optional `normalize`/`normalizeIndexes`
+  flag (default `true`, unchanged behavior). The EvalSum family passes `false`: OpenFHE applies
+  the raw automorphism `5^step`, while the slot normalisation turns a step above `slots/2` into its
+  negative equivalent and a multiple of `slots` into a plain copy — the same values on a sparse
+  ciphertext, but not the same bits. `AccumulateSum` keeps the normalisation, so on sparse packing
+  it can still differ bitwise from its CPU fallback when a step is a multiple of `slots` or the
+  context also holds the key of a step's negative equivalent (unchanged, not covered by tests).
+
 ## Fork: FE functional bootstrapping (unreleased)
 
 - **Fourier-extension functional bootstrapping on the GPU** — OpenFHE 1.6.1's

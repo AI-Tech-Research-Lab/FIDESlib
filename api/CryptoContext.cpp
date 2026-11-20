@@ -772,6 +772,77 @@ void CryptoContextImpl<DCRTPoly>::EvalRotateKeyGen(const PrivateKey<DCRTPoly>& s
     this->rotation_indexes.insert(this->rotation_indexes.end(), steps.begin(), steps.end());
 }
 
+namespace {
+// Rotation steps of OpenFHE's EvalSumRadixFold(g0 = 5^stride, size): level s = 1, R, R^2, ...
+// rotates by i*s*stride for i in [1, R) with i*s < size (GenerateEvalSumIndices). Automorphism
+// 5^step is the key OpenFHE generates for g0^(i*s), so LoadContext uploads the very same keys.
+std::vector<int32_t> EvalSumFoldSteps(int32_t stride, uint32_t size) {
+    std::vector<int32_t> steps;
+    for (uint32_t s = 1; s < size; s *= PARTIAL_SUM_RADIX)
+        for (uint32_t i = 1; i < PARTIAL_SUM_RADIX && i * s < size; ++i)
+            steps.push_back(static_cast<int32_t>(i * s) * stride);
+    return steps;
+}
+
+uint32_t EvalSumRowsSize(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& context, uint32_t rowSize, uint32_t subringDim, const char* who) {
+    const uint32_t m = context->GetCyclotomicOrder();
+    if (rowSize == 0 || rowSize > m / 4)
+        OPENFHE_THROW(std::string(who) + ": rowSize must be in [1, N/2], got " + std::to_string(rowSize));
+    if (subringDim != 0 && subringDim != m)
+        OPENFHE_THROW(std::string(who) + ": only subringDim == 0 or the cyclotomic order (" + std::to_string(m) + ") is supported, got " +
+            std::to_string(subringDim));
+    return m / (4 * rowSize);
+}
+} // namespace
+
+void CryptoContextImpl<DCRTPoly>::AddRotationIndexes(const std::vector<int32_t>& steps) {
+    for (const int32_t step : steps)
+        if (std::find(this->rotation_indexes.begin(), this->rotation_indexes.end(), step) == this->rotation_indexes.end())
+            this->rotation_indexes.push_back(step);
+}
+
+void CryptoContextImpl<DCRTPoly>::EvalSumKeyGen(const PrivateKey<DCRTPoly>& sk) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    if (!this->devices.empty() && this->loaded) {
+        OPENFHE_THROW("EvalSumKeyGen must be called before LoadContext");
+    }
+
+    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+    auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
+    context->EvalSumKeyGen(skImpl);
+    AddRotationIndexes(EvalSumFoldSteps(1, context->GetEncodingParams()->GetBatchSize()));
+}
+
+void CryptoContextImpl<DCRTPoly>::EvalSumRowsKeyGen(const PrivateKey<DCRTPoly>& sk, uint32_t rowSize, uint32_t subringDim) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    if (!this->devices.empty() && this->loaded) {
+        OPENFHE_THROW("EvalSumRowsKeyGen must be called before LoadContext");
+    }
+
+    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+    const uint32_t colSize = EvalSumRowsSize(context, rowSize, subringDim, "EvalSumRowsKeyGen");
+    auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
+    context->EvalSumRowsKeyGen(skImpl, rowSize, subringDim);
+    AddRotationIndexes(EvalSumFoldSteps(static_cast<int32_t>(rowSize), colSize));
+}
+
+void CryptoContextImpl<DCRTPoly>::EvalSumColsKeyGen(const PrivateKey<DCRTPoly>& sk) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    if (!this->devices.empty() && this->loaded) {
+        OPENFHE_THROW("EvalSumColsKeyGen must be called before LoadContext");
+    }
+
+    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+    auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
+    context->EvalSumColsKeyGen(skImpl);
+    const uint32_t batchSize = context->GetEncodingParams()->GetBatchSize();
+    AddRotationIndexes(EvalSumFoldSteps(1, batchSize));
+    AddRotationIndexes(EvalSumFoldSteps(-1, batchSize));
+}
+
 // ---- Bootstrapping ----
 
 uint32_t CryptoContextImpl<DCRTPoly>::ResolveBootstrapSlots(uint32_t slots) const {
@@ -2691,6 +2762,105 @@ void CryptoContextImpl<DCRTPoly>::AccumulateSumInPlace(Ciphertext<DCRTPoly>& ct,
     const int inputSlots = res_gpu->slots;
     FIDESlib::CKKS::Accumulate(*res_gpu, ACCUMULATE_SUM_RADIX, stride, slots, start);
     res_gpu->slots = inputSlots;
+}
+
+// ---- OpenFHE EvalSum family ----
+//
+// OpenFHE 1.6.1 runs EvalSum/EvalSumRows/EvalSumCols through AdvancedSHEBase::EvalSumRadixFold,
+// the same lazy radix-PARTIAL_SUM_RADIX fold as the GPU `Accumulate`: generator g0 = 5^stride
+// maps to the rotation schedule {i*s*stride}. The CPU fallback forwards to OpenFHE with the
+// context's automorphism key map (a superset of the map OpenFHE's keygen returns).
+// The GPU folds pass normalizeIndexes = false: OpenFHE applies the raw automorphism 5^step, which
+// on a sparse ciphertext differs bitwise from FIDESlib's slot-normalised rotation (a step above
+// slots/2 becomes its negative equivalent, a multiple of slots a plain copy).
+
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSum(const Ciphertext<DCRTPoly>& ct, uint32_t batchSize) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    if (this->devices.empty()) {
+        auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+        auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+        result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(context->EvalSum(ctImpl, batchSize));
+        return result;
+    }
+
+    // GPU path: EvalSum2nComplex = EvalSumRadixFold(g0 = 5, batchSize).
+    this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
+
+    Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+    auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+    const int inputSlots = res_gpu->slots;
+    FIDESlib::CKKS::Accumulate(*res_gpu, ACCUMULATE_SUM_RADIX, 1, static_cast<int>(batchSize), 1, false);
+    res_gpu->slots = inputSlots;
+    return result;
+}
+
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSumRows(const Ciphertext<DCRTPoly>& ct, uint32_t rowSize, uint32_t subringDim) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+    const uint32_t colSize = EvalSumRowsSize(context, rowSize, subringDim, "EvalSumRows");
+
+    if (this->devices.empty()) {
+        auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        auto& keys = context->GetEvalAutomorphismKeyMap(ctImpl->GetKeyTag());
+        Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+        result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(context->EvalSumRows(ctImpl, rowSize, keys, subringDim));
+        return result;
+    }
+
+    // GPU path: EvalSum2nComplexRows = EvalSumRadixFold(g0 = 5^rowSize, M / (4 * rowSize)).
+    this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
+
+    Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+    auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+    const int inputSlots = res_gpu->slots;
+    FIDESlib::CKKS::Accumulate(*res_gpu, ACCUMULATE_SUM_RADIX, static_cast<int>(rowSize), static_cast<int>(colSize), 1, false);
+    res_gpu->slots = inputSlots;
+    return result;
+}
+
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSumCols(const Ciphertext<DCRTPoly>& ct, uint32_t numCols) {
+    FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
+
+    const uint32_t slots = ct->GetSlots();
+    if (numCols == 0 || numCols > slots)
+        OPENFHE_THROW("EvalSumCols: numCols must be in [1, slots = " + std::to_string(slots) + "], got " + std::to_string(numCols));
+
+    if (this->devices.empty()) {
+        auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+        auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        auto& keys = context->GetEvalAutomorphismKeyMap(ctImpl->GetKeyTag());
+        Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+        result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(context->EvalSumCols(ctImpl, numCols, keys));
+        return result;
+    }
+
+    // GPU path, as AdvancedSHEBase::EvalSumCols: left fold over numCols, multiply by the mask that
+    // keeps the first slot of each block (encoded exactly as OpenFHE does: level 0, degree 1, the
+    // ciphertext's slots), then the right fold (g0 = 5^-1) that replicates it over the block.
+    std::vector<std::complex<double>> mask(slots, 0);
+    for (uint32_t i = 0; i < slots; i += numCols)
+        mask[i] = 1;
+    Plaintext maskPt = this->MakeCKKSPackedPlaintext(mask, 1, 0, nullptr, slots);
+
+    this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
+    Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
+    {
+        auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+        const int inputSlots = res_gpu->slots;
+        FIDESlib::CKKS::Accumulate(*res_gpu, ACCUMULATE_SUM_RADIX, 1, static_cast<int>(numCols), 1, false);
+        res_gpu->slots = inputSlots;
+    }
+    this->EvalMultInPlace(result, maskPt);
+    {
+        auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+        const int inputSlots = res_gpu->slots;
+        FIDESlib::CKKS::Accumulate(*res_gpu, ACCUMULATE_SUM_RADIX, -1, static_cast<int>(numCols), 1, false);
+        res_gpu->slots = inputSlots;
+    }
+    return result;
 }
 
 void CryptoContextImpl<DCRTPoly>::ConvolutionTransformInPlace(Ciphertext<DCRTPoly>& ct,

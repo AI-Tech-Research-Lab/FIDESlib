@@ -59,9 +59,10 @@ std::vector<int> FIDESlib::CKKS::GetbroadcastRotationIndices(const int bStep, co
     return indices;
 }
 
-void FIDESlib::CKKS::Accumulate(Ciphertext& ctxt, const int bStep, const int stride, const int size, const int startFactor) {
+void FIDESlib::CKKS::Accumulate(Ciphertext& ctxt, const int bStep, const int stride, const int size, const int startFactor,
+    const bool normalizeIndexes) {
     checkBStep(bStep, "Accumulate");
-    if (startFactor <= 0 || size <= 0) {
+    if (startFactor <= 0 || size <= 0 || stride == 0) {
         return;
     }
 
@@ -87,16 +88,18 @@ void FIDESlib::CKKS::Accumulate(Ciphertext& ctxt, const int bStep, const int str
     for (int s = startFactor; s < size; s <<= logbStep) {
         std::vector<int> indexes;
         std::vector<Ciphertext*> auxptr;
-        for (int idx = stride * s; idx < stride * size && idx < bStep * stride * s; idx += stride * s) {
-            indexes.push_back(idx);
-            auxptr.emplace_back(&aux[idx / stride / s - 1]);
+        // Rotation i of the level is by i*s*stride, for i in [1, bStep) with i*s < size. A negative
+        // stride folds rightwards with the same schedule (OpenFHE's EvalSumCols second fold).
+        for (int i = 1; i < bStep && i * s < size; ++i) {
+            indexes.push_back(i * s * stride);
+            auxptr.emplace_back(&aux[i - 1]);
         }
 
         if (indexes.empty()) {
             continue;
         }
 
-        ctxt.rotate_hoisted(indexes, auxptr, true);
+        ctxt.rotate_hoisted(indexes, auxptr, true, normalizeIndexes);
         for (size_t i = 0; i < indexes.size(); ++i) {
             ctxt.add(*auxptr[i]);
         }

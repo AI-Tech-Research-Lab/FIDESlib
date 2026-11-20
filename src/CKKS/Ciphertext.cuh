@@ -576,8 +576,12 @@ class Ciphertext {
      * @param indexes Vector of rotation indexes.
      * @param results Vector to receive resulting ciphertext pointers.
      * @param ext     If true, extends ciphertexts before rotation.
+     * @param normalize If false, keep each index as given (only reduced mod N/2 by the key lookup)
+     *                instead of normalising it to the ciphertext's slots. OpenFHE's EvalSum family
+     *                applies the raw automorphism 5^index, which on a sparse ciphertext differs
+     *                bitwise from the slot-normalised one (and from skipping a multiple of slots).
      */
-    void rotate_hoisted(const std::vector<int>& indexes, std::vector<Ciphertext*> results, bool ext);
+    void rotate_hoisted(const std::vector<int>& indexes, std::vector<Ciphertext*> results, bool ext, bool normalize = true);
 
     /**
      * @brief Evaluates a linear weighted sum (mutable version) over `n` ciphertexts.

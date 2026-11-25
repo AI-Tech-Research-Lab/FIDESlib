@@ -116,9 +116,15 @@ one is rejected with "Not enough levels to perform FE functional bootstrapping".
   latter at the first evaluation; FIDESlib rejects it in the setup).
 - `EvalFEFuncBootstrapSetup` must run before `LoadContext()`, with exactly two entries in
   `levelBudget` and `dim1`, and `slots` either 0 (full packing) or a power of two up to `N/2`.
-- A slot count holds one bootstrapping precomputation: one set up for FE functional
-  bootstrapping cannot be used by `EvalBootstrap` and vice versa (the two fold a different
-  overflow bound into the CoeffsToSlots matrix), and a conflicting second setup throws.
+- FE functional bootstrapping and the standard (or SlotsToCoeffs-first) bootstrap fold a
+  different overflow bound into the CoeffsToSlots matrix, so each keeps its own precomputation.
+  Both can be set up for the same slot count, with their own `levelBudget` and `dim1`, in either
+  order; `EvalBootstrapKeyGen` generates the keys of every mode set up for that slot count, so
+  run it after the last setup (or once after each). `EvalBootstrap` then uses the standard setup
+  and `EvalFEFuncBootstrap*` the FE one, on the CPU and on the GPU, with the same keys and
+  packing. A slot count set up for only one of the two rejects the other evaluation, and a mode
+  set up after the slot count's last `EvalBootstrapKeyGen` is rejected after `LoadContext()`.
+  The standard and SlotsToCoeffs-first setups still exclude each other on one slot count.
 - Coefficients must be finite, with a nonzero coefficient above the constant term. Exact trailing
   zeros are removed before either backend evaluates the series, including for degree below 5.
   For degree below 5, at least one component of the highest remaining coefficient (real or

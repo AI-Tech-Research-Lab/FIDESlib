@@ -35,8 +35,16 @@ and #46.
   `EvalFEFuncBootstrapWithPrecomp`, plus `FHECKKSRNS::GetFEFBTDepth`, with the CPU fallback before
   `LoadContext()`. Bit-identical to the CPU reference for the three secret distributions, the four
   scaling techniques, REAL and COMPLEX data, dense and sparse packing and level budgets `{3,2}` /
-  `{1,1}`. `BootstrapMode::FEFBT` is no longer reserved: a slot set up for it cannot be bootstrapped
-  normally and vice versa.
+  `{1,1}`. `BootstrapMode::FEFBT` is no longer reserved: a slot set up only for it cannot be
+  bootstrapped normally and vice versa.
+- **Standard bootstrapping and FE functional bootstrapping on the same slot count** — one context
+  can set up both for one slot count (each with its own level budget and `dim1`, in either order)
+  and evaluate both on the same ciphertexts and keys. The api keeps one OpenFHE precomputation per
+  (slot count, mode) and installs the one each operation reads; `EvalBootstrapKeyGen` covers every
+  mode set up for the slot count; the GPU stores the precomputations by (slot count, kind), and the
+  FE pipeline selects its own with `BootPrecomputationScope`. Previously the second setup threw
+  `Bootstrap setup conflict for slots=…`. The standard and SlotsToCoeffs-first setups still
+  exclude each other.
 - **`SeriesPowers`** — an opaque handle to the shared powers of the complex exponential; it keeps
   its context alive, frees its VRAM first, and is not managed by the ciphertext cache.
 - **Up-front validation** — setup arguments OpenFHE indexes unchecked or rejects only at the first

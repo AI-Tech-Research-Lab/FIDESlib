@@ -9,6 +9,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <set>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -443,22 +444,45 @@ template <> class CryptoContextImpl<DCRTPoly> {
     /// @brief Bootstrap-precomputation VRAM budget in bytes, applied to the GPU context in
     /// LoadContext(); SIZE_MAX means unlimited. See SetBootstrapCache().
     size_t bootstrap_cache_bytes = SIZE_MAX;
-    /// @brief Bootstrapping mode each slot was set up for (standard / SlotsToCoeffs-first / FE). All
-    /// modes share one OpenFHE precomputation entry per slot count, so this is used to reject
-    /// conflicting setups and mismatched evaluations.
-    std::map<uint32_t, fideslib::BootstrapMode> bootstrap_mode;
+    /// @brief Bootstrapping modes each slot count was set up for. A slot count holds at most one
+    /// regular mode (STANDARD or STC_FIRST, which share OpenFHE's regular precomputation) and,
+    /// independently, FEFBT: the two families fold different overflow bounds into CoeffsToSlots,
+    /// so each keeps its own precomputation (see bootstrap_precom).
+    std::map<uint32_t, std::set<fideslib::BootstrapMode>> bootstrap_mode;
+    /// @brief The OpenFHE precomputation (std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>) each
+    /// (slot count, mode) setup built. OpenFHE itself keeps one entry per slot count
+    /// (m_bootPrecomMap[slots]), so the one an operation needs is installed there before OpenFHE
+    /// reads it (InstallBootstrapPrecomputation).
+    std::map<std::pair<uint32_t, fideslib::BootstrapMode>, std::any> bootstrap_precom;
+    /// @brief The (slot count, mode) pairs EvalBootstrapKeyGen generated keys for (see
+    /// BootstrapModeHasKeys).
+    std::set<std::pair<uint32_t, fideslib::BootstrapMode>> bootstrap_keyed;
 
   private:
-    // ---- Bootstrapping guardrails (shared OpenFHE precomputation entries) ----
+    // ---- Bootstrapping guardrails and per-mode precomputations ----
 
-    /// @brief Register @p mode as the bootstrapping mode of @p slot, throwing if the slot is
-    /// already configured for a different mode.
+    /// @brief Register @p mode for @p slot, throwing if it conflicts with a mode already set up,
+    /// and keep the OpenFHE precomputation the setup just built for it.
     void RecordBootstrapMode(uint32_t slot, fideslib::BootstrapMode mode);
-    /// @brief Throw if @p slot is already configured for a bootstrapping mode different from
-    /// @p mode. Called before a setup mutates OpenFHE's shared precomputation entry.
+    /// @brief Throw if @p slot is already configured for a regular mode other than @p mode
+    /// (STANDARD and STC_FIRST share OpenFHE's regular precomputation). Called before a setup
+    /// mutates OpenFHE's precomputation entry.
     void CheckBootstrapModeConflict(uint32_t slot, fideslib::BootstrapMode mode) const;
-    /// @brief Throw unless @p slot is configured for one of @p allowed. `who` names the caller.
-    void CheckBootstrapMode(uint32_t slot, std::initializer_list<fideslib::BootstrapMode> allowed, const char* who) const;
+    /// @brief Throw unless @p slot is configured for one of @p allowed, and install the
+    /// precomputation of that mode in OpenFHE's entry for @p slot. `who` names the caller.
+    void SelectBootstrapMode(uint32_t slot, std::initializer_list<fideslib::BootstrapMode> allowed, const char* who);
+    /// @brief Put the precomputation set up for (@p slot, @p mode) back in OpenFHE's entry for
+    /// @p slot, where OpenFHE's evaluators, key generation and the GPU upload read it. No-op when
+    /// no such precomputation was recorded (e.g. after deserialization).
+    void InstallBootstrapPrecomputation(uint32_t slot, fideslib::BootstrapMode mode);
+    /// @brief Install the regular (STANDARD / STC_FIRST) precomputation of @p slot, if one was set
+    /// up, before a CPU EvalBootstrap*; otherwise leave OpenFHE's entry alone.
+    void InstallRegularBootstrapPrecomputation(uint32_t slot);
+    /// @brief Whether LoadContext uploads (@p slot, @p mode): true when EvalBootstrapKeyGen covered
+    /// it, or when it never ran for @p slot in this process (keys loaded from elsewhere, e.g.
+    /// deserialized), in which case the keys are assumed present as before. False for a mode set up
+    /// after the slot's last EvalBootstrapKeyGen.
+    bool BootstrapModeHasKeys(uint32_t slot, fideslib::BootstrapMode mode) const;
     /// @brief Throw unless @p slot has any bootstrapping precomputation.
     void RequireBootstrapPrecomputation(uint32_t slot, const char* who) const;
     /// @brief Resolve the slot count a setup call will register (0 => full packing M/4).

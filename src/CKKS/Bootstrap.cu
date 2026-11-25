@@ -754,6 +754,9 @@ static void TwiceRealPart(Ciphertext& series) {
 void FIDESlib::CKKS::FEFuncBootstrap(Ciphertext& ctxt, const int slots, const std::vector<std::complex<double>>& coefficients) {
     CudaNvtxRange r(std::string{ sc::current().function_name() });
     const auto normalized = NormalizeFEFuncCoefficients(coefficients, "FEFuncBootstrap");
+    // Every precomputation lookup below (including those of the shared CtS/StC/ModRaise building
+    // blocks) resolves to the FE precomputation of `slots`, which may coexist with a regular one.
+    BootPrecomputationScope scope(ctxt.cc, BootPrecomputationKind::FE_FUNC);
     ValidateFEFunc(ctxt, slots, normalized, "FEFuncBootstrap");
 
     FEFuncBootstrapExp(ctxt, slots);
@@ -767,6 +770,7 @@ void FIDESlib::CKKS::FEFuncBootstrap(Ciphertext& ctxt, const int slots, const st
 FIDESlib::CKKS::SeriesPowers FIDESlib::CKKS::FEFuncBootstrapPrecompute(Ciphertext& ctxt, const int slots, const std::vector<std::complex<double>>& coefficients) {
     CudaNvtxRange r(std::string{ sc::current().function_name() });
     const auto normalized = NormalizeFEFuncCoefficients(coefficients, "FEFuncBootstrapPrecompute");
+    BootPrecomputationScope scope(ctxt.cc, BootPrecomputationKind::FE_FUNC); // see FEFuncBootstrap
     ValidateFEFunc(ctxt, slots, normalized, "FEFuncBootstrapPrecompute");
     // Below degree 5 EvalPowers builds only the powers this series needs, so they cannot be shared.
     if (normalized.size() <= 5)
@@ -817,6 +821,8 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt,
     const uint32_t precision) {
     CudaNvtxRange r(std::string{ sc::current().function_name() });
 
+    // The regular precomputation of `slots`, even when an FE one is registered next to it.
+    BootPrecomputationScope scope(ctxt.cc, BootPrecomputationKind::REGULAR);
     const auto& pre = ctxt.cc.GetBootPrecomputation(slots);
     if (pre.isFEFunc) {
         throw std::invalid_argument(std::string("CKKS Bootstrap: slots=") + std::to_string(slots) +
@@ -857,6 +863,8 @@ void FIDESlib::CKKS::BootstrapStCFirst(Ciphertext& ctxt,
     const uint32_t precision) {
     CudaNvtxRange r(std::string{ sc::current().function_name() });
 
+    // The regular precomputation of `slots`, even when an FE one is registered next to it.
+    BootPrecomputationScope scope(ctxt.cc, BootPrecomputationKind::REGULAR);
     const auto& pre = ctxt.cc.GetBootPrecomputation(slots);
     if (pre.isFEFunc) {
         throw std::invalid_argument(

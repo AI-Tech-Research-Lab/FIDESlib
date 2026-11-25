@@ -1008,10 +1008,14 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
     // Under a bootstrap-cache budget every group keeps the host data it was built from as its
     // snapshot (see ContextData::AdmitBootBlock); otherwise each one is dropped right after upload.
     const bool keep_raw = GPUcc.bootstrapPrecomputationLazy();
+    // Only skip the upload when this kind is already on the device: the other kind of the same
+    // slot count has different matrices.
+    const BootPrecomputationKind kind =
+        precom->m_variant == lbcrypto::CKKSBootstrapPrecom::FEFBT ? BootPrecomputationKind::FE_FUNC : BootPrecomputationKind::REGULAR;
 
     if (precom->m_paramsEnc.lvlb /*[CKKS_BOOT_PARAMS::LEVEL_BUDGET]*/ == 1 && precom->m_paramsDec.lvlb /*[CKKS_BOOT_PARAMS::LEVEL_BUDGET]*/ == 1) {
 
-        if (!GPUcc.HasBootPrecomputation(slots)) {
+        if (!GPUcc.HasBootPrecomputation(slots, kind)) {
             if constexpr (1) {
                 // extended limbs computation
                 auto auxA = precom->m_U0hatTPre;
@@ -1045,7 +1049,7 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
 
     } else {
 
-        if (!GPUcc.HasBootPrecomputation(slots)) {
+        if (!GPUcc.HasBootPrecomputation(slots, kind)) {
             uint32_t M = cc->GetCyclotomicOrder();
             auto& A = precom->m_U0hatTPreFFT;
             auto& invA = precom->m_U0PreFFT;
@@ -1083,10 +1087,19 @@ void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcryp
     ContextData& GPUcc = *GPUcc_;
     lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc = publicKey->GetCryptoContext();
 
-    if (!GPUcc.HasBootPrecomputation(slots)) {
-        FIDESlib::CKKS::BootstrapPrecomputation result_;
+    // OpenFHE holds one precomputation per slot count: the one the caller installed in
+    // m_bootPrecomMap[slots]. Its variant selects the GPU entry, so a regular and an FE functional
+    // precomputation of the same slot count are uploaded by two calls and kept side by side.
+    const auto& bootPrecomMap = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_bootPrecomMap;
+    const auto installed = bootPrecomMap.find(slots);
+    if (installed == bootPrecomMap.end() || !installed->second)
+        throw std::runtime_error("AddBootstrapPrecomputation: no OpenFHE bootstrap precomputation for " + std::to_string(slots) + " slots.");
+    const BootPrecomputationKind kind =
+        installed->second->m_variant == lbcrypto::CKKSBootstrapPrecom::FEFBT ? BootPrecomputationKind::FE_FUNC : BootPrecomputationKind::REGULAR;
+    BootPrecomputationScope scope(GPUcc, kind); // AddBootstrapKeys stores the sparse context in this entry
 
-        FIDESlib::CKKS::BootstrapPrecomputation& result = GPUcc.HasBootPrecomputation(slots) ? GPUcc_->GetBootPrecomputation(slots) : result_;
+    if (!GPUcc.HasBootPrecomputation(slots, kind)) {
+        FIDESlib::CKKS::BootstrapPrecomputation result;
 
         std::vector<int> indexes = GetBootstrapIndexes(cc, slots, &result);
 

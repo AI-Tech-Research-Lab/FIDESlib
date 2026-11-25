@@ -100,12 +100,12 @@ enum SecurityLevel {
 /// @brief The bootstrapping mode a slot's precomputation was set up for.
 ///
 /// OpenFHE keeps a single bootstrapping precomputation entry per slot count
-/// (`m_bootPrecomMap[slots]`), shared by the standard (ModRaise-first) bootstrap, the
-/// SlotsToCoeffs-first bootstrap and the FE functional bootstrap. A slot can therefore be
-/// configured for exactly one of these modes at a time, and evaluating another mode against it
-/// would silently misroute (e.g. a decode-first setup read back as the standard bootstrap, or an
-/// FE setup, whose CoeffsToSlots matrix folds a different overflow bound K, used for a standard
-/// bootstrap). This enum lets the api guard against that.
+/// (`m_bootPrecomMap[slots]`). The standard (ModRaise-first) and SlotsToCoeffs-first bootstraps
+/// share the regular precomputation, so a slot count holds at most one of them. The FE functional
+/// bootstrap folds a different overflow bound K into its CoeffsToSlots matrix and gets its own
+/// precomputation, so it can be set up next to either: the api keeps one OpenFHE precomputation
+/// per (slot count, mode) and installs the one an operation needs. This enum names the modes, so
+/// the api can route each evaluation to its own precomputation and reject mismatched ones.
 enum class BootstrapMode {
     UNCONFIGURED = 0, ///< no setup ran for this slot
     STANDARD,         ///< EvalBootstrapSetup (ModRaise-first, btsfirstboot=false)

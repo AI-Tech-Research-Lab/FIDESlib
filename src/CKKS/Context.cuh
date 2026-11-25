@@ -26,10 +26,21 @@ namespace FIDESlib::CKKS {
 struct BootCacheBlock;
 struct RawPlainText;
 
+/// @brief The family a bootstrap precomputation belongs to. The regular bootstrap (ModRaise-first
+/// or SlotsToCoeffs-first) and FE functional bootstrapping fold different overflow bounds K into
+/// their CoeffsToSlots matrices, so one slot count can hold one precomputation of each kind.
+enum class BootPrecomputationKind : int { REGULAR = 0, FE_FUNC = 1 };
+
+/// @brief Key of ContextData::precom.boot: the slot count and the precomputation kind.
+using BootPrecomputationKey = std::pair<int, BootPrecomputationKind>;
+
+/// @brief The kind a precomputation was built for (from its isFEFunc flag).
+BootPrecomputationKind KindOf(const BootstrapPrecomputation& precomp);
+
 struct Precomputations {
     std::vector<Constants> constants;
     std::unique_ptr<Global> globals;
-    std::map<int, BootstrapPrecomputation> boot;
+    std::map<BootPrecomputationKey, BootstrapPrecomputation> boot;
     std::vector<RNSPoly> auxPoly;
     std::map<int, RNSPoly> monomialCache;
 #ifdef NCCL
@@ -188,9 +199,19 @@ class ContextData {
     std::vector<uint64_t> ElemForEvalAddOrSub(const int level, const double operand, const int noise_deg);
     std::vector<double>& GetCoeffsChebyshev();
     int GetDoubleAngleIts();
+    /// @brief Register @p precomp for @p slots under its own kind (KindOf). A precomputation of the
+    /// same slot count and kind already registered is kept.
     void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp);
+    /// @brief Whether @p slots has a precomputation of any kind.
     bool HasBootPrecomputation(int slots);
+    /// @brief Whether @p slots has a precomputation of kind @p kind.
+    bool HasBootPrecomputation(int slots, BootPrecomputationKind kind);
+    /// @brief The precomputation for @p slots of the kind selected by the innermost
+    /// BootPrecomputationScope (REGULAR outside any scope). When the slot count only has the other
+    /// kind, that one is returned, so the evaluators can report a mode mismatch themselves.
     BootstrapPrecomputation& GetBootPrecomputation(int slots);
+    /// @brief The precomputation for @p slots of kind @p kind; throws if there is none.
+    BootstrapPrecomputation& GetBootPrecomputation(int slots, BootPrecomputationKind kind);
     void AddRotationKey(int index, KeySwitchingKey&& ksk);
     KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID);
     KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID, int slots, int& actual_index);
@@ -210,6 +231,7 @@ class ContextData {
     void clearAuxilarPoly();
     void clearAutomorphismKeys(const KeyHash& KeyID = {});
     void clearEvalMultKeys(const KeyHash& KeyID = {});
+    /// @brief Drop the precomputations of @p slots (of every kind), or all of them for -1.
     void clearBootPrecomputation(int slots = -1);
     void clearParamSwitchKeys(const KeyHash& KeyID = {});
 
@@ -299,6 +321,8 @@ class ContextData {
     size_t rotation_key_cache_bytes = SIZE_MAX;
     /** Depth of active RotationKeyEvictionHold scopes. */
     int rotation_key_eviction_hold = 0;
+    /** Kind GetBootPrecomputation(slots) resolves to; set by BootPrecomputationScope. */
+    BootPrecomputationKind boot_precomputation_kind = BootPrecomputationKind::REGULAR;
     /** @endcond */
 
     friend Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& devs);
@@ -335,6 +359,27 @@ struct RotationKeyEvictionHold {
 
     RotationKeyEvictionHold(const RotationKeyEvictionHold&) = delete;
     RotationKeyEvictionHold& operator=(const RotationKeyEvictionHold&) = delete;
+};
+
+/** RAII guard selecting which bootstrap precomputation kind ContextData::GetBootPrecomputation(slots)
+ * resolves to while in scope. The pipelines share their building blocks (CoeffsToSlots,
+ * SlotsToCoeffs, ModRaise, ...), which look the precomputation up by slot count, so an FE functional
+ * bootstrap opens an FE_FUNC scope for its duration and a slot count can carry both a regular and an
+ * FE precomputation. Scopes nest; the previous kind is restored on exit. */
+struct BootPrecomputationScope {
+    ContextData& cc;
+    BootPrecomputationKind previous;
+
+    BootPrecomputationScope(ContextData& cc_, BootPrecomputationKind kind) : cc(cc_), previous(cc_.boot_precomputation_kind) {
+        cc.boot_precomputation_kind = kind;
+    }
+
+    ~BootPrecomputationScope() {
+        cc.boot_precomputation_kind = previous;
+    }
+
+    BootPrecomputationScope(const BootPrecomputationScope&) = delete;
+    BootPrecomputationScope& operator=(const BootPrecomputationScope&) = delete;
 };
 
 /// @brief Give back to the CUDA driver every buffer sitting idle in the GPU allocator's

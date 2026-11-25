@@ -589,9 +589,22 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
         rot_ksk.Initialize(raw_rot_ksk, c->rotationKeysLazy());
         c->AddRotationKey(step, std::move(rot_ksk));
     }
-    // Bootstrapping keys.
+    // Bootstrapping keys and precomputations: one GPU precomputation per mode set up for the slot
+    // count (AddBootstrapPrecomputation keys it by the variant of the installed OpenFHE entry).
     for (const auto& slot : this->slots_bootstrap) {
-        FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, slot, c);
+        auto modes = this->bootstrap_mode.find(slot);
+        if (modes == this->bootstrap_mode.end() || modes->second.empty()) {
+            FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, slot, c);
+            continue;
+        }
+        for (const auto mode : modes->second) {
+            // A mode set up after the last EvalBootstrapKeyGen has no keys for its rotations;
+            // SelectBootstrapMode reports it if it is evaluated.
+            if (!BootstrapModeHasKeys(slot, mode))
+                continue;
+            InstallBootstrapPrecomputation(slot, mode);
+            FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, slot, c);
+        }
     }
 
     this->loaded = true;
@@ -853,39 +866,109 @@ uint32_t CryptoContextImpl<DCRTPoly>::ResolveBootstrapSlots(uint32_t slots) cons
     return context->GetCyclotomicOrder() / 4;
 }
 
+namespace {
+
+// STANDARD and STC_FIRST share OpenFHE's regular precomputation (variant BOOTSTRAP); FEFBT has its own.
+bool IsRegularBootstrapMode(const fideslib::BootstrapMode mode) {
+    return mode == fideslib::BootstrapMode::STANDARD || mode == fideslib::BootstrapMode::STC_FIRST;
+}
+
+std::map<uint32_t, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>& OpenFheBootPrecomMap(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& context) {
+    return std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE)->m_bootPrecomMap;
+}
+
+std::string BootstrapModeNames(const std::set<fideslib::BootstrapMode>& modes) {
+    std::string names;
+    for (const auto mode : modes) {
+        if (!names.empty())
+            names += " and ";
+        names += fideslib::BootstrapModeName(mode);
+    }
+    return names;
+}
+
+} // namespace
+
 void CryptoContextImpl<DCRTPoly>::RecordBootstrapMode(uint32_t slot, fideslib::BootstrapMode mode) {
     FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
     CheckBootstrapModeConflict(slot, mode);
-    bootstrap_mode[slot] = mode;
+    bootstrap_mode[slot].insert(mode);
+    // The setup just (re)built OpenFHE's entry for this slot count: keep it for this mode, since a
+    // setup of the other family for the same slot count replaces the entry.
+    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+    bootstrap_precom[{ slot, mode }] = std::make_any<std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>(OpenFheBootPrecomMap(context).at(slot));
 }
 
 void CryptoContextImpl<DCRTPoly>::CheckBootstrapModeConflict(uint32_t slot, fideslib::BootstrapMode mode) const {
     auto it = bootstrap_mode.find(slot);
-    if (it != bootstrap_mode.end() && it->second != fideslib::BootstrapMode::UNCONFIGURED && it->second != mode) {
-        OPENFHE_THROW("Bootstrap setup conflict for slots=" + std::to_string(slot) + ": already configured for " +
-            std::string(fideslib::BootstrapModeName(it->second)) + "; cannot reconfigure it for " + std::string(fideslib::BootstrapModeName(mode)) +
-            ". The standard, SlotsToCoeffs-first and FE functional bootstraps share one precomputation "
-            "entry per slot count.");
+    if (it == bootstrap_mode.end() || !IsRegularBootstrapMode(mode))
+        return;
+    for (const auto configured : it->second) {
+        if (configured != mode && IsRegularBootstrapMode(configured)) {
+            OPENFHE_THROW("Bootstrap setup conflict for slots=" + std::to_string(slot) + ": already configured for " +
+                std::string(fideslib::BootstrapModeName(configured)) + "; cannot reconfigure it for " + std::string(fideslib::BootstrapModeName(mode)) +
+                ". The standard and SlotsToCoeffs-first bootstraps share one precomputation per slot count "
+                "(FE functional bootstrapping can be set up next to either).");
+        }
     }
 }
 
-void CryptoContextImpl<DCRTPoly>::CheckBootstrapMode(uint32_t slot, std::initializer_list<fideslib::BootstrapMode> allowed, const char* who) const {
+void CryptoContextImpl<DCRTPoly>::SelectBootstrapMode(uint32_t slot, std::initializer_list<fideslib::BootstrapMode> allowed, const char* who) {
     auto it = bootstrap_mode.find(slot);
-    if (it == bootstrap_mode.end() || it->second == fideslib::BootstrapMode::UNCONFIGURED) {
+    if (it == bootstrap_mode.end() || it->second.empty()) {
         OPENFHE_THROW(std::string(who) + ": no bootstrapping precomputation for slots=" + std::to_string(slot) + " (run the matching setup before LoadContext).");
     }
     for (auto m : allowed) {
-        if (it->second == m) {
+        if (it->second.contains(m)) {
+            if (this->loaded && !BootstrapModeHasKeys(slot, m)) {
+                OPENFHE_THROW(std::string(who) + ": slots=" + std::to_string(slot) + " was set up for " + std::string(fideslib::BootstrapModeName(m)) +
+                    ", but EvalBootstrapKeyGen did not run after that setup and before LoadContext, so its keys and precomputation are not on the device.");
+            }
+            InstallBootstrapPrecomputation(slot, m);
             return;
         }
     }
-    OPENFHE_THROW(std::string(who) + ": slots=" + std::to_string(slot) + " is configured for " + std::string(fideslib::BootstrapModeName(it->second)) +
+    OPENFHE_THROW(std::string(who) + ": slots=" + std::to_string(slot) + " is configured for " + BootstrapModeNames(it->second) +
         ", which is incompatible with this evaluation.");
+}
+
+void CryptoContextImpl<DCRTPoly>::InstallBootstrapPrecomputation(uint32_t slot, fideslib::BootstrapMode mode) {
+    auto it = bootstrap_precom.find({ slot, mode });
+    if (it == bootstrap_precom.end())
+        return;
+    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+    OpenFheBootPrecomMap(context)[slot] = std::any_cast<const std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>&>(it->second);
+}
+
+void CryptoContextImpl<DCRTPoly>::InstallRegularBootstrapPrecomputation(uint32_t slot) {
+    // OpenFHE's own evaluator reports a missing or mismatched precomputation, as before.
+    auto it = bootstrap_mode.find(slot);
+    if (it == bootstrap_mode.end())
+        return;
+    for (const auto mode : it->second) {
+        if (IsRegularBootstrapMode(mode)) {
+            InstallBootstrapPrecomputation(slot, mode);
+            return;
+        }
+    }
+}
+
+bool CryptoContextImpl<DCRTPoly>::BootstrapModeHasKeys(uint32_t slot, fideslib::BootstrapMode mode) const {
+    if (bootstrap_keyed.contains({ slot, mode }))
+        return true;
+    auto it = bootstrap_mode.find(slot);
+    if (it == bootstrap_mode.end())
+        return true;
+    for (const auto configured : it->second) {
+        if (bootstrap_keyed.contains({ slot, configured }))
+            return false;
+    }
+    return true;
 }
 
 void CryptoContextImpl<DCRTPoly>::RequireBootstrapPrecomputation(uint32_t slot, const char* who) const {
     auto it = bootstrap_mode.find(slot);
-    if (it == bootstrap_mode.end() || it->second == fideslib::BootstrapMode::UNCONFIGURED) {
+    if (it == bootstrap_mode.end() || it->second.empty()) {
         OPENFHE_THROW(std::string(who) + ": no bootstrapping precomputation for slots=" + std::to_string(slot) + " (run the matching setup before LoadContext).");
     }
 }
@@ -929,8 +1012,9 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>
         context->EvalBootstrapSetup(levelBudget, std::move(dim1), slots, correctionFactor, precompute, btsfirstboot, modall);
     }
 
-    // Guardrail: one precomputation mode per slot count (the standard and StC-first setups share
-    // the OpenFHE entry; a conflicting earlier setup is rejected by CheckBootstrapModeConflict).
+    // Guardrail: one regular mode per slot count (the standard and StC-first setups share the
+    // OpenFHE precomputation; a conflicting earlier setup is rejected by CheckBootstrapModeConflict).
+    // An FE functional setup of the same slot count is kept apart (bootstrap_precom).
     RecordBootstrapMode(ResolveBootstrapSlots(slots), btsfirstboot ? fideslib::BootstrapMode::STC_FIRST : fideslib::BootstrapMode::STANDARD);
 }
 
@@ -956,9 +1040,19 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>
     //  2. FIDESlib::CKKS::GenBootstrapKeys, whose sparse-switch keys live in the disjoint
     //     2N-6/2N-8 slots (BTS_KSPARSE_*_SLOT in RawCiphertext.cu) consumed by the GPU pipeline.
     // The two key sets never collide.
-    context->EvalBootstrapKeyGen(skImpl, slots);
-    FIDESlib::CKKS::GenBootstrapKeys(skImpl, slots, this->keyDist == fideslib::SPARSE_ENCAPSULATED);
-    this->slots_bootstrap.push_back(slots);
+    //
+    // Each mode set up for this slot count has its own transforms, hence its own rotations: generate
+    // the keys of every one of them, so both evaluators find theirs. OpenFHE only inserts the
+    // automorphism keys not present yet, so the shared ones (conjugation, the sparse-encapsulation
+    // pair at 2N-2/2N-4) are generated once and stay consistent.
+    for (const auto mode : bootstrap_mode.at(slots)) {
+        InstallBootstrapPrecomputation(slots, mode);
+        context->EvalBootstrapKeyGen(skImpl, slots);
+        FIDESlib::CKKS::GenBootstrapKeys(skImpl, slots, this->keyDist == fideslib::SPARSE_ENCAPSULATED);
+        this->bootstrap_keyed.insert({ slots, mode });
+    }
+    if (std::find(this->slots_bootstrap.begin(), this->slots_bootstrap.end(), slots) == this->slots_bootstrap.end())
+        this->slots_bootstrap.push_back(slots);
 }
 
 // ---- FE functional bootstrapping ----
@@ -988,7 +1082,7 @@ void CryptoContextImpl<DCRTPoly>::EvalFEFuncBootstrapSetup(const std::vector<uin
     const int32_t deg = static_cast<int32_t>(std::round(std::log2(q0 / std::pow(2, cryptoParams->GetPlaintextModulus()))));
     if (deg != 1)
         OPENFHE_THROW(FIDESlib::CKKS::FEFuncFirstModulusError(deg));
-    // Guardrail: reject a conflicting mode before the reference setup overwrites the shared entry.
+    // A regular setup of the same slot count is kept apart (bootstrap_precom), so this never conflicts.
     CheckBootstrapModeConflict(ResolveBootstrapSlots(slots), fideslib::BootstrapMode::FEFBT);
 
     context->EvalFEFuncBootstrapSetup(levelBudget, dim1, slots);
@@ -1001,7 +1095,8 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalFEFuncBootstrap(const Ciph
 
     // Same checks, and so the same outcome, on both backends.
     const auto normalized = FIDESlib::CKKS::NormalizeFEFuncCoefficients(coefficients, "EvalFEFuncBootstrap");
-    CheckBootstrapMode(static_cast<uint32_t>(ciphertext->GetSlots()), { fideslib::BootstrapMode::FEFBT }, "EvalFEFuncBootstrap");
+    // Also installs the FE precomputation in OpenFHE's entry for the CPU path.
+    SelectBootstrapMode(static_cast<uint32_t>(ciphertext->GetSlots()), { fideslib::BootstrapMode::FEFBT }, "EvalFEFuncBootstrap");
 
     // Fall back to CPU.
     if (this->devices.empty()) {
@@ -1029,7 +1124,7 @@ SeriesPowers CryptoContextImpl<DCRTPoly>::EvalFEFuncBootstrapPrecompute(const Ci
     const auto normalized = FIDESlib::CKKS::NormalizeFEFuncCoefficients(coefficients, "EvalFEFuncBootstrapPrecompute");
     if (normalized.size() <= 5)
         OPENFHE_THROW(FIDESlib::CKKS::FEFuncPrecomputeDegreeError());
-    CheckBootstrapMode(static_cast<uint32_t>(ciphertext->GetSlots()), { fideslib::BootstrapMode::FEFBT }, "EvalFEFuncBootstrapPrecompute");
+    SelectBootstrapMode(static_cast<uint32_t>(ciphertext->GetSlots()), { fideslib::BootstrapMode::FEFBT }, "EvalFEFuncBootstrapPrecompute");
 
     auto powers = std::make_shared<SeriesPowersImpl>();
 
@@ -2619,6 +2714,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalBootstrap(const Ciphertext
     if (this->devices.empty()) {
 
         auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
+        InstallRegularBootstrapPrecomputation(ctImpl->GetSlots());
         auto ct = context->EvalBootstrap(ctImpl, numIterations, precision);
         Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
         result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(ct);
@@ -2631,7 +2727,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalBootstrap(const Ciphertext
     Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
     auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 
-    CheckBootstrapMode(res_gpu->slots, { fideslib::BootstrapMode::STANDARD, fideslib::BootstrapMode::STC_FIRST }, "EvalBootstrap");
+    SelectBootstrapMode(res_gpu->slots, { fideslib::BootstrapMode::STANDARD, fideslib::BootstrapMode::STC_FIRST }, "EvalBootstrap");
     FIDESlib::CKKS::Bootstrap(*res_gpu, res_gpu->slots, prescaled, numIterations, precision);
 
     return result;
@@ -2645,6 +2741,7 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapInPlace(Ciphertext<DCRTPoly>& cip
     if (this->devices.empty()) {
 
         auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
+        InstallRegularBootstrapPrecomputation(ctImpl->GetSlots());
         auto ct = context->EvalBootstrap(ctImpl, numIterations, precision);
         Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
         result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(ct);
@@ -2657,7 +2754,7 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapInPlace(Ciphertext<DCRTPoly>& cip
 
     auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ciphertext->gpu));
 
-    CheckBootstrapMode(res_gpu->slots, { fideslib::BootstrapMode::STANDARD, fideslib::BootstrapMode::STC_FIRST }, "EvalBootstrapInPlace");
+    SelectBootstrapMode(res_gpu->slots, { fideslib::BootstrapMode::STANDARD, fideslib::BootstrapMode::STC_FIRST }, "EvalBootstrapInPlace");
     FIDESlib::CKKS::Bootstrap(*res_gpu, res_gpu->slots, prescaled, numIterations, precision);
 }
 
@@ -2669,6 +2766,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalBootstrapStCFirst(const Ci
     if (this->devices.empty()) {
 
         auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
+        InstallRegularBootstrapPrecomputation(ctImpl->GetSlots());
         auto ct = context->EvalBootstrapStCFirst(ctImpl, numIterations, precision);
         Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
         result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(ct);
@@ -2681,7 +2779,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalBootstrapStCFirst(const Ci
     Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
     auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 
-    CheckBootstrapMode(res_gpu->slots, { fideslib::BootstrapMode::STC_FIRST }, "EvalBootstrapStCFirst");
+    SelectBootstrapMode(res_gpu->slots, { fideslib::BootstrapMode::STC_FIRST }, "EvalBootstrapStCFirst");
     FIDESlib::CKKS::BootstrapStCFirst(*res_gpu, res_gpu->slots, /*prescaled=*/false, numIterations, precision);
 
     return result;

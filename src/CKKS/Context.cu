@@ -727,18 +727,42 @@ double ContextData::GetBootK() {
     return param.raw ? param.raw->bootK : 1;
 }
 
-bool ContextData::HasBootPrecomputation(int slots) {
+BootPrecomputationKind KindOf(const BootstrapPrecomputation& precomp) {
+    return precomp.isFEFunc ? BootPrecomputationKind::FE_FUNC : BootPrecomputationKind::REGULAR;
+}
 
-    return precom.boot.contains(slots);
+static BootPrecomputationKind OtherKind(const BootPrecomputationKind kind) {
+    return kind == BootPrecomputationKind::REGULAR ? BootPrecomputationKind::FE_FUNC : BootPrecomputationKind::REGULAR;
+}
+
+bool ContextData::HasBootPrecomputation(int slots) {
+    return HasBootPrecomputation(slots, BootPrecomputationKind::REGULAR) || HasBootPrecomputation(slots, BootPrecomputationKind::FE_FUNC);
+}
+
+bool ContextData::HasBootPrecomputation(int slots, BootPrecomputationKind kind) {
+    return precom.boot.contains({ slots, kind });
 }
 
 BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
-    auto it = precom.boot.find(slots);
+    // The selected kind first; otherwise the other one, whose own flags (isFEFunc, btsfirstboot)
+    // let the evaluator reject the mismatch with a message naming the right setup.
+    auto it = precom.boot.find({ slots, boot_precomputation_kind });
+    if (it == precom.boot.end())
+        it = precom.boot.find({ slots, OtherKind(boot_precomputation_kind) });
     if (it == precom.boot.end()) {
         // Guardrail, not a get-or-create: AddBootPrecomputation() is the creator. A raw
         // assert here (or the map's operator[]) left release builds silently using a
         // default-constructed precomputation.
         throw std::runtime_error("No bootstrap precomputation for " + std::to_string(slots) + " slots (run EvalBootstrapSetup/EvalBootstrapKeyGen before LoadContext)");
+    }
+    return it->second;
+}
+
+BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots, BootPrecomputationKind kind) {
+    auto it = precom.boot.find({ slots, kind });
+    if (it == precom.boot.end()) {
+        throw std::runtime_error("No " + std::string(kind == BootPrecomputationKind::FE_FUNC ? "FE functional" : "regular") +
+            " bootstrap precomputation for " + std::to_string(slots) + " slots (run its setup and EvalBootstrapKeyGen before LoadContext)");
     }
     return it->second;
 }
@@ -911,7 +935,7 @@ void evictBootstrapCache(ContextData& cc, const size_t budget, const size_t inco
     if (resident + incoming <= budget)
         return;
     std::vector<std::pair<BootCacheBlock*, std::vector<Plaintext>*>> candidates;
-    for (auto& [slots, precomp] : cc.precom.boot) {
+    for (auto& [key, precomp] : cc.precom.boot) {
         precomp.forEachBlock([&](BootCacheBlock& block, std::vector<Plaintext>& pts) {
             if (block.resident && block.hasSnapshot() && &block != keep)
                 candidates.emplace_back(&block, &pts);
@@ -981,7 +1005,7 @@ void ContextData::OffloadBootstrapPrecomputation() {
 
 size_t ContextData::BootstrapCacheResidentBytes() const {
     size_t bytes = 0;
-    for (const auto& [slots, precomp] : precom.boot) {
+    for (const auto& [key, precomp] : precom.boot) {
         precomp.forEachBlock([&](const BootCacheBlock& block, const std::vector<Plaintext>&) {
             if (block.resident)
                 bytes += block.bytes;
@@ -1120,12 +1144,13 @@ void ContextData::AddBootPrecomputation(int slots, BootstrapPrecomputation&& pre
             count += pts.size();
             bytes += block.bytes;
         });
-        std::cout << "Adding bootstrap precomputation to GPU for " << slots << " slots.\n"
+        std::cout << "Adding " << (precomp.isFEFunc ? "FE functional " : "") << "bootstrap precomputation to GPU for " << slots << " slots.\n"
                   << "Plaintexts loaded: " << count << " ~ " << bytes / (1 << 20) << "MB"
                   << (bootstrapPrecomputationLazy() ? " (offloaded to host RAM until first use)" : "") << "\n";
     }
 
-    precom.boot.emplace(slots, std::move(precomp));
+    const BootPrecomputationKey key{ slots, KindOf(precomp) };
+    precom.boot.emplace(key, std::move(precomp));
 }
 
 FIDESlib::CKKS::RESCALE_TECHNIQUE ContextData::translateRescalingTechnique(lbcrypto::ScalingTechnique technique) {
@@ -1439,9 +1464,8 @@ void ContextData::clearBootPrecomputation(const int slots) {
     if (slots == -1)
         precom.boot.clear();
     else {
-        if (precom.boot.contains(slots)) {
-            precom.boot.erase(slots);
-        }
+        precom.boot.erase({ slots, BootPrecomputationKind::REGULAR });
+        precom.boot.erase({ slots, BootPrecomputationKind::FE_FUNC });
     }
 }
 
@@ -1495,7 +1519,7 @@ void DeregisterCryptoContextGPU(const Parameters& param) {
     Context retiring = registered == map_param_context.end() ? nullptr : registered->second;
     std::vector<Context> auxiliaries;
     if (retiring) {
-        for (const auto& [slots, precomp] : retiring->precom.boot)
+        for (const auto& [key, precomp] : retiring->precom.boot)
             if (auto auxiliary = precomp.sparse_context.lock(); auxiliary && auxiliary != retiring)
                 auxiliaries.push_back(std::move(auxiliary));
     }
@@ -1519,7 +1543,7 @@ void DeregisterCryptoContextGPU(const Parameters& param) {
     for (const auto& auxiliary : auxiliaries) {
         bool shared = false;
         for (const auto& [otherParam, other] : map_param_context) {
-            for (const auto& [slots, precomp] : other->precom.boot)
+            for (const auto& [key, precomp] : other->precom.boot)
                 shared |= precomp.sparse_context.lock() == auxiliary;
         }
         if (!shared)

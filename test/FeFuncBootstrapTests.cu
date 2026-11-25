@@ -770,10 +770,11 @@ TEST(FeFuncBootstrap, LevelBoundary) {
     RunLevelBoundary(lt, *kSigmoid.coeffs, -1);
 }
 
-// Case 13: mode guards. A slot set up for FE functional bootstrapping cannot be bootstrapped
+// Case 13: mode guards. A slot set up only for FE functional bootstrapping cannot be bootstrapped
 // normally and vice versa (the two fold different K into the CoeffsToSlots matrix), an
-// unconfigured slot is rejected, and a conflicting second setup or a setup after LoadContext
-// throws; on both backends.
+// unconfigured slot is rejected, the two regular modes exclude each other, a mode set up after the
+// slot's EvalBootstrapKeyGen is rejected on the device, and a setup after LoadContext throws; on
+// both backends. Both families on one slot count: SameSlotsAsStandardBootstrap.
 TEST(FeFuncBootstrap, ModeGuards) {
     auto fx = MakeFeFixture(FeCase{}, *kSigmoid.coeffs);
     const uint32_t level = fx.depth - 3;
@@ -784,12 +785,14 @@ TEST(FeFuncBootstrap, ModeGuards) {
     EXPECT_THROW(fx.cc->EvalBootstrap(fx.ctxt), std::exception);
     EXPECT_THROW(fx.cc->EvalFEFuncBootstrap(ct4, *kSigmoid.coeffs), std::exception);
     EXPECT_THROW(fx.cc->EvalFEFuncBootstrapPrecompute(ct4, *kSigmoid.coeffs), std::exception);
-    EXPECT_THROW(fx.cc->EvalBootstrapSetup({ 3, 2 }, { 0, 0 }, fx.slots), std::exception);
+    // A regular setup may join the FE one; the other regular mode then conflicts with it.
+    EXPECT_NO_THROW(fx.cc->EvalBootstrapSetup({ 3, 2 }, { 0, 0 }, fx.slots));
     EXPECT_THROW(fx.cc->EvalBootstrapSetup({ 3, 2 }, { 0, 0 }, fx.slots, 0, true, /*btsfirstboot=*/true), std::exception);
     // Re-running the same FE setup is not a conflict.
     EXPECT_NO_THROW(fx.cc->EvalFEFuncBootstrapSetup({ 3, 2 }, { 0, 0 }, fx.slots));
 
     LoadFixture(fx);
+    // The standard setup came after the slot's EvalBootstrapKeyGen: nothing of it is on the device.
     EXPECT_THROW(fx.cc->EvalBootstrap(fx.ctxt), std::exception);
     EXPECT_THROW(fx.cc->EvalBootstrapStCFirst(fx.ctxt), std::exception);
     EXPECT_THROW(fx.cc->EvalFEFuncBootstrap(ct4, *kSigmoid.coeffs), std::exception);
@@ -816,7 +819,6 @@ TEST(FeFuncBootstrap, ModeGuards) {
     cc->EvalMultKeyGen(keys.secretKey);
     cc->EvalBootstrapSetup({ 3, 2 }, { 0, 0 }, 8);
     cc->EvalBootstrapKeyGen(keys.secretKey, 8);
-    EXPECT_THROW(cc->EvalFEFuncBootstrapSetup({ 3, 2 }, { 0, 0 }, 8), std::exception);
     Plaintext pt = cc->MakeCKKSPackedPlaintext(fx.input, 1, level, nullptr, 8);
     auto ct = cc->Encrypt(keys.publicKey, pt);
     EXPECT_THROW(cc->EvalFEFuncBootstrap(ct, *kSigmoid.coeffs), std::exception);
@@ -946,6 +948,206 @@ TEST(FeFuncBootstrap, EvaluationErrors) {
     auto gpuSigmoid = fx.cc->EvalFEFuncBootstrap(fx.ctxt, *kSigmoid.coeffs);
     ASSERT_EQ_CIPHERTEXT(cpuSigmoid, gpuSigmoid);
     ExpectDecryptsTo(fx, cpuSigmoid, gpuSigmoid, Expected(fx, kSigmoid), REAL);
+}
+
+namespace {
+
+// Standard bootstrapping and FE functional bootstrapping set up for the same slot count, each with
+// its own level budget (so a precomputation picked for the wrong mode shows up in the output level
+// as well as in the decrypted values).
+const std::vector<uint32_t> kStdBudget = { 2, 2 };
+const std::vector<uint32_t> kFeBudget = { 3, 2 };
+constexpr uint32_t kSameSlots = 8;
+
+uint32_t SameSlotsDepth() {
+    // FE: its own depth plus two spare levels (the standard refresh of its output rescales once).
+    // Standard: its own depth, plus the levels the FE input must keep after it (the depletion
+    // target lvlbDec + 1) and one spare.
+    const uint32_t fe = fideslib::FHECKKSRNS::GetFEFBTDepth(kFeBudget, *kSigmoid.coeffs, SPARSE_TERNARY) + 2;
+    const uint32_t std = lbcrypto::FHECKKSRNS::GetBootstrapDepth(kStdBudget, lbcrypto::SPARSE_TERNARY) + kFeBudget[1] + 2;
+    return std::max(fe, std);
+}
+
+CryptoContext<DCRTPoly> MakeSameSlotsContext(uint32_t depth) {
+    CCParams<CryptoContextCKKSRNS> parameters;
+    parameters.SetSecretKeyDist(SPARSE_TERNARY);
+    parameters.SetScalingTechnique(FLEXIBLEAUTO);
+    parameters.SetMultiplicativeDepth(depth);
+    parameters.SetScalingModSize(59);
+    parameters.SetFirstModSize(60);
+    parameters.SetNumLargeDigits(3);
+    parameters.SetBatchSize(kSameSlots);
+    parameters.SetSecurityLevel(HEStd_NotSet);
+    parameters.SetRingDim(kRingDim);
+    parameters.SetPlaintextAutoload(false);
+    parameters.SetCiphertextAutoload(true);
+
+    CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
+    cc->Enable(PKE);
+    cc->Enable(KEYSWITCH);
+    cc->Enable(LEVELEDSHE);
+    cc->Enable(ADVANCEDSHE);
+    cc->Enable(FHE);
+    return cc;
+}
+
+std::vector<double> SameSlotsInput() {
+    std::vector<double> x(kSameSlots);
+    for (uint32_t i = 0; i < kSameSlots; ++i)
+        x[i] = -0.5 + static_cast<double>(i) / kSameSlots;
+    return x;
+}
+
+Ciphertext<DCRTPoly> EncryptAt(CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys, const std::vector<double>& x, uint32_t level) {
+    Plaintext pt = cc->MakeCKKSPackedPlaintext(x, 1, level, nullptr, kSameSlots);
+    return cc->Encrypt(keys.publicKey, pt);
+}
+
+double MaxError(CryptoContext<DCRTPoly>& cc, const KeyPair<DCRTPoly>& keys, Ciphertext<DCRTPoly> ct, const std::vector<double>& expected) {
+    Plaintext pt;
+    cc->Decrypt(keys.secretKey, ct, &pt);
+    pt->SetLength(kSameSlots);
+    const auto v = pt->GetCKKSPackedValue();
+    double m = 0.0;
+    for (size_t i = 0; i < expected.size(); ++i)
+        m = std::max(m, std::abs(v[i].real() - expected[i]));
+    return m;
+}
+
+struct OutputShape {
+    size_t level;
+    size_t noiseScaleDeg;
+};
+
+OutputShape ShapeOf(const Ciphertext<DCRTPoly>& ct) {
+    return { ct->GetLevel(), ct->GetNoiseScaleDeg() };
+}
+
+// The output level and scale degree of one standard bootstrap (input at `stdLevel`) and one FE
+// functional bootstrap (input at `feLevel`), each in a context set up for that mode only.
+std::pair<OutputShape, OutputShape> SingleModeShapes(uint32_t depth, uint32_t stdLevel, uint32_t feLevel) {
+    const auto x = SameSlotsInput();
+    auto stdCc = MakeSameSlotsContext(depth);
+    auto stdKeys = stdCc->KeyGen();
+    stdCc->EvalMultKeyGen(stdKeys.secretKey);
+    stdCc->EvalBootstrapSetup(kStdBudget, { 0, 0 }, kSameSlots);
+    stdCc->EvalBootstrapKeyGen(stdKeys.secretKey, kSameSlots);
+    const auto stdShape = ShapeOf(stdCc->EvalBootstrap(EncryptAt(stdCc, stdKeys, x, stdLevel)));
+
+    auto feCc = MakeSameSlotsContext(depth);
+    auto feKeys = feCc->KeyGen();
+    feCc->EvalMultKeyGen(feKeys.secretKey);
+    feCc->EvalFEFuncBootstrapSetup(kFeBudget, { 0, 0 }, kSameSlots);
+    feCc->EvalBootstrapKeyGen(feKeys.secretKey, kSameSlots);
+    const auto feShape = ShapeOf(feCc->EvalFEFuncBootstrap(EncryptAt(feCc, feKeys, x, feLevel), *kSigmoid.coeffs));
+    return { stdShape, feShape };
+}
+
+void ExpectShape(const Ciphertext<DCRTPoly>& ct, const OutputShape& expected, const char* what) {
+    SCOPED_TRACE(what);
+    EXPECT_EQ(ct->GetLevel(), expected.level);
+    EXPECT_EQ(ct->GetNoiseScaleDeg(), expected.noiseScaleDeg);
+}
+
+} // namespace
+
+// Case 14: standard bootstrapping and FE functional bootstrapping on one slot count of one context,
+// in both setup orders, with one EvalBootstrapKeyGen after both setups or one after each. Each
+// evaluator uses its own precomputation on the CPU and on the GPU: the output level and scale degree
+// match a context set up for that mode alone, and the composition refresh -> sigmoid -> refresh on
+// one ciphertext is bit-exact between the backends and decrypts to the function in the clear.
+TEST(FeFuncBootstrap, SameSlotsAsStandardBootstrap) {
+    const uint32_t depth = SameSlotsDepth();
+    const uint32_t stdLevel = depth - 1;                 // a nearly exhausted input
+    const uint32_t feLevel = depth - (kFeBudget[1] + 1); // the FE depletion target
+    const auto [stdShape, feShape] = SingleModeShapes(depth, stdLevel, feLevel);
+    const auto x = SameSlotsInput();
+
+    std::vector<double> sigmoid(kSameSlots);
+    for (uint32_t i = 0; i < kSameSlots; ++i)
+        sigmoid[i] = kSigmoid.f(2.0 * kSigmoid.radius * x[i]);
+
+    for (const bool feFirst : { false, true }) {
+        for (const bool keyGenPerSetup : { false, true }) {
+            SCOPED_TRACE(std::string(feFirst ? "FE setup first" : "standard setup first") +
+                (keyGenPerSetup ? ", EvalBootstrapKeyGen after each setup" : ", one EvalBootstrapKeyGen"));
+            std::cout << (feFirst ? "FE setup first" : "standard setup first") << (keyGenPerSetup ? ", key generation after each setup" : ", one key generation")
+                      << std::endl;
+
+            auto cc = MakeSameSlotsContext(depth);
+            auto keys = cc->KeyGen();
+            cc->EvalMultKeyGen(keys.secretKey);
+            auto setupStd = [&] { cc->EvalBootstrapSetup(kStdBudget, { 0, 0 }, kSameSlots); };
+            auto setupFe = [&] { cc->EvalFEFuncBootstrapSetup(kFeBudget, { 0, 0 }, kSameSlots); };
+            for (int step = 0; step < 2; ++step) {
+                if ((step == 0) == feFirst)
+                    setupFe();
+                else
+                    setupStd();
+                if (keyGenPerSetup)
+                    cc->EvalBootstrapKeyGen(keys.secretKey, kSameSlots);
+            }
+            if (!keyGenPerSetup)
+                cc->EvalBootstrapKeyGen(keys.secretKey, kSameSlots);
+
+            auto ctStd = EncryptAt(cc, keys, x, stdLevel);
+            auto ctFe = EncryptAt(cc, keys, x, feLevel);
+
+            // CPU: each mode alone, then the composition.
+            auto cpuStd = cc->EvalBootstrap(ctStd);
+            auto cpuFe = cc->EvalFEFuncBootstrap(ctFe, *kSigmoid.coeffs);
+            ExpectShape(cpuStd, stdShape, "CPU standard bootstrap");
+            ExpectShape(cpuFe, feShape, "CPU FE functional bootstrap");
+            auto cpuRefresh = cc->EvalBootstrap(ctStd);
+            auto cpuSigmoid = cc->EvalFEFuncBootstrap(cpuRefresh, *kSigmoid.coeffs);
+            auto cpuOut = cc->EvalBootstrap(cpuSigmoid);
+
+            cc->SetDevices(devices);
+            cc->LoadContext(keys.publicKey);
+
+            // Both precomputations are on the device, each under its own kind.
+            auto& gpu = std::any_cast<FIDESlib::CKKS::Context&>(cc->gpu);
+            const auto& regular = gpu->GetBootPrecomputation(kSameSlots, FIDESlib::CKKS::BootPrecomputationKind::REGULAR);
+            const auto& fe = gpu->GetBootPrecomputation(kSameSlots, FIDESlib::CKKS::BootPrecomputationKind::FE_FUNC);
+            EXPECT_FALSE(regular.isFEFunc);
+            EXPECT_FALSE(regular.btsfirstboot);
+            EXPECT_EQ(regular.lvlbEnc, static_cast<int>(kStdBudget[0]));
+            EXPECT_TRUE(fe.isFEFunc);
+            EXPECT_EQ(fe.lvlbEnc, static_cast<int>(kFeBudget[0]));
+            EXPECT_FALSE(gpu->GetBootPrecomputation(kSameSlots).isFEFunc);
+            {
+                FIDESlib::CKKS::BootPrecomputationScope scope(*gpu, FIDESlib::CKKS::BootPrecomputationKind::FE_FUNC);
+                EXPECT_TRUE(gpu->GetBootPrecomputation(kSameSlots).isFEFunc);
+            }
+            EXPECT_FALSE(gpu->GetBootPrecomputation(kSameSlots).isFEFunc);
+
+            std::cout << "GPU standard bootstrap: ";
+            auto gpuStd = cc->EvalBootstrap(ctStd);
+            ASSERT_EQ_CIPHERTEXT(cpuStd, gpuStd);
+            ExpectShape(gpuStd, stdShape, "GPU standard bootstrap");
+            std::cout << "GPU FE functional bootstrap: ";
+            auto gpuFe = cc->EvalFEFuncBootstrap(ctFe, *kSigmoid.coeffs);
+            ASSERT_EQ_CIPHERTEXT(cpuFe, gpuFe);
+            ExpectShape(gpuFe, feShape, "GPU FE functional bootstrap");
+
+            std::cout << "GPU refresh -> sigmoid -> refresh: ";
+            auto gpuRefresh = cc->EvalBootstrap(ctStd);
+            ASSERT_EQ_CIPHERTEXT(cpuRefresh, gpuRefresh);
+            auto gpuSigmoid = cc->EvalFEFuncBootstrap(gpuRefresh, *kSigmoid.coeffs);
+            ASSERT_EQ_CIPHERTEXT(cpuSigmoid, gpuSigmoid);
+            auto gpuOut = cc->EvalBootstrap(gpuSigmoid);
+            ASSERT_EQ_CIPHERTEXT(cpuOut, gpuOut);
+
+            const double errStd = MaxError(cc, keys, gpuStd, x);
+            const double errFe = MaxError(cc, keys, gpuFe, sigmoid);
+            const double errOut = MaxError(cc, keys, gpuOut, sigmoid);
+            std::cout << "max error: standard " << errStd << ", FE " << errFe << ", composition " << errOut << std::endl;
+            // Observed: ~1e-8 for the refreshes, ~3e-10 for FE on its fresh input.
+            EXPECT_LT(errStd, 1e-6);
+            EXPECT_LT(errFe, kFunctionTolerance);
+            EXPECT_LT(errOut, 1e-6);
+        }
+    }
 }
 
 } // namespace FIDESlib::Testing

@@ -1,9 +1,30 @@
 #include "Plaintext.hpp"
 #include "CryptoContext.hpp"
+#include "CKKS/openfhe-interface/RawCiphertext.cuh"
 
 #include <openfhe.h>
 
+#include <mutex>
+
 namespace fideslib {
+namespace {
+std::mutex cpu_encoding_mutex;
+}
+
+void PlaintextImpl::EnsureCpuEncoding() const {
+    if (!this->coefficients || !this->cpu.has_value())
+        return;
+    const auto& impl = std::any_cast<const lbcrypto::Plaintext&>(this->cpu);
+    std::lock_guard<std::mutex> lock(cpu_encoding_mutex);
+    if (impl && !impl->IsEncoded()) {
+        impl->Encode();
+        // NoiseLevel is the degree of the encoded plaintext, which OpenFHE can set after Encode()
+        // (FLEXIBLEAUTOEXT at level 0).
+        if (impl->GetNoiseScaleDeg() != static_cast<size_t>(this->coefficients->NoiseLevel))
+            impl->SetNoiseScaleDeg(this->coefficients->NoiseLevel);
+    }
+}
+
 PlaintextImpl::PlaintextImpl(const CryptoContext<DCRTPoly>&& context) : parent_context(context) {
     if (!context) {
         OPENFHE_THROW("Cannot create Ciphertext with null CryptoContext");
@@ -20,6 +41,7 @@ PlaintextImpl::~PlaintextImpl() {
 // ---- Functions ----
 
 void PlaintextImpl::SetLength(size_t length) {
+    this->EnsureCpuEncoding();
     if (this->cpu.has_value()) {
         auto& impl = std::any_cast<lbcrypto::Plaintext&>(this->cpu);
         impl->SetLength(length);
@@ -27,6 +49,8 @@ void PlaintextImpl::SetLength(size_t length) {
 }
 
 void PlaintextImpl::SetSlots(uint32_t slots) {
+    // Encode first: on an unencoded OpenFHE plaintext the slot count would change the encoding.
+    this->EnsureCpuEncoding();
     if (this->cpu.has_value()) {
         auto& impl = std::any_cast<lbcrypto::Plaintext&>(this->cpu);
         impl->SetSlots(slots);
@@ -96,6 +120,8 @@ std::ostream& operator<<(std::ostream& os, const Plaintext& pt) {
 }
 
 bool operator==(const PlaintextImpl& lhs, const PlaintextImpl& rhs) {
+    lhs.EnsureCpuEncoding();
+    rhs.EnsureCpuEncoding();
     if (!lhs.cpu.has_value() || !rhs.cpu.has_value())
         return lhs.cpu.has_value() == rhs.cpu.has_value();
     const auto& l = std::any_cast<const lbcrypto::Plaintext&>(lhs.cpu);

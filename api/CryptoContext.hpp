@@ -57,6 +57,22 @@ template <> class CryptoContextImpl<DCRTPoly> {
     void SetAutoLoadPlaintexts(bool autoload);
     void SetAutoLoadCiphertexts(bool autoload);
     void SetDevices(const std::vector<int>& devices);
+    /// @brief Finish the CKKS encoding of new plaintexts on the GPU instead of the CPU.
+    ///
+    /// When enabled (and the context has devices), MakeCKKSPackedPlaintext() only runs the part
+    /// of OpenFHE's encoding that is shared by all RNS limbs: the IFFT over the slots and the
+    /// scaling and rounding to 2*slots integer coefficients. LoadPlaintext() then uploads those
+    /// coefficients once and reduces them modulo each prime and takes the NTT on the GPU. The
+    /// device limbs are bit-identical to the CPU path; the per-limb work, almost all of the
+    /// encoding cost, leaves the CPU, and the plaintext keeps 8 bytes per coefficient in host
+    /// memory instead of a full-ring element per limb.
+    ///
+    /// The OpenFHE plaintext in PlaintextImpl::cpu is created unencoded and encoded on the CPU
+    /// only when something needs it (Encrypt, CPU-only operations, comparisons); call
+    /// PlaintextImpl::EnsureCpuEncoding() before reading its element directly. Plaintexts that
+    /// already exist keep the representation they were made with. Default: off.
+    void SetGPUPlaintextEncoding(bool enable);
+    bool GetGPUPlaintextEncoding() const;
 
     // ---- Rotation-key VRAM cache ----
 
@@ -428,6 +444,8 @@ template <> class CryptoContextImpl<DCRTPoly> {
     bool auto_load_plaintexts = false;
     /// @brief Whether ciphertexts should be automatically loaded to the device upon creation.
     bool auto_load_ciphertexts = true;
+    /// @brief Whether new plaintexts finish their encoding on the GPU (SetGPUPlaintextEncoding).
+    bool gpu_plaintext_encoding = false;
     /// @brief Self reference to enable shared_from_this-like behavior.
     std::weak_ptr<CryptoContextImpl<DCRTPoly>> self_reference;
     /// @brief Multiplicative depth of the context.

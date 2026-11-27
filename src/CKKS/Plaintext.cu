@@ -17,6 +17,129 @@ using sc = std::source_location;
 
 namespace FIDESlib::CKKS {
 
+namespace {
+// Ring element of one limb in coefficient form: coefficient k of the encoding at position k * gap,
+// zero elsewhere. Same residues as OpenFHE's CKKSPackedEncoding::FitToNativeVector followed by the
+// optional constant multiplication (DCRTPoly::Times), both of which leave canonical values in [0, q).
+template <typename T>
+__global__ void scatterReduceCoefficients(T* out, const int64_t* coefficients, const int n, const int gap, const uint64_t q,
+    const uint64_t factor, const int N) {
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < N; idx += gridDim.x * blockDim.x) {
+        if (idx % gap != 0) {
+            out[idx] = 0;
+            continue;
+        }
+        const int64_t x = coefficients[idx / gap];
+        uint64_t r = x >= 0 ? static_cast<uint64_t>(x) % q : (q - (static_cast<uint64_t>(-x) % q)) % q;
+        if (factor != 1)
+            r = static_cast<uint64_t>(static_cast<unsigned __int128>(r) * factor % q);
+        out[idx] = static_cast<T>(r);
+        (void)n;
+    }
+}
+
+// Keep every gap-th word of a full-ring evaluation-form limb: the compressed layout
+// RNSPoly::loadConstant(..., compress = true) builds on the host for sparsely packed plaintexts.
+template <typename T> __global__ void gatherStrided(T* out, const T* in, const int n, const int gap) {
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += gridDim.x * blockDim.x)
+        out[idx] = in[static_cast<size_t>(idx) * gap];
+}
+
+constexpr int kEncodeBlock = 256;
+
+int EncodeGrid(const int n) {
+    return std::max(1, std::min((n + kEncodeBlock - 1) / kEncodeBlock, 4096));
+}
+} // namespace
+
+Plaintext::Plaintext(Context& cc, const RawPlainCoefficients& raw)
+: my_range(loc, LIFETIME), cc_((assert(cc != nullptr), CudaNvtxStart(std::string{ sc::current().function_name() }.substr()), cc)), cc(*cc_),
+  c0(this->cc, -1, false, true) {
+    load(raw);
+    CudaNvtxStop();
+    c0.onSizeChanged = [] { CudaNvtxLifetimeRefresh(Plaintext::loc); };
+    CudaNvtxLifetimeRegisterBytes(loc, this, [this] { return this->getMemoryUsage(); });
+}
+
+void Plaintext::load(const RawPlainCoefficients& raw) {
+    CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+    CKKS::SetCurrentContext(cc_);
+    const int limbs = static_cast<int>(raw.moduli.size());
+    const int n = 2 * raw.slots;
+    if (limbs == 0 || limbs > cc.L + 1 || raw.N != cc.N || raw.slots <= 0 || n > cc.N || cc.N % n != 0 ||
+        raw.coefficients.size() != static_cast<size_t>(n) || (!raw.factors.empty() && raw.factors.size() != raw.moduli.size()))
+        throw std::invalid_argument("Plaintext::load: inconsistent coefficient encoding");
+    for (int i = 0; i < limbs; ++i) {
+        if (raw.moduli[i] != cc.prime.at(i).p)
+            throw std::invalid_argument("Plaintext::load: plaintext moduli do not match the context's primes");
+        if (!raw.factors.empty() && raw.factors[i] >= raw.moduli[i])
+            throw std::invalid_argument("Plaintext::load: per-limb factors must be reduced");
+    }
+    NoiseFactor = raw.Noise;
+    NoiseLevel = raw.NoiseLevel;
+    slots = raw.slots;
+    const int gap = cc.N / n;
+
+    // Destination: the same compressed constant layout loadConstant() builds.
+    if (c0.getLevel() < limbs - 1)
+        c0.grow(limbs - 1, false, true, n);
+    else
+        c0.dropToLevel(limbs - 1);
+
+    // Scratch full-ring element to run the NTT on (constant limbs carry no NTT workspace).
+    RNSPoly full(cc, limbs - 1);
+    assert(full.GPU.size() == c0.GPU.size());
+
+    for (auto& g : full.GPU) {
+        cudaSetDevice(g.device);
+        const int limbSize = static_cast<int>(g.getLimbSize(limbs - 1));
+        if (limbSize == 0)
+            continue;
+        VectorGPU<uint64_t> coefficients(g.s, n, g.device, reinterpret_cast<const uint64_t*>(raw.coefficients.data()));
+        for (int j = 0; j < limbSize; ++j) {
+            Stream& stream = STREAM(g.limb[j]);
+            stream.wait(g.s);
+            const int primeid = PRIMEID(g.limb[j]);
+            const uint64_t q = cc.prime.at(primeid).p;
+            const uint64_t factor = raw.factors.empty() ? 1 : raw.factors[primeid];
+            std::visit(
+                [&](auto& limb) {
+                    scatterReduceCoefficients<<<EncodeGrid(cc.N), kEncodeBlock, 0, stream.ptr()>>>(limb.v.data,
+                        reinterpret_cast<const int64_t*>(coefficients.data), n, gap, q, factor, cc.N);
+                },
+                g.limb[j]);
+            g.s.wait(stream);
+        }
+        coefficients.free(g.s); // stream-ordered after every scatter through g.s
+    }
+
+    full.NTT(cc.batch, true); // waits for g.s before, and g.s waits for the NTT after
+
+    for (size_t p = 0; p < full.GPU.size(); ++p) {
+        auto& g = full.GPU[p];
+        auto& d = c0.GPU[p];
+        cudaSetDevice(g.device);
+        const int limbSize = static_cast<int>(g.getLimbSize(limbs - 1));
+        for (int j = 0; j < limbSize; ++j) {
+            assert(PRIMEID(g.limb[j]) == PRIMEID(d.limb[j]));
+            Stream& stream = STREAM(d.limb[j]);
+            stream.wait(g.s);
+            std::visit(
+                [&](auto& dst) {
+                    using T = std::remove_reference_t<decltype(dst.v.data[0])>;
+                    const T* src = std::get<std::is_same_v<T, uint32_t> ? U32 : U64>(g.limb[j]).v.data;
+                    gatherStrided<<<EncodeGrid(n), kEncodeBlock, 0, stream.ptr()>>>(dst.v.data, src, n, gap);
+                },
+                d.limb[j]);
+            g.s.wait(stream);
+        }
+        // The scratch limbs are released on their own streams: order that after the gathers.
+        for (int j = 0; j < limbSize; ++j)
+            STREAM(g.limb[j]).wait(g.s);
+    }
+    CudaCheckErrorModNoSync;
+}
+
 void Plaintext::copyMetadata(const Plaintext& a) {
     assert(this->c0.getLevel() == a.c0.getLevel());
     this->slots = a.slots;

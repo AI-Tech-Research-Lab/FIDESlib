@@ -46,6 +46,27 @@ struct RawPlainText {
     int NoiseLevel;
 };
 
+/**
+ * A CKKS plaintext whose encoding stops before the per-limb work. OpenFHE's
+ * CKKSPackedEncoding::Encode() runs an IFFT over the slots, scales and rounds the result to
+ * 2*slots integer coefficients, then for every RNS limb reduces those coefficients modulo the
+ * limb's prime, multiplies by a constant (for noise scale degree > 1 and scaled values wider than
+ * 64 bits) and takes the NTT. The first part is shared by all limbs and is cheap; the per-limb
+ * part is almost all of the cost and is what Plaintext::load(const RawPlainCoefficients&) does
+ * on the GPU. The resulting limbs are bit-identical to OpenFHE's.
+ */
+struct RawPlainCoefficients {
+    /// The 2*slots rounded coefficients (real parts, then imaginary parts), before any modular
+    /// reduction. Coefficient k lands at position k * N / (2*slots) of the ring element.
+    std::vector<int64_t> coefficients;
+    std::vector<uint64_t> moduli;  ///< the plaintext's RNS primes, one per limb
+    std::vector<uint64_t> factors; ///< per-limb constant applied before the NTT (< moduli[i]); empty means 1
+    int N = 0;                     ///< ring dimension
+    double Noise = 0;              ///< scaling factor of the encoded plaintext (already raised to NoiseLevel)
+    int slots = 0;
+    int NoiseLevel = 1;
+};
+
 struct RawParams {
     int N;
     int L;

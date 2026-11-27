@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <functional>
 #include <openfhe.h>
+#include <math/dftransform.h>
 // Serialization headers - required for cereal type registration.
 #include <ciphertext-ser.h>
 #include <cryptocontext-ser.h>
@@ -195,6 +196,14 @@ void CryptoContextImpl<DCRTPoly>::SetAutoLoadPlaintexts(bool autoload) {
 void CryptoContextImpl<DCRTPoly>::SetAutoLoadCiphertexts(bool autoload) {
     FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
     this->auto_load_ciphertexts = autoload;
+}
+
+void CryptoContextImpl<DCRTPoly>::SetGPUPlaintextEncoding(bool enable) {
+    this->gpu_plaintext_encoding = enable;
+}
+
+bool CryptoContextImpl<DCRTPoly>::GetGPUPlaintextEncoding() const {
+    return this->gpu_plaintext_encoding;
 }
 
 void CryptoContextImpl<DCRTPoly>::SetDevices(const std::vector<int>& devices) {
@@ -620,10 +629,17 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt) {
     }
 
     auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
-    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
-    const auto& ptImpl = std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
-    FIDESlib::CKKS::RawPlainText raw_pt = FIDESlib::CKKS::GetRawPlainText(context, ptImpl);
-    std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu, raw_pt);
+    std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt;
+    if (pt->coefficients) {
+        // Encoding deferred to the GPU (SetGPUPlaintextEncoding): upload the rounded coefficients
+        // once and finish there. Also the reload path after a plaintext-cache eviction.
+        gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu, *pt->coefficients);
+    } else {
+        auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+        const auto& ptImpl = std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
+        FIDESlib::CKKS::RawPlainText raw_pt = FIDESlib::CKKS::GetRawPlainText(context, ptImpl);
+        gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu, raw_pt);
+    }
     const size_t bytes = gpu_pt->limbBytes();
     uint32_t handle = this->RegisterDevicePlaintext(std::move(gpu_pt));
     pt->gpu = handle;
@@ -1288,6 +1304,134 @@ bool CryptoContextImpl<DCRTPoly>::DeserializeEvalAutomorphismKey(std::istream& s
 
 // ---- Encoding ----
 
+namespace {
+// lbcrypto::CryptoContextImpl::MakeCKKSPackedPlaintextInternal (with params == nullptr) without
+// its final Encode(): the plaintext gets the same values, slots, level, noise scale degree,
+// scaling factor and element parameters, but no element yet. Returns null when the request would
+// make OpenFHE throw, so the caller lets OpenFHE handle it (and raise the same error).
+lbcrypto::Plaintext MakeUnencodedCKKSPlaintext(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& context,
+    const std::vector<std::complex<double>>& value,
+    size_t noiseScaleDeg,
+    uint32_t level,
+    uint32_t slots) {
+    const auto cryptoParams = std::dynamic_pointer_cast<lbcrypto::CryptoParametersRNS>(context->GetCryptoParameters());
+    if (!cryptoParams || value.empty() || context->getSchemeId() != lbcrypto::SCHEME::CKKSRNS_SCHEME)
+        return nullptr;
+    const size_t numModuli = cryptoParams->GetElementParams()->GetParams().size();
+    if (level >= numModuli)
+        return nullptr;
+
+    double scFact = 0;
+    if (cryptoParams->GetScalingTechnique() == lbcrypto::FLEXIBLEAUTOEXT && level == 0) {
+        scFact = cryptoParams->GetScalingFactorRealBig(level);
+        noiseScaleDeg = 1; // as in OpenFHE: the noise scale degree does not apply at level 0 here
+    } else {
+        scFact = cryptoParams->GetScalingFactorReal(level);
+    }
+
+    std::shared_ptr<lbcrypto::ILDCRTParams<lbcrypto::DCRTPoly::Integer>> elemParamsPtr;
+    if (level != 0) {
+        lbcrypto::ILDCRTParams<lbcrypto::DCRTPoly::Integer> elemParams = *(cryptoParams->GetElementParams());
+        for (uint32_t i = 0; i < level; i++)
+            elemParams.PopLastParam();
+        elemParamsPtr = std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::DCRTPoly::Integer>>(elemParams);
+    } else {
+        elemParamsPtr = cryptoParams->GetElementParams();
+    }
+    if (value.size() > elemParamsPtr->GetRingDimension() / 2)
+        return nullptr;
+    return lbcrypto::Plaintext(std::make_shared<lbcrypto::CKKSPackedEncoding>(
+        elemParamsPtr, context->GetEncodingParams(), value, noiseScaleDeg, level, scFact, slots, context->GetCKKSDataType()));
+}
+
+uint64_t MulMod(const uint64_t a, const uint64_t b, const uint64_t q) {
+    return static_cast<uint64_t>(static_cast<unsigned __int128>(a) * b % q);
+}
+
+// The shared, cheap half of lbcrypto::CKKSPackedEncoding::Encode() (64-bit native integers):
+// IFFT, scaling and rounding. The per-limb half runs on the GPU in
+// FIDESlib::CKKS::Plaintext::load(const RawPlainCoefficients&). Returns null whenever Encode()
+// would throw (too few slots, scaling factor too small, overflow), so the caller encodes on the
+// CPU and OpenFHE reports the error exactly as before.
+std::shared_ptr<FIDESlib::CKKS::RawPlainCoefficients> PrepareCoefficients(const lbcrypto::Plaintext& pt) {
+    static_assert(NATIVEINT == 64, "GPU plaintext encoding replicates the 64-bit native integer path");
+    const auto& value = pt->GetCKKSPackedValue();
+    const uint32_t slots = pt->GetSlots();
+    if (slots < value.size())
+        return nullptr;
+    const auto& params = pt->GetElement<lbcrypto::DCRTPoly>().GetParams();
+    const uint32_t ringDim = params->GetRingDimension();
+    if (slots == 0 || ringDim % (2 * slots) != 0)
+        return nullptr;
+
+    auto inverse{ value };
+    inverse.resize(slots);
+    lbcrypto::DiscreteFourierTransform::FFTSpecialInv(inverse, ringDim * 2);
+
+    const double scalingFactor = pt->GetScalingFactor();
+    double maxAbs = 0.;
+    for (uint32_t i = 0; i < slots; ++i) {
+        inverse[i] *= scalingFactor;
+        const double re = std::abs(inverse[i].real());
+        const double im = std::abs(inverse[i].imag());
+        if (maxAbs < re)
+            maxAbs = re;
+        if (maxAbs < im)
+            maxAbs = im;
+    }
+    const int32_t logc = (maxAbs == 0.) ? 0 : static_cast<int32_t>(std::ceil(std::log2(maxAbs)));
+    if (logc < 0)
+        return nullptr;
+    constexpr int32_t MAX_BITS_IN_WORD = lbcrypto::LargeScalingFactorConstants::MAX_BITS_IN_WORD;
+    const int32_t logValid = (logc <= MAX_BITS_IN_WORD) ? logc : MAX_BITS_IN_WORD;
+    const int32_t logApprox = logc - logValid;
+    const double approxFactor = std::pow(2, logApprox);
+
+    auto raw = std::make_shared<FIDESlib::CKKS::RawPlainCoefficients>();
+    raw->coefficients.resize(2 * slots);
+    for (uint32_t i = 0; i < slots; ++i) {
+        const double dre = inverse[i].real() / approxFactor;
+        const double dim = inverse[i].imag() / approxFactor;
+        if (lbcrypto::is64BitOverflow(dre) || lbcrypto::is64BitOverflow(dim))
+            return nullptr;
+        // OpenFHE stores negative values as Max64BitValue() + x and maps them back while reducing
+        // modulo each prime; the residue is that of x itself.
+        raw->coefficients[i] = std::llround(dre);
+        raw->coefficients[i + slots] = std::llround(dim);
+    }
+
+    const auto& towers = params->GetParams();
+    raw->moduli.reserve(towers.size());
+    for (const auto& tower : towers)
+        raw->moduli.push_back(tower->GetModulus().ConvertToInt<uint64_t>());
+
+    // Encode() multiplies the coefficient-form element by round(scalingFactor)^(degree - 1) when
+    // the noise scale degree is above 1, and by 2^logApprox when the scaled values did not fit in
+    // a word. Both are per-limb constants and commute with the NTT, so they fold into one factor.
+    const size_t noiseScaleDeg = pt->GetNoiseScaleDeg();
+    if (noiseScaleDeg > 1 || logApprox > 0) {
+        const auto intPowP = static_cast<uint64_t>(std::llround(scalingFactor));
+        raw->factors.resize(raw->moduli.size());
+        for (size_t i = 0; i < raw->moduli.size(); ++i) {
+            const uint64_t q = raw->moduli[i];
+            uint64_t factor = 1 % q;
+            const uint64_t base = intPowP % q;
+            for (size_t d = 1; d < noiseScaleDeg; ++d)
+                factor = MulMod(factor, base, q);
+            for (int32_t b = 0; b < logApprox; ++b)
+                factor = MulMod(factor, 2 % q, q);
+            raw->factors[i] = factor;
+        }
+    }
+
+    raw->N = static_cast<int>(ringDim);
+    raw->Noise = std::pow(scalingFactor, noiseScaleDeg); // Encode() leaves this as the plaintext's scale
+    raw->slots = static_cast<int>(slots);
+    raw->NoiseLevel = static_cast<int>(noiseScaleDeg);
+    return raw;
+}
+} // namespace
+
 Plaintext CryptoContextImpl<DCRTPoly>::MakeCKKSPackedPlaintext(const std::vector<std::complex<double>>& value,
     size_t noiseScaleDeg,
     uint32_t level,
@@ -1296,9 +1440,26 @@ Plaintext CryptoContextImpl<DCRTPoly>::MakeCKKSPackedPlaintext(const std::vector
     FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
 
     auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
-    auto pt = context->MakeCKKSPackedPlaintext(value, noiseScaleDeg, level, nullptr, slots);
-
     Plaintext plaintext = std::make_shared<PlaintextImpl>(this->self_reference.lock());
+
+    lbcrypto::Plaintext pt;
+    if (this->gpu_plaintext_encoding && !this->devices.empty()) {
+        pt = MakeUnencodedCKKSPlaintext(context, value, noiseScaleDeg, level, slots);
+        if (pt) {
+            if (auto coefficients = PrepareCoefficients(pt)) {
+                // OpenFHE marks a fresh FLEXIBLEAUTOEXT plaintext at level 0 as degree 2 after
+                // encoding it with degree 1; PlaintextImpl::EnsureCpuEncoding() applies the same.
+                const auto rns = std::dynamic_pointer_cast<lbcrypto::CryptoParametersRNS>(context->GetCryptoParameters());
+                if (rns->GetScalingTechnique() == lbcrypto::FLEXIBLEAUTOEXT && level == 0)
+                    coefficients->NoiseLevel = 2;
+                plaintext->coefficients = std::move(coefficients);
+            } else
+                pt->Encode(); // the CPU path, including its error reporting
+        }
+    }
+    if (!pt)
+        pt = context->MakeCKKSPackedPlaintext(value, noiseScaleDeg, level, nullptr, slots);
+
     plaintext->cpu = std::make_any<lbcrypto::Plaintext>(pt);
     plaintext->loaded = false;
 
@@ -1315,20 +1476,27 @@ Plaintext
 CryptoContextImpl<DCRTPoly>::MakeCKKSPackedPlaintext(const std::vector<double>& value, size_t noiseScaleDeg, uint32_t level, const std::shared_ptr<void> params, uint32_t slots) {
     FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
 
-    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
-    auto pt = context->MakeCKKSPackedPlaintext(value, noiseScaleDeg, level, nullptr, slots);
+    if (!this->gpu_plaintext_encoding || this->devices.empty()) {
+        auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+        auto pt = context->MakeCKKSPackedPlaintext(value, noiseScaleDeg, level, nullptr, slots);
 
-    Plaintext plaintext = std::make_shared<PlaintextImpl>(this->self_reference.lock());
-    plaintext->cpu = std::make_any<lbcrypto::Plaintext>(pt);
-    plaintext->loaded = false;
+        Plaintext plaintext = std::make_shared<PlaintextImpl>(this->self_reference.lock());
+        plaintext->cpu = std::make_any<lbcrypto::Plaintext>(pt);
+        plaintext->loaded = false;
 
-    if (this->devices.empty() || !this->auto_load_plaintexts) {
+        if (this->devices.empty() || !this->auto_load_plaintexts) {
+            return plaintext;
+        }
+
+        this->LoadPlaintext(plaintext);
+
         return plaintext;
     }
 
-    this->LoadPlaintext(plaintext);
-
-    return plaintext;
+    // Same conversion as OpenFHE's real-valued overload.
+    std::vector<std::complex<double>> complexValue(value.size());
+    std::transform(value.begin(), value.end(), complexValue.begin(), [](double da) { return std::complex<double>(da); });
+    return MakeCKKSPackedPlaintext(complexValue, noiseScaleDeg, level, params, slots);
 }
 
 // ---- Encryption ----
@@ -1338,6 +1506,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::Encrypt(Plaintext& pt, const P
 
     auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
     const auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(pk->pimpl);
+    pt->EnsureCpuEncoding();
     const auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
 
     auto ct = context->Encrypt(pkImpl, ptImpl);
@@ -1363,6 +1532,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::Encrypt(Plaintext& pt, const P
 
     auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
     const auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
+    pt->EnsureCpuEncoding();
     const auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
 
     auto ct = context->Encrypt(skImpl, ptImpl);
@@ -1434,6 +1604,7 @@ DecryptResult CryptoContextImpl<DCRTPoly>::Decrypt(Ciphertext<DCRTPoly>& ct, con
         }
 
         (*pt)->cpu = std::make_any<lbcrypto::Plaintext>(std::move(ptImpl));
+        (*pt)->coefficients.reset();
         (*pt)->loaded = false;
         (*pt)->gpu = 0;
     } else {
@@ -1538,6 +1709,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalAdd(const Ciphertext<DCRTP
     if (this->devices.empty()) {
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
         auto ct = context->EvalAdd(ctImpl, ptImpl);
         Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
@@ -1623,6 +1795,7 @@ void CryptoContextImpl<DCRTPoly>::EvalAddInPlace(Ciphertext<DCRTPoly>& ct1, Plai
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         EnsureMutableCpuCiphertext(ct1);
         auto& ct1Impl = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct1->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
         context->EvalAddInPlace(ct1Impl, ptImpl);
         return;
@@ -1703,6 +1876,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalAddMutable(Ciphertext<DCRT
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         EnsureMutableCpuCiphertext(ct);
         auto& ctImpl = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
         auto res = context->EvalAddMutable(ctImpl, ptImpl);
         Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
@@ -1895,6 +2069,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSub(const Ciphertext<DCRTP
 
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
         auto ct = context->EvalSub(ctImpl, ptImpl);
         Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
@@ -1923,6 +2098,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSub(Plaintext& pt, const C
 
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         auto& ctImpl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
         auto ct = context->EvalSub(ptImpl, ctImpl);
         Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
@@ -2097,6 +2273,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSubMutable(Ciphertext<DCRT
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         EnsureMutableCpuCiphertext(ct);
         auto& ctImpl = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
         auto res = context->EvalSubMutable(ctImpl, ptImpl);
         Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
@@ -2177,6 +2354,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(const Ciphertext<DCRT
 
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         auto& ct1Impl = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct1->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
         auto ct = context->EvalMult(ct1Impl, ptImpl);
         Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
@@ -2239,6 +2417,7 @@ void CryptoContextImpl<DCRTPoly>::EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, Pla
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         EnsureMutableCpuCiphertext(ct1);
         auto& ct1Impl = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct1->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
         auto res = context->EvalMult(ct1Impl, ptImpl);
         ct1->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(res);
@@ -2311,6 +2490,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMultMutable(Ciphertext<DCR
         auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
         EnsureMutableCpuCiphertext(ct);
         auto& ctImpl = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+        pt->EnsureCpuEncoding();
         auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
         auto res = context->EvalMultMutable(ctImpl, ptImpl);
         Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());

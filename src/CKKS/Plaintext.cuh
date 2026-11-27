@@ -100,6 +100,18 @@ class Plaintext {
      */
     void load(const RawPlainText& raw);
     /**
+     * @brief Construct a plaintext by finishing a CKKS encoding on the GPU (see load(const RawPlainCoefficients&)).
+     */
+    Plaintext(Context& cc, const RawPlainCoefficients& raw);
+    /**
+     * @brief Finish a CKKS encoding on the GPU: reduce the rounded coefficients modulo each limb's
+     * prime, apply the per-limb factors, take the NTT and keep the 2*slots words per limb that a
+     * sparsely packed plaintext needs. The limbs are bit-identical to what load(const RawPlainText&)
+     * produces from OpenFHE's own encoding of the same values. Only one copy of the coefficients
+     * (8 bytes per coefficient) crosses the bus instead of one row per limb.
+     */
+    void load(const RawPlainCoefficients& raw);
+    /**
      * @brief Store this plaintext into a raw representation.
      *
      * @param raw Destination for the raw plaintext data.

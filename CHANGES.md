@@ -6,6 +6,23 @@ work it accumulated since the previous release, **FIDESlib 2.1.3**. It closes
 issues #11, #15, #29, #32, #33 and #42, and supersedes pull requests #18, #45
 and #46.
 
+## Fork: GPU plaintext encoding (unreleased)
+
+- **`SetGPUPlaintextEncoding(bool)` / `GetGPUPlaintextEncoding()`** (default off) — with it on
+  and devices set, `MakeCKKSPackedPlaintext` runs only the part of OpenFHE's CKKS encoding that
+  all RNS limbs share (IFFT, scaling, rounding to `2*slots` integers) and keeps those
+  coefficients (`PlaintextImpl::coefficients`, a `RawPlainCoefficients`). `LoadPlaintext` uploads
+  them once and reduces them modulo each prime, applies the noise-degree / wide-value factor and
+  takes the NTT on the GPU (`Plaintext::load(const RawPlainCoefficients&)`), which is also how an
+  evicted plaintext reloads. The device limbs are bit-identical to the CPU path for the four
+  scaling techniques, REAL and COMPLEX, dense and sparse packing, every level, noise scale degree
+  1 and 2, scaled values wider than 64 bits, and two GPUs.
+- The OpenFHE plaintext in `PlaintextImpl::cpu` stays unencoded until the CPU needs it:
+  `Encrypt`, the CPU fallbacks, `==`, `SetLength`/`SetSlots` call the new
+  `PlaintextImpl::EnsureCpuEncoding()`, which runs OpenFHE's `Encode()` once. Code reading that
+  element directly must call it too. Requests OpenFHE would reject go through OpenFHE unchanged,
+  with the same exceptions.
+
 ## Fork: OpenFHE EvalSum family (unreleased)
 
 - **`EvalSum`, `EvalSumRows`, `EvalSumCols` on the GPU** — with `EvalSumKeyGen`,

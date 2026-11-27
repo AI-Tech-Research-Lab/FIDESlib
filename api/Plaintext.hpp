@@ -9,6 +9,10 @@
 
 #include "Definitions.hpp"
 
+namespace FIDESlib::CKKS {
+struct RawPlainCoefficients;
+}
+
 namespace fideslib {
 /// @brief Plaintext representation for the CKKS-RNS scheme.
 class PlaintextImpl {
@@ -43,6 +47,12 @@ class PlaintextImpl {
     std::vector<std::complex<double>> GetCKKSPackedValue() const;
     std::vector<double> GetRealPackedValue() const;
 
+    /// @brief Make sure `cpu` holds a fully encoded OpenFHE plaintext. A plaintext made with
+    /// GPU encoding enabled (CryptoContextImpl::SetGPUPlaintextEncoding) keeps its OpenFHE
+    /// plaintext unencoded until something on the CPU needs its element; this encodes it then
+    /// (once, thread-safe). A no-op for every other plaintext.
+    void EnsureCpuEncoding() const;
+
     // ---- Friend Operators ----
 
     friend std::ostream& operator<<(std::ostream& os, const PlaintextImpl& pt);
@@ -55,6 +65,9 @@ class PlaintextImpl {
     bool loaded = false;
     /// @brief Parent context for device management.
     CryptoContext<DCRTPoly> parent_context;
+    /// @brief Rounded encoding coefficients the GPU finishes encoding from (see
+    /// CryptoContextImpl::SetGPUPlaintextEncoding); null for plaintexts encoded on the CPU.
+    std::shared_ptr<const FIDESlib::CKKS::RawPlainCoefficients> coefficients;
 };
 
 // ---- Override Operators ----

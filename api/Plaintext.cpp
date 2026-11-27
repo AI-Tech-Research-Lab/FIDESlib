@@ -11,8 +11,18 @@ namespace {
 std::mutex cpu_encoding_mutex;
 }
 
+bool PlaintextImpl::HasGPUEncoding() const {
+    if (!this->coefficients)
+        return false;
+    const auto* impl = std::any_cast<lbcrypto::Plaintext>(&this->cpu);
+    const auto source = this->coefficients_source.lock();
+    return impl != nullptr && *impl && source && source.get() == static_cast<const void*>(impl->get());
+}
+
 void PlaintextImpl::EnsureCpuEncoding() const {
-    if (!this->coefficients || !this->cpu.has_value())
+    // Only the OpenFHE plaintext the coefficients came from is ours to encode; one that replaced
+    // it in `cpu` is left as it is.
+    if (!this->HasGPUEncoding())
         return;
     const auto& impl = std::any_cast<const lbcrypto::Plaintext&>(this->cpu);
     std::lock_guard<std::mutex> lock(cpu_encoding_mutex);

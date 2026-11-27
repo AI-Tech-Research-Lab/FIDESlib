@@ -1,4 +1,4 @@
-// GPU plaintext encoding (CryptoContextImpl::SetGPUPlaintextEncoding): the CPU only runs the IFFT
+// GPU plaintext encoding (CryptoContextImpl::SetGPUPlaintextEncoding, on by default): the CPU only runs the IFFT
 // and rounding, the GPU reduces modulo each prime and takes the NTT. The device limbs must be
 // bit-identical to the ones uploaded from OpenFHE's own encoding, for every scaling technique,
 // data type, packing, level and noise scale degree, and after cache eviction and reload.
@@ -202,18 +202,76 @@ CryptoContext<DCRTPoly> SmallContext(KeyPair<DCRTPoly>& keys) {
     return MakeContext(EncodingCase{ FLEXIBLEAUTO, REAL, 12, 6, 50, 16 }, keys);
 }
 
-TEST(GpuPlaintextEncodingApi, OffByDefault) {
+TEST(GpuPlaintextEncodingApi, OnByDefault) {
     KeyPair<DCRTPoly> keys;
     auto cc = SmallContext(keys);
-    EXPECT_FALSE(cc->GetGPUPlaintextEncoding());
+    EXPECT_TRUE(cc->GetGPUPlaintextEncoding());
     auto pt = cc->MakeCKKSPackedPlaintext(std::vector<double>{ 1, 2, 3 });
+    EXPECT_NE(pt->coefficients, nullptr);
+    EXPECT_TRUE(pt->HasGPUEncoding());
+    cc->SetGPUPlaintextEncoding(false);
+    auto cpu = cc->MakeCKKSPackedPlaintext(std::vector<double>{ 1, 2, 3 });
+    EXPECT_EQ(cpu->coefficients, nullptr);
+    EXPECT_FALSE(cpu->HasGPUEncoding());
+}
+
+// Code that swaps its own OpenFHE plaintext into `cpu` gets that plaintext uploaded, not the
+// coefficients of the one it replaced, and EnsureCpuEncoding() leaves it alone.
+TEST(GpuPlaintextEncodingApi, ReplacedCpuPlaintextIsUploaded) {
+    KeyPair<DCRTPoly> keys;
+    auto cc = SmallContext(keys);
+    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(cc->cpu);
+    const std::vector<double> original{ 1, 2, 3, 4 }, replacement{ -0.5, 0.25, 0.75, 2 };
+    cc->SetGPUPlaintextEncoding(false);
+    auto reference = cc->MakeCKKSPackedPlaintext(replacement, 1, 1, nullptr, 16);
+    cc->SetGPUPlaintextEncoding(true);
+
+    auto pt = cc->MakeCKKSPackedPlaintext(original, 1, 1, nullptr, 16);
+    ASSERT_TRUE(pt->HasGPUEncoding());
+    pt->cpu = std::make_any<lbcrypto::Plaintext>(context->MakeCKKSPackedPlaintext(replacement, 1, 1, nullptr, 16));
+    EXPECT_FALSE(pt->HasGPUEncoding());
+    pt->EnsureCpuEncoding();
+    EXPECT_TRUE(*pt == *reference);
+    ExpectSameImage(Download(cc, reference), Download(cc, pt));
     EXPECT_EQ(pt->coefficients, nullptr);
+
+    // Also after the plaintext was already on the device and got evicted.
+    auto loaded = cc->MakeCKKSPackedPlaintext(original, 1, 1, nullptr, 16);
+    cc->LoadPlaintext(loaded);
+    cc->OffloadPlaintexts();
+    loaded->cpu = std::make_any<lbcrypto::Plaintext>(context->MakeCKKSPackedPlaintext(replacement, 1, 1, nullptr, 16));
+    ExpectSameImage(Download(cc, reference), Download(cc, loaded));
+}
+
+// The metadata OpenFHE sets on an encoded plaintext is there once EnsureCpuEncoding() ran.
+TEST(GpuPlaintextEncodingApi, MetadataAfterCpuEncoding) {
+    KeyPair<DCRTPoly> keys;
+    auto cc = MakeContext(EncodingCase{ FLEXIBLEAUTOEXT, REAL, 12, 6, 50, 16 }, keys);
+    for (uint32_t level : { 0u, 2u }) {
+        for (size_t degree : { 1, 2 }) {
+            SCOPED_TRACE(testing::Message() << "level=" << level << " degree=" << degree);
+            const std::vector<double> values{ 0.5, -0.25, 0.125 };
+            cc->SetGPUPlaintextEncoding(false);
+            auto reference = cc->MakeCKKSPackedPlaintext(values, degree, level);
+            cc->SetGPUPlaintextEncoding(true);
+            auto pt = cc->MakeCKKSPackedPlaintext(values, degree, level);
+            pt->EnsureCpuEncoding();
+            const auto& a = std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
+            const auto& b = std::any_cast<const lbcrypto::Plaintext&>(reference->cpu);
+            EXPECT_EQ(a->GetNoiseScaleDeg(), b->GetNoiseScaleDeg());
+            EXPECT_EQ(a->GetScalingFactor(), b->GetScalingFactor());
+            EXPECT_EQ(a->GetLevel(), b->GetLevel());
+            EXPECT_EQ(a->GetSlots(), b->GetSlots());
+            EXPECT_TRUE(*a == *b);
+        }
+    }
 }
 
 TEST(GpuPlaintextEncodingApi, ReloadAfterEvictionStaysIdentical) {
     KeyPair<DCRTPoly> keys;
     auto cc = SmallContext(keys);
     const auto values = RandomValues(16, 1, false, 7);
+    cc->SetGPUPlaintextEncoding(false);
     auto reference = cc->MakeCKKSPackedPlaintext(values, 1, 2, nullptr, 16);
     cc->SetGPUPlaintextEncoding(true);
     auto deferred = cc->MakeCKKSPackedPlaintext(values, 1, 2, nullptr, 16);

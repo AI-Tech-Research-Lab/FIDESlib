@@ -48,10 +48,16 @@ class PlaintextImpl {
     std::vector<double> GetRealPackedValue() const;
 
     /// @brief Make sure `cpu` holds a fully encoded OpenFHE plaintext. A plaintext made with
-    /// GPU encoding enabled (CryptoContextImpl::SetGPUPlaintextEncoding) keeps its OpenFHE
-    /// plaintext unencoded until something on the CPU needs its element; this encodes it then
-    /// (once, thread-safe). A no-op for every other plaintext.
+    /// GPU encoding enabled (CryptoContextImpl::SetGPUPlaintextEncoding, on by default) keeps
+    /// its OpenFHE plaintext unencoded until something on the CPU needs its element; this
+    /// encodes it then (once, thread-safe) and sets the metadata OpenFHE sets after encoding.
+    /// Call it before reading the OpenFHE plaintext in `cpu` directly. A no-op for every other
+    /// plaintext.
     void EnsureCpuEncoding() const;
+    /// @brief Whether LoadPlaintext() finishes this plaintext's encoding on the GPU: it was made
+    /// with GPU encoding on and `cpu` still holds the OpenFHE plaintext its coefficients came
+    /// from. Replacing `cpu` turns this off, so the replacement is what gets uploaded.
+    bool HasGPUEncoding() const;
 
     // ---- Friend Operators ----
 
@@ -68,6 +74,8 @@ class PlaintextImpl {
     /// @brief Rounded encoding coefficients the GPU finishes encoding from (see
     /// CryptoContextImpl::SetGPUPlaintextEncoding); null for plaintexts encoded on the CPU.
     std::shared_ptr<const FIDESlib::CKKS::RawPlainCoefficients> coefficients;
+    /// @brief The OpenFHE plaintext `coefficients` were computed from (see HasGPUEncoding()).
+    std::weak_ptr<const void> coefficients_source;
 };
 
 // ---- Override Operators ----

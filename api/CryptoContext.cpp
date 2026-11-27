@@ -630,6 +630,11 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt) {
 
     auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
     std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt;
+    if (pt->coefficients && !pt->HasGPUEncoding()) {
+        // `cpu` was replaced after the plaintext was made: upload the replacement instead.
+        pt->coefficients.reset();
+        pt->coefficients_source.reset();
+    }
     if (pt->coefficients) {
         // Encoding deferred to the GPU (SetGPUPlaintextEncoding): upload the rounded coefficients
         // once and finish there. Also the reload path after a plaintext-cache eviction.
@@ -1453,6 +1458,7 @@ Plaintext CryptoContextImpl<DCRTPoly>::MakeCKKSPackedPlaintext(const std::vector
                 if (rns->GetScalingTechnique() == lbcrypto::FLEXIBLEAUTOEXT && level == 0)
                     coefficients->NoiseLevel = 2;
                 plaintext->coefficients = std::move(coefficients);
+                plaintext->coefficients_source = pt;
             } else
                 pt->Encode(); // the CPU path, including its error reporting
         }
@@ -1605,6 +1611,7 @@ DecryptResult CryptoContextImpl<DCRTPoly>::Decrypt(Ciphertext<DCRTPoly>& ct, con
 
         (*pt)->cpu = std::make_any<lbcrypto::Plaintext>(std::move(ptImpl));
         (*pt)->coefficients.reset();
+        (*pt)->coefficients_source.reset();
         (*pt)->loaded = false;
         (*pt)->gpu = 0;
     } else {

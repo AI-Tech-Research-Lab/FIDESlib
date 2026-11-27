@@ -8,7 +8,7 @@ and #46.
 
 ## Fork: GPU plaintext encoding (unreleased)
 
-- **`SetGPUPlaintextEncoding(bool)` / `GetGPUPlaintextEncoding()`** (default off) — with it on
+- **`SetGPUPlaintextEncoding(bool)` / `GetGPUPlaintextEncoding()`** (default on) — with it on
   and devices set, `MakeCKKSPackedPlaintext` runs only the part of OpenFHE's CKKS encoding that
   all RNS limbs share (IFFT, scaling, rounding to `2*slots` integers) and keeps those
   coefficients (`PlaintextImpl::coefficients`, a `RawPlainCoefficients`). `LoadPlaintext` uploads
@@ -19,9 +19,16 @@ and #46.
   1 and 2, scaled values wider than 64 bits, and two GPUs.
 - The OpenFHE plaintext in `PlaintextImpl::cpu` stays unencoded until the CPU needs it:
   `Encrypt`, the CPU fallbacks, `==`, `SetLength`/`SetSlots` call the new
-  `PlaintextImpl::EnsureCpuEncoding()`, which runs OpenFHE's `Encode()` once. Code reading that
-  element directly must call it too. Requests OpenFHE would reject go through OpenFHE unchanged,
+  `PlaintextImpl::EnsureCpuEncoding()`, which runs OpenFHE's `Encode()` once and applies the
+  metadata OpenFHE sets afterwards. Requests OpenFHE would reject go through OpenFHE unchanged,
   with the same exceptions.
+- **Behavior change for code that uses `PlaintextImpl::cpu` directly.** Plaintexts made on a
+  context with devices now hold an unencoded OpenFHE plaintext: call `EnsureCpuEncoding()`
+  before reading its element, scaling factor or noise scale degree (before it, the element is
+  empty and in COEFFICIENT format, and the scale is not yet raised to the degree), or turn the
+  option off with `SetGPUPlaintextEncoding(false)`. Replacing `cpu` with another OpenFHE
+  plaintext stays safe: `HasGPUEncoding()` then turns false and `LoadPlaintext` uploads the
+  replacement.
 
 ## Fork: OpenFHE EvalSum family (unreleased)
 

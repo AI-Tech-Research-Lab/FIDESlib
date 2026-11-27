@@ -69,8 +69,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
     ///
     /// The OpenFHE plaintext in PlaintextImpl::cpu is created unencoded and encoded on the CPU
     /// only when something needs it (Encrypt, CPU-only operations, comparisons); call
-    /// PlaintextImpl::EnsureCpuEncoding() before reading its element directly. Plaintexts that
-    /// already exist keep the representation they were made with. Default: off.
+    /// PlaintextImpl::EnsureCpuEncoding() before reading its element or metadata directly. A
+    /// plaintext whose `cpu` is replaced is uploaded from the replacement. Plaintexts that
+    /// already exist keep the representation they were made with. Default: on.
     void SetGPUPlaintextEncoding(bool enable);
     bool GetGPUPlaintextEncoding() const;
 
@@ -445,7 +446,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
     /// @brief Whether ciphertexts should be automatically loaded to the device upon creation.
     bool auto_load_ciphertexts = true;
     /// @brief Whether new plaintexts finish their encoding on the GPU (SetGPUPlaintextEncoding).
-    bool gpu_plaintext_encoding = false;
+    bool gpu_plaintext_encoding = true;
     /// @brief Self reference to enable shared_from_this-like behavior.
     std::weak_ptr<CryptoContextImpl<DCRTPoly>> self_reference;
     /// @brief Multiplicative depth of the context.
